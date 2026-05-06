@@ -12,7 +12,16 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import ANSI
+
+from rich.console import Console, Group
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.panel import Panel
+
 import config
+
+# Initialize the rich console
+console = Console()
 
 # --- CLI Colors ---
 COLOR_RED = '\033[91m'
@@ -280,39 +289,58 @@ async def run_chat():
                                 final_usage = None
                                 
                                 # Use async for to loop through the stream ---
-                                async for chunk in response_stream:
-                                    if len(chunk.choices) > 0:
-                                        delta = chunk.choices[0].delta
-                                        chunk_thinking = None
-                                        
-                                        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
-                                            chunk_thinking = delta.reasoning_content
-                                        elif hasattr(delta, "model_extra") and delta.model_extra:
-                                            chunk_thinking = delta.model_extra.get("reasoning_content") or delta.model_extra.get("reasoning")
-                                        
-                                        if chunk_thinking:
-                                            full_thinking += chunk_thinking
-                                            print(f"{COLOR_DIM}{chunk_thinking}{COLOR_RESET}", end="", flush=True)
+                                with Live(console=console, refresh_per_second=5, transient=False) as live:
+                                    async for chunk in response_stream:
+                                        # 1. MOVE USAGE OUTSIDE: Always capture metadata regardless of choices
+                                        if chunk.usage:
+                                            final_usage = chunk.usage
 
-                                        if delta.content:
-                                            full_content += delta.content
-                                            print(delta.content, end="", flush=True)
+                                        if len(chunk.choices) > 0:
+                                            delta = chunk.choices[0].delta
+                                            
+                                            # Logic for thinking/content extraction stays the same
+                                            chunk_thinking = getattr(delta, 'reasoning_content', None)
+                                            if not chunk_thinking and hasattr(delta, "model_extra") and delta.model_extra:
+                                                chunk_thinking = delta.model_extra.get("reasoning_content") or delta.model_extra.get("reasoning")
+                                            
+                                            if chunk_thinking: full_thinking += chunk_thinking
+                                            if delta.content: full_content += delta.content
 
-                                        if delta.tool_calls:
-                                            for tc in delta.tool_calls:
-                                                if tc.index not in tool_calls_dict:
-                                                    tool_calls_dict[tc.index] = {
-                                                        "id": tc.id, 
-                                                        "type": "function", 
-                                                        "function": {"name": tc.function.name, "arguments": ""}
-                                                    }
-                                                if tc.function.arguments:
-                                                    tool_calls_dict[tc.index]["function"]["arguments"] += tc.function.arguments
+                                            if delta.tool_calls:
+                                                for tc in delta.tool_calls:
+                                                    if tc.index not in tool_calls_dict:
+                                                        tool_calls_dict[tc.index] = {
+                                                            "id": tc.id, 
+                                                            "type": "function", 
+                                                            "function": {"name": tc.function.name, "arguments": ""}
+                                                        }
+                                                    if tc.function.arguments:
+                                                        tool_calls_dict[tc.index]["function"]["arguments"] += tc.function.arguments
 
-                                    if chunk.usage:
-                                        final_usage = chunk.usage
+                                            # --- ENHANCED UI ASSEMBLY ---
+                                            display_elements = []
+                                            
+                                            if full_thinking:
+                                                display_elements.append(Panel(
+                                                    Markdown(full_thinking),
+                                                    title="[bold yellow]BRAIN THOUGHTS[/bold yellow]",
+                                                    border_style="yellow",
+                                                    padding=(1, 2),
+                                                    subtitle="[dim white]Internal Logic Loop[/dim white]"
+                                                ))
+                                                
+                                            if full_content:
+                                                display_elements.append(Markdown(full_content))
+                                            
+                                            # 2. ADD TOOL STATUS: If there's no text yet but there ARE tool calls, show it!
+                                            if not full_content and tool_calls_dict:
+                                                tool_names = [tc['function']['name'] for tc in tool_calls_dict.values()]
+                                                display_elements.append(Markdown(f"*Preparing tool calls: {', '.join(f'`{n}`' for n in tool_names)}...*"))
+                                                
+                                            if display_elements:
+                                                live.update(Group(*display_elements))
 
-                                print() 
+                                print() # Drop a single clean newline after the stream
                                 
                                 assistant_message = {"role": "assistant", "content": full_content}
                                 

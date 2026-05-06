@@ -161,7 +161,7 @@ Create a new directory for your project, initialize Pixi, and add the required l
     mkdir ai_workspace
     cd ai_workspace
     pixi init
-    pixi add python openai mcp fastmcp prompt_toolkit
+    pixi add python openai mcp fastmcp prompt_toolkit rich
 
 ### Step 4: Set Up the Host Proxy (Zero-Trust Routing)
 To keep secrets completely out of the sandbox, we run a LiteLLM proxy on the host machine. The AI uses fake keys, and the proxy attaches the real ones.
