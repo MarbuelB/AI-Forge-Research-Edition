@@ -6,12 +6,16 @@ import re
 import copy
 import subprocess
 import traceback
+import logging
+import argparse
+import sys
 from datetime import datetime
 from openai import AsyncOpenAI
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import ANSI
+from contextlib import nullcontext
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -19,6 +23,41 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 
 import config
+
+# Can be run using arguments like this:
+# pixi run python chat_overseer.py -p "tell me what tools do you have" -f formatted -s "Test_2" --brain 2 --coder 3 --summarizer 3 --adviser 3 -x
+
+# --- CLI ARGUMENT PARSER ---
+parser = argparse.ArgumentParser(description="AI-Forge Overseer")
+parser.add_argument("-p", "--prompt", type=str, help="Initial user prompt")
+parser.add_argument("-f", "--format", choices=["formatted", "text", "silent"], help="Console mode override")
+parser.add_argument("-s", "--session", type=str, help="Session ID to load or create")
+parser.add_argument("-x", "--exit", action="store_true", help="Auto-exit after finishing the CLI prompt")
+# Add the LLM profile overrides back:
+parser.add_argument("--brain", type=int, help="Brain LLM profile index")
+parser.add_argument("--coder", type=int, help="Coder LLM profile index")
+parser.add_argument("--summarizer", type=int, help="Summarizer LLM profile index")
+parser.add_argument("--adviser", type=int, help="Adviser LLM profile index")
+
+cli_args = parser.parse_args()
+
+# Apply Overrides BEFORE any LLM clients initialize
+if cli_args.format: config.CONSOLE_MODE = cli_args.format
+if cli_args.session: config.SESSION_ID = cli_args.session
+if cli_args.brain is not None: config.ACTIVE_BRAIN_PROFILE = cli_args.brain
+if cli_args.coder is not None: config.ACTIVE_CODER_PROFILE = cli_args.coder
+if cli_args.summarizer is not None: config.ACTIVE_SUMMARIZER_PROFILE = cli_args.summarizer
+if cli_args.adviser is not None: config.ACTIVE_ADVISER_PROFILE = cli_args.adviser
+
+# Capture Prompt (from -p flag OR piped STDIN)
+cli_prompt = cli_args.prompt
+if not cli_prompt and not sys.stdin.isatty():
+    # This grabs piped text like: cat input.txt | python chat_overseer.py
+    cli_prompt = sys.stdin.read().strip()
+   
+# Mute the MCP client's internal info logs
+logging.getLogger("mcp").setLevel(logging.WARNING)
+logging.getLogger("fastmcp").setLevel(logging.WARNING)
 
 # Initialize the rich console
 console = Console()
@@ -115,34 +154,32 @@ def log_event(role, content, usage=None, thinking=None, text_color=None):
         f.write(file_msg)
 
     # 2. Console logging
-    if role.upper() not in ["BRAIN"]:
-        if role.upper().startswith("TOOL"):
-            console_header = f"\n{COLOR_BRIGHT_GREEN}[{time_str}] === {role.upper()} ==={COLOR_RESET}"
-            actual_color = text_color if text_color else COLOR_DARK_GREEN
-            console_content = f"{actual_color}{content}{COLOR_RESET}"
-        else:
-            console_header = f"\n{COLOR_BLUE}[{time_str}] === {role.upper()} ==={COLOR_RESET}"
-            console_content = f"{COLOR_RED}{content}{COLOR_RESET}" if role.upper() in ["USER", "YOU"] else content
-            
-        print(f"{console_header}\n{console_content}")
-        if usage and usage.prompt_tokens is not None:
-            print(f"{COLOR_YELLOW}[Tokens: {usage.prompt_tokens} in | {usage.completion_tokens} out]{COLOR_RESET}")
+    if config.CONSOLE_MODE != "silent":
+        if role.upper() not in ["BRAIN"]:
+            if role.upper().startswith("TOOL"):
+                console_header = f"\n{COLOR_BRIGHT_GREEN}[{time_str}] === {role.upper()} ==={COLOR_RESET}"
+                actual_color = text_color if text_color else COLOR_DARK_GREEN
+                console_content = f"{actual_color}{content}{COLOR_RESET}"
+            else:
+                console_header = f"\n{COLOR_BLUE}[{time_str}] === {role.upper()} ==={COLOR_RESET}"
+                console_content = f"{COLOR_RED}{content}{COLOR_RESET}" if role.upper() in ["USER", "YOU"] else content
+                
+            print(f"{console_header}\n{console_content}")
+            if usage and usage.prompt_tokens is not None:
+                print(f"{COLOR_YELLOW}[Tokens: {usage.prompt_tokens} in | {usage.completion_tokens} out]{COLOR_RESET}")
 
 async def run_chat():
-    log_event("SYSTEM", f"Session: [{active_session}]\nBrain: {brain_profile['name']} | Coder: {config.LLM_PROFILES[config.ACTIVE_CODER_PROFILE]['name']}\nLog saved to: {LOG_FILE}")
-
-    # Clear stale Podman WSL state ---
-    print(f"{COLOR_DIM}Sweeping stale Podman state...{COLOR_RESET}")
-    subprocess.run(
-        f"podman rm -f -i forge_sandbox_{timestamp}",
-        #"podman system prune -f && podman rm -f $(podman ps -aq)",
-        #"rm -rf ~/.podman-run/containers ~/.podman-run/libpod/tmp",
-        shell=True, 
-        stderr=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL
+    banner = (
+        f"Session: [{active_session}]\n"
+        f"Brain:      {config.LLM_PROFILES[config.ACTIVE_BRAIN_PROFILE]['name']}\n"
+        f"Coder:      {config.LLM_PROFILES[config.ACTIVE_CODER_PROFILE]['name']}\n"
+        f"Summarizer: {config.LLM_PROFILES[config.ACTIVE_SUMMARIZER_PROFILE]['name']}\n"
+        f"Adviser:    {config.LLM_PROFILES[config.ACTIVE_ADVISER_PROFILE]['name']}\n"
+        f"Log saved to: {LOG_FILE}"
     )
-
-    prompt_session = PromptSession()
+    log_event("SYSTEM", banner)
+    
+    prompt_session = None
     quit_app = False
     last_known_tokens = 0 # State tracker for accurate token checking
     
@@ -153,7 +190,29 @@ async def run_chat():
 
     # THE SELF-HEALING CONNECTION LOOP
     while not quit_app:
+        # Clear stale Podman WSL state before every single boot/reboot ---
+        if config.CONSOLE_MODE != "silent":
+            print(f"{COLOR_DIM}Sweeping stale Podman state...{COLOR_RESET}")
+
+        subprocess.run(
+            f"podman rm -f -i forge_sandbox_{timestamp}",
+            #"podman system prune -f && podman rm -f $(podman ps -aq)",
+            #"rm -rf ~/.podman-run/containers ~/.podman-run/libpod/tmp",
+            shell=True, 
+            stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL
+        )
+
         try:
+            # --- 1. DYNAMICALLY BUILD THE TARGET COMMAND ---
+            # Start with the base command
+            god_tools_cmd = "pixi run --manifest-path /app/pixi.toml -q python /app/god_tools.py"
+            
+            # Append any CLI profile overrides that were provided
+            if cli_args.coder is not None: god_tools_cmd += f" --coder {cli_args.coder}"
+            if cli_args.summarizer is not None: god_tools_cmd += f" --summarizer {cli_args.summarizer}"
+            if cli_args.adviser is not None: god_tools_cmd += f" --adviser {cli_args.adviser}"
+                    
             server_params = StdioServerParameters(
                 command="podman",
                 args=[
@@ -175,7 +234,7 @@ async def run_chat():
                     "-v", f"{os.path.abspath('./god_tools.py')}:/app/god_tools.py:ro,Z",
                     "-v", f"{config.HOST_INPUT_DIR}:/app/host_input:ro,Z", # same for all sessions, read only
                     "ai-forge",
-                    "bash", "-c", """
+                    "bash", "-c", f"""
                     # 1. Ensure the persistent custom packages folder exists
                     mkdir -p /app/workspace/custom_packages
                     
@@ -184,7 +243,7 @@ async def run_chat():
                     
                     # 3. Start the MCP server using the Base Image's heavy Pixi environment
                     cd /app/workspace
-                    pixi run --manifest-path /app/pixi.toml -q python /app/god_tools.py
+                    {god_tools_cmd}
                     """
                 ]
             )
@@ -207,17 +266,37 @@ async def run_chat():
                         for t in mcp_tools.tools
                     ]
                     
+                    # Initialize tracker outside the loop
+                    cli_prompt_consumed = False
+                    
                     while True:
                         try:
-                            prompt_text = ANSI(f"\n{COLOR_RED}YOU: {COLOR_RESET}")
-                            user_input = await prompt_session.prompt_async(prompt_text)
-                            user_input = user_input.strip()
+                            # 1. Check if we have a CLI or Piped prompt to use first
+                            if cli_prompt and not cli_prompt_consumed:
+                                user_input = cli_prompt
+                                cli_prompt_consumed = True
+                            else:
+                                # 2. Auto-exit for silent mode after CLI prompt is done
+                                if cli_prompt and (config.CONSOLE_MODE == "silent" or cli_args.exit):
+                                    quit_app = True
+                                    break
+                                    
+                                # 3. Normal interactive mode
+                                # Only initialize the prompter if we actually need human input!
+                                if prompt_session is None:
+                                    prompt_session = PromptSession()
+
+                                prompt_text = ANSI(f"\n{COLOR_RED}YOU: {COLOR_RESET}")
+                                user_input = await prompt_session.prompt_async(prompt_text)
+                                
+                        # Catch Ctrl+C and Ctrl+D gracefully
                         except KeyboardInterrupt:
                             continue
                         except EOFError:
                             quit_app = True
                             break
-                        
+
+                        user_input = user_input.strip()
                         if user_input.lower() in ['/quit', '/exit', 'quit', 'exit']: 
                             quit_app = True
                             break
@@ -280,18 +359,24 @@ async def run_chat():
 
                                 response_stream = await brain_client.chat.completions.create(**api_args)
                                 
-                                time_str = datetime.now().strftime("%H:%M:%S")
-                                print(f"\n{COLOR_BLUE}[{time_str}] === BRAIN ==={COLOR_RESET}")
+                                if config.CONSOLE_MODE != "silent":
+                                    time_str = datetime.now().strftime("%H:%M:%S")
+                                    print(f"\n{COLOR_BLUE}[{time_str}] === BRAIN ==={COLOR_RESET}")
                                 
                                 full_content = ""
                                 full_thinking = ""
                                 tool_calls_dict = {}
                                 final_usage = None
                                 
-                                # Use async for to loop through the stream ---
-                                with Live(console=console, refresh_per_second=5, transient=False) as live:
+                                # --- MULTI-MODE CONTEXT ROUTING ---
+                                if config.CONSOLE_MODE == "formatted":
+                                    display_ctx = Live(console=console, refresh_per_second=4, transient=False)
+                                else:
+                                    display_ctx = nullcontext()
+
+                                with display_ctx as live:
                                     async for chunk in response_stream:
-                                        # 1. MOVE USAGE OUTSIDE: Always capture metadata regardless of choices
+                                        
                                         if chunk.usage:
                                             final_usage = chunk.usage
 
@@ -306,6 +391,7 @@ async def run_chat():
                                             if chunk_thinking: full_thinking += chunk_thinking
                                             if delta.content: full_content += delta.content
 
+                                            # (Keep your existing tool_calls_dict logic here)
                                             if delta.tool_calls:
                                                 for tc in delta.tool_calls:
                                                     if tc.index not in tool_calls_dict:
@@ -317,31 +403,38 @@ async def run_chat():
                                                     if tc.function.arguments:
                                                         tool_calls_dict[tc.index]["function"]["arguments"] += tc.function.arguments
 
-                                            # --- ENHANCED UI ASSEMBLY ---
-                                            display_elements = []
-                                            
-                                            if full_thinking:
-                                                display_elements.append(Panel(
-                                                    Markdown(full_thinking),
-                                                    title="[bold yellow]BRAIN THOUGHTS[/bold yellow]",
-                                                    border_style="yellow",
-                                                    padding=(1, 2),
-                                                    subtitle="[dim white]Internal Logic Loop[/dim white]"
-                                                ))
-                                                
-                                            if full_content:
-                                                display_elements.append(Markdown(full_content))
-                                            
-                                            # 2. ADD TOOL STATUS: If there's no text yet but there ARE tool calls, show it!
-                                            if not full_content and tool_calls_dict:
-                                                tool_names = [tc['function']['name'] for tc in tool_calls_dict.values()]
-                                                display_elements.append(Markdown(f"*Preparing tool calls: {', '.join(f'`{n}`' for n in tool_names)}...*"))
-                                                
-                                            if display_elements:
-                                                live.update(Group(*display_elements))
 
-                                print() # Drop a single clean newline after the stream
-                                
+                                            # --- CONSOLE MODE DISPATCHER ---
+                                            if config.CONSOLE_MODE == "text":
+                                                # Classic raw streaming
+                                                if chunk_thinking:
+                                                    print(f"{COLOR_DIM}{chunk_thinking}{COLOR_RESET}", end="", flush=True)
+                                                if delta.content:
+                                                    print(delta.content, end="", flush=True)
+                                                    
+                                            elif config.CONSOLE_MODE == "formatted":
+                                                # Rich UI Assembly
+                                                display_elements = []
+                                                if full_thinking:
+                                                    display_elements.append(Panel(
+                                                        Markdown(full_thinking),
+                                                        title="[bold yellow]BRAIN THOUGHTS[/bold yellow]", border_style="yellow", padding=(1, 2), subtitle="[dim white]Internal Logic Loop[/dim white]"
+                                                    ))
+                                                if full_content:
+                                                    display_elements.append(Markdown(full_content))
+                                                
+                                                if not full_content and tool_calls_dict:
+                                                    tool_names = [tc['function']['name'] for tc in tool_calls_dict.values()]
+                                                    display_elements.append(Markdown(f"*Preparing tool calls: {', '.join(f'`{n}`' for n in tool_names)}...*"))
+                                                    
+                                                if display_elements:
+                                                    live.update(Group(*display_elements))
+                                                    
+                                            # If mode is "silent", we do nothing visually!
+
+                                if config.CONSOLE_MODE != "silent":
+                                    print() # Drop a single clean newline after the stream is fully finished
+                                    
                                 assistant_message = {"role": "assistant", "content": full_content}
                                 
                                 if full_thinking:
@@ -365,10 +458,11 @@ async def run_chat():
                                     if reasoning_tokens == 0 and full_thinking:
                                         reasoning_tokens = len(full_thinking) // 4
                                         
-                                    if reasoning_tokens > 0:
-                                        print(f"{COLOR_YELLOW}[Tokens: {final_usage.prompt_tokens} in | {final_usage.completion_tokens} out (~{reasoning_tokens} thinking)]{COLOR_RESET}")
-                                    else:
-                                        print(f"{COLOR_YELLOW}[Tokens: {final_usage.prompt_tokens} in | {final_usage.completion_tokens} out]{COLOR_RESET}")
+                                    if config.CONSOLE_MODE != "silent":   
+                                        if reasoning_tokens > 0:
+                                            print(f"{COLOR_YELLOW}[Tokens: {final_usage.prompt_tokens} in | {final_usage.completion_tokens} out (~{reasoning_tokens} thinking)]{COLOR_RESET}")
+                                        else:
+                                            print(f"{COLOR_YELLOW}[Tokens: {final_usage.prompt_tokens} in | {final_usage.completion_tokens} out]{COLOR_RESET}")
 
                                 if not tool_calls_dict:
                                     break
@@ -404,12 +498,13 @@ async def run_chat():
                                         continue 
 
                                     log_event("TOOL CALL", f"Requesting: {name}\nArgs: {json.dumps(args, indent=2)}")
-                                    
-                                    if name == "forge_and_register_tool":
-                                        print(f"\n{COLOR_ORANGE}▶ Passing task to Coder... Awaiting response...{COLOR_RESET}")
-                                    elif name == "compress_and_store_context":
-                                        print(f"\n{COLOR_ORANGE}▶ Triggering Memory Manager Pipeline... Awaiting response...{COLOR_RESET}")
-                                        
+
+                                    if config.CONSOLE_MODE != "silent":                                    
+                                        if name == "forge_and_register_tool":
+                                            print(f"\n{COLOR_ORANGE}▶ Passing task to Coder... Awaiting response...{COLOR_RESET}")
+                                        elif name == "compress_and_store_context":
+                                            print(f"\n{COLOR_ORANGE}▶ Triggering Memory Manager Pipeline... Awaiting response...{COLOR_RESET}")
+                                            
                                     start = time.time()
                                     result = await session.call_tool(name, args)
                                     output = result.content[0].text
@@ -432,16 +527,20 @@ async def run_chat():
 
                                     if coder_thoughts or coder_code:
                                         time_str = datetime.now().strftime("%H:%M:%S")
-                                        print(f"\n{COLOR_ORANGE}[{time_str}] === CODER (HIDDEN) ==={COLOR_RESET}")
                                         log_text = f"\n[{time_str}] === CODER (HIDDEN) ===\n"
 
+                                        if config.CONSOLE_MODE != "silent":
+                                            print(f"\n{COLOR_ORANGE}[{time_str}] === CODER (HIDDEN) ==={COLOR_RESET}")
+
                                         if coder_thoughts:
-                                            print(f"{COLOR_DIM}--- THOUGHTS ---\n{coder_thoughts}\n{COLOR_RESET}")
                                             log_text += f"--- THOUGHTS ---\n{coder_thoughts}\n\n"
+                                            if config.CONSOLE_MODE != "silent":
+                                                print(f"{COLOR_DIM}--- THOUGHTS ---\n{coder_thoughts}\n{COLOR_RESET}")
 
                                         if coder_code:
-                                            print(f"--- GENERATED CODE ---\n{coder_code}\n")
                                             log_text += f"--- GENERATED CODE ---\n{coder_code}\n\n"
+                                            if config.CONSOLE_MODE != "silent":
+                                                print(f"--- GENERATED CODE ---\n{coder_code}\n")
 
                                         with open(LOG_FILE, "a", encoding="utf-8") as f:
                                             f.write(log_text)

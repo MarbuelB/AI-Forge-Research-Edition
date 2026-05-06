@@ -18,6 +18,10 @@ SESSION_ID = None
 
 HOST_INPUT_DIR = os.path.abspath("./my_host_input")   # Folder you drop files into
 
+# --- UI SETTINGS ---
+# Options: "formatted" (Rich Markdown), "text" (Classic streaming text), "silent" (No console output)
+CONSOLE_MODE = "formatted"
+
 PROMPTS = {
     "overseer_system": r"""You are the Overseer, the logical Brain of an autonomous AI framework. Your objective is to solve user requests by orchestrating a suite of native and dynamically forged Python tools.
 

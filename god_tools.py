@@ -7,12 +7,33 @@ import traceback
 import logging
 import re
 import sys
+import argparse
 from typing import Any
 from datetime import datetime
-from fastmcp import FastMCP
 from openai import AsyncOpenAI
 import config
 
+# --- HIDE FASTMCP INTERNAL LOGS BEFORE IMPORT ---
+# We MUST set this before importing FastMCP, otherwise it reads the default settings!
+os.environ["FASTMCP_LOG_ENABLED"] = "false"
+from fastmcp import FastMCP
+
+
+# --- CATCH CLI ARGUMENTS FROM PODMAN ---
+parser = argparse.ArgumentParser(description="Forge God Tools (Containerized)")
+parser.add_argument("--coder", type=int, help="Coder LLM profile index")
+parser.add_argument("--summarizer", type=int, help="Summarizer LLM profile index")
+parser.add_argument("--adviser", type=int, help="Adviser LLM profile index")
+args, unknown = parser.parse_known_args() # Ignore other arguments Podman might pass
+# --- HIDE ARGUMENTS FROM FASTMCP ---
+sys.argv = [sys.argv[0]] + unknown
+
+# --- OVERRIDE CONFIG IN MEMORY ---
+if args.coder is not None: config.ACTIVE_CODER_PROFILE = args.coder
+if args.summarizer is not None: config.ACTIVE_SUMMARIZER_PROFILE = args.summarizer
+if args.adviser is not None: config.ACTIVE_ADVISER_PROFILE = args.adviser
+
+## Start the MCP server
 mcp = FastMCP("TheForge")
 
 # --- MCP STREAM PROTECTION ---

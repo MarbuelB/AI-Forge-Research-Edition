@@ -100,6 +100,8 @@ Traditional agents lose track of time during long workflows. This framework util
 ### 11. Self-Healing JSON Interception
 Smaller or quantized models occasionally hallucinate malformed JSON when calling tools. The MCP server sits between the LLM and the tools, intercepting `JSONDecodeError` failures. Instead of crashing the script, it instantly returns a `SYSTEM ERROR` directly to the LLM, prompting it to fix its syntax and try again autonomously.
 
+### 12. Headless CLI & Multi-Mode UI
+The Overseer natively supports multiple visual modes via the command line. Run it in `formatted` mode for a rich, color-coded terminal dashboard, `text` mode for raw streaming, or `silent` mode to run the agent entirely in the background. With piped STDIN support, you can feed massive files directly into the AI through the bash pipeline and have it automatically exit (`-x`) when finished, turning the framework into a pure, headless Unix utility.
 
 ---
 
@@ -278,14 +280,30 @@ Build the rootless image by running:
 
 ## 🚀 How to Run & Manage Sessions
 
-### Starting a Chat
-To start the interactive framework, run the Overseer script via your Pixi environment:
+### Starting a Chat & CLI Usage
+The Overseer can be launched as a standard interactive chat or driven entirely via command-line arguments. To start a basic interactive session:
 
-    pixi run --locked python chat_overseer.py
+    pixi run python chat_overseer.py
 
-### Session Management
-Open `config.py` to control your workspaces. **Always use strings for Session IDs**.
-* `SESSION_ID = None` -> Starts a brand new, empty workspace.
+**CLI Arguments & Headless Execution:**
+You can override configurations, pipe in files, and trigger headless background tasks using the built-in CLI flags:
+* `-p`, `--prompt`: Pass an initial prompt directly (e.g., `-p "Analyze the data"`).
+* `-f`, `--format`: Override the UI mode. Options: `formatted` (Rich markdown panels), `text` (classic streaming), `silent` (pure background execution with zero console output).
+* `-s`, `--session`: Override the `SESSION_ID` to load or create a specific workspace (e.g., `-s "Project_X"`).
+* `-x`, `--exit`: Auto-exit back to your bash terminal when the AI finishes its tasks (perfect for single-shot scripts).
+* `--brain`, `--coder`, `--summarizer`, `--adviser`: Pass the index number of your LLM profiles to override the active models dynamically.
+
+**Advanced Usage Examples:**
+* **Rich Interactive Mode with Specific Models:**
+  `pixi run python chat_overseer.py -f formatted -s "Test_2" --brain 2 --coder 3`
+* **Headless Background Task (Auto-Exits when done):**
+  `pixi run python chat_overseer.py -f silent -s "Research" -x -p "Scrape the latest papers on CRISPR and save to outputs/summary.md"`
+* **Unix Pipeline (Pipe files directly into the AI):**
+  `cat error_log.txt | pixi run python chat_overseer.py -f text -x -p "Find the bug and write a python fix to outputs/fix.py"`
+
+### Session Management (Config Fallback)
+If you don't use the `-s` flag, the framework falls back to your `config.py`. **Always use strings for Session IDs**.
+* `SESSION_ID = None` -> Starts a brand new, uniquely timestamped workspace.
 * `SESSION_ID = "20260429180500"` -> Restores that specific session, loading all previously forged tools and state memory.
 
 ### Example Interaction Flow
