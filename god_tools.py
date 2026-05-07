@@ -893,57 +893,61 @@ async def fetch_webpage(url: str) -> str:
 
 
 @mcp.tool()
-async def analyze_file(filepath: str, instruction: str) -> str:
-    """Delegates the analysis of a massive text file, log, or image to the Analyst LLM.
-    Use this to prevent large files from blowing out your context window.
-    'filepath' must be the absolute path to the file.
-    'instruction' must be a specific question or command (e.g., "Summarize this", "Find the error on line 50", "What is in this image?").
+async def analyze_files(filepaths: list[str], instruction: str) -> str:
+    """Delegates the analysis of multiple massive text files, logs, or images to the Analyst LLM.
+    Use this to prevent large files from blowing out your context window, or to compare multiple files.
+    'filepaths' must be a list of absolute paths to the files.
+    'instruction' must be a specific question or command (e.g., "Compare these logs", "Find the error between this code and this log").
     """
-    if not os.path.exists(filepath):
-        return f"Error: File '{filepath}' does not exist."
-
-    # Guess the file type
-    mime_type, _ = mimetypes.guess_type(filepath)
-    is_image = mime_type and mime_type.startswith('image/')
-
     api_args = analyst_profile["api_params"].copy()
     api_args["model"] = analyst_profile["model"]
     
+    # We build a multi-part message array
+    user_content = [{"type": "text", "text": f"Instruction: {instruction}\n\n"}]
+    
     try:
-        if is_image:
-            # --- VISION PIPELINE ---
-            with open(filepath, "rb") as image_file:
-                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+        for filepath in filepaths:
+            if not os.path.exists(filepath):
+                user_content.append({"type": "text", "text": f"\n[ERROR: File '{filepath}' does not exist.]"})
+                continue
+
+            mime_type, _ = mimetypes.guess_type(filepath)
+            is_image = mime_type and mime_type.startswith('image/')
             
-            api_args["messages"] = [
-                {"role": "system", "content": config.PROMPTS["analyst_system"]},
-                {"role": "user", "content": [
-                    {"type": "text", "text": f"Instruction: {instruction}\n\nAnalyze this image:"},
-                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}}
-                ]}
-            ]
-        else:
-            # --- TEXT PIPELINE ---
-            with open(filepath, "r", encoding="utf-8", errors="replace") as text_file:
-                file_content = text_file.read()
-                
-            # Truncate to ~100k chars to prevent the Analyst from crashing
-            if len(file_content) > 100000:
-                file_content = file_content[:100000] + "\n... [TRUNCATED DUE TO SIZE]"
-                
-            api_args["messages"] = [
-                {"role": "system", "content": config.PROMPTS["analyst_system"]},
-                {"role": "user", "content": f"Instruction: {instruction}\n\n--- FILE CONTENT ---\n{file_content}"}
-            ]
+            filename = os.path.basename(filepath)
+            
+            if is_image:
+                # --- VISION PIPELINE ---
+                with open(filepath, "rb") as image_file:
+                    base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+                user_content.append({"type": "text", "text": f"\n--- IMAGE: {filename} ---"})
+                user_content.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}})
+            else:
+                # --- TEXT PIPELINE ---
+                with open(filepath, "r", encoding="utf-8", errors="replace") as text_file:
+                    file_content = text_file.read()
+                    
+                # Truncate to ~50k chars per file to prevent crashing the Analyst on multi-file requests
+                if len(file_content) > 50000:
+                    file_content = file_content[:50000] + "\n... [TRUNCATED DUE TO SIZE]"
+                    
+                user_content.append({"type": "text", "text": f"\n--- TEXT FILE: {filename} ---\n{file_content}\n"})
+
+        api_args["messages"] = [
+            {"role": "system", "content": config.PROMPTS["analyst_system"]},
+            {"role": "user", "content": user_content}
+        ]
 
         # Call the Analyst Model
         response = await analyst_client.chat.completions.create(**api_args)
         answer = response.choices[0].message.content
         
-        return f"--- ANALYST REPORT FOR {os.path.basename(filepath)} ---\n{answer}"
+        # Format the output header
+        file_list = ", ".join([os.path.basename(f) for f in filepaths])
+        return f"--- ANALYST REPORT FOR [{file_list}] ---\n{answer}"
         
     except Exception as e:
-        return f"Analyst failed to process file. Error: {str(e)}"
+        return f"Analyst failed to process files. Error: {str(e)}"
 
 if __name__ == "__main__":
     mcp.run()

@@ -257,6 +257,7 @@ async def run_chat():
                     "-v", f"{SESSION_DIR}:/app/workspace:Z",
                     "-v", f"{os.path.abspath('./config.py')}:/app/config.py:ro,Z",
                     "-v", f"{os.path.abspath('./god_tools.py')}:/app/god_tools.py:ro,Z",
+                    "-v", f"{os.path.abspath('./chat_overseer.py')}:/app/chat_overseer.py:ro,Z", # it can read own code
                     "-v", f"{config.HOST_INPUT_DIR}:/app/host_input:ro,Z", # same for all sessions, read only
                     "ai-forge",
                     "bash", "-c", f"""
@@ -533,8 +534,8 @@ async def run_chat():
                                             print(f"\n{COLOR_ORANGE}▶ Consulting Senior Adviser... Awaiting strategic report...{COLOR_RESET}")
                                         elif name == "query_universal_llm":
                                             print(f"\n{COLOR_ORANGE}▶ Spawning Sub-Agent... Awaiting response...{COLOR_RESET}")
-                                        elif name == "analyze_file":
-                                            print(f"\n{COLOR_ORANGE}▶ Passing file to The Analyst... Awaiting report...{COLOR_RESET}")
+                                        elif name == "analyze_files":
+                                            print(f"\n{COLOR_ORANGE}▶ Passing files to The Analyst... Awaiting report...{COLOR_RESET}")
                                             
                                     start = time.time()
                                     result = await session.call_tool(name, args)
