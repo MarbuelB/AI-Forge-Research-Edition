@@ -39,6 +39,7 @@ parser.add_argument("--brain", type=int, help="Brain LLM profile index")
 parser.add_argument("--coder", type=int, help="Coder LLM profile index")
 parser.add_argument("--summarizer", type=int, help="Summarizer LLM profile index")
 parser.add_argument("--adviser", type=int, help="Adviser LLM profile index")
+parser.add_argument("--analyst", type=int, help="Analyst LLM profile index")
 
 cli_args = parser.parse_args()
 
@@ -49,6 +50,7 @@ if cli_args.brain is not None: config.ACTIVE_BRAIN_PROFILE = cli_args.brain
 if cli_args.coder is not None: config.ACTIVE_CODER_PROFILE = cli_args.coder
 if cli_args.summarizer is not None: config.ACTIVE_SUMMARIZER_PROFILE = cli_args.summarizer
 if cli_args.adviser is not None: config.ACTIVE_ADVISER_PROFILE = cli_args.adviser
+if cli_args.analyst is not None: config.ACTIVE_ANALYST_PROFILE = cli_args.analyst
 
 # Capture Prompt (from -p flag OR piped STDIN)
 cli_prompt = cli_args.prompt
@@ -233,6 +235,7 @@ async def run_chat():
             if cli_args.coder is not None: god_tools_cmd += f" --coder {cli_args.coder}"
             if cli_args.summarizer is not None: god_tools_cmd += f" --summarizer {cli_args.summarizer}"
             if cli_args.adviser is not None: god_tools_cmd += f" --adviser {cli_args.adviser}"
+            if cli_args.analyst is not None: god_tools_cmd += f" --analyst {cli_args.analyst}"
                     
             server_params = StdioServerParameters(
                 command="podman",
@@ -530,6 +533,8 @@ async def run_chat():
                                             print(f"\n{COLOR_ORANGE}▶ Consulting Senior Adviser... Awaiting strategic report...{COLOR_RESET}")
                                         elif name == "query_universal_llm":
                                             print(f"\n{COLOR_ORANGE}▶ Spawning Sub-Agent... Awaiting response...{COLOR_RESET}")
+                                        elif name == "analyze_file":
+                                            print(f"\n{COLOR_ORANGE}▶ Passing file to The Analyst... Awaiting report...{COLOR_RESET}")
                                             
                                     start = time.time()
                                     result = await session.call_tool(name, args)

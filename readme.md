@@ -55,6 +55,7 @@ This project utilizes multiple distinct Large Language Models (LLMs) to maximize
 * **The Coder (The Hands):** A specialized coding model operating inside the Forge sandbox. It operates invisibly in the background. When the Brain needs a new tool, the Coder writes the Python script, validates its syntax, and saves it.
 * **The Summarizer (The Memory Manager):** A background agent responsible for context compression using strict JSON schemas.
 * **The Adviser (The Strategist):** A slow, extremely heavy reasoning model (e.g., DeepSeek-R1, Qwen 397B). It is invoked exclusively when the Brain encounters critical bottlenecks or requires strategic redirection.
+* **The Analyst (The Eyes & Data Miner):** A specialized context-isolation and vision agent. When the Brain needs to read a massive 50,000-line error log, parse a raw data dump, or look at an image, it delegates the file to the Analyst. The Analyst processes the heavy payload and returns a highly concentrated summary, keeping the Brain's context window clean, fast, and immune to data-bloat.
 * **Universal Sub-Agents:** The Brain has the ability to dynamically spawn its own temporary LLM sub-agents to delegate isolated tasks, test prompt engineering, or request second opinions using custom temperature and parameters.
 
 ### 2. The Auto-Retry Loop
@@ -83,6 +84,8 @@ To prevent the AI from reinventing the wheel with complex Python scripts, the sa
 * **Native Vector Database (Context-Bypass Architecture):** Equipped with `sqlite3` and the C-based `sqlite-vec` extension. The framework uses a strict Two-Table relational schema to link metadata directly to high-speed vector tables. 
   * *Zero Context Bloat:* When the Brain wants to insert or search semantic data, it simply passes a `text_to_embed` parameter to the SQL tool. The host proxy automatically routes the text to a local embedding model (e.g., Qwen 4096-dim), packs it into a binary BLOB, and injects it into the database. The massive floating-point arrays never touch the LLM's context window, drastically reducing token costs and preventing hallucination.
 * **Native Web Scraping:** Features a built-in `fetch_webpage` tool powered by headless Chromium and Playwright. It automatically renders JavaScript, bypasses basic bot protections, and strips HTML bloat, returning clean Markdown without the Brain writing a single line of scraper code.
+* **Native Multi-Modal Vision (VLM Support):** The framework isn't just limited to text. By pointing the Analyst profile to a local Vision-Language Model (like LLaVA or Qwen-VL), the AI framework can "see." The Brain can autonomously ask the Analyst to review generated charts, describe UI screenshots, or read scanned documents, fully integrating visual feedback into its reasoning loop.
+* **Context-Isolation Pattern:** Large files (codebases, logs, datasets) are strictly airlocked away from the Overseer's working memory. Through the `analyze_file` tool, the system utilizes a delegator pattern where heavy read-operations are offloaded to the Analyst, completely eliminating the "Context Blowout" problem common in standard LLM agents.
 * **Massive Data Processing:** Equipped with `aria2c` for high-speed parallel downloads and `pigz`/`zstd` for instantaneous decompression of massive genomic/data payloads.
 * **Media & Documents:** Pre-loaded with `tesseract-ocr`, `poppler-utils` (for direct PDF extraction), and `ffmpeg`.
 * **Scientific Rendering & Reporting:** Uses `graphviz` to render complex networks and `pandoc` to compile the AI's markdown findings directly into HTML, Word, or scientific PDF formats.
@@ -296,7 +299,7 @@ You can override configurations, pipe in files, and trigger headless background 
 * `-f`, `--format`: Override the UI mode. Options: `formatted` (Rich markdown panels), `text` (classic streaming), `silent` (pure background execution with zero console output).
 * `-s`, `--session`: Override the `SESSION_ID` to load or create a specific workspace (e.g., `-s "Project_X"`).
 * `-x`, `--exit`: Auto-exit back to your bash terminal when the AI finishes its tasks (perfect for single-shot scripts).
-* `--brain`, `--coder`, `--summarizer`, `--adviser`: Pass the index number of your LLM profiles to override the active models dynamically.
+* `--brain`, `--coder`, `--summarizer`, `--adviser`, `--analyst`: Pass the index number of your LLM profiles to override the active models dynamically.
 
 **Advanced Usage Examples:**
 * **Rich Interactive Mode with Specific Models:**

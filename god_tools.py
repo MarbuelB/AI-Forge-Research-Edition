@@ -12,6 +12,8 @@ import argparse
 import sqlite3
 import sqlite_vec
 import array
+import base64
+import mimetypes
 from typing import Any
 from datetime import datetime
 from openai import AsyncOpenAI
@@ -79,6 +81,13 @@ if adviser_profile.get("base_url"):
 else:
     adviser_client = AsyncOpenAI(api_key=adviser_profile["api_key"], timeout=300.0)
 
+analyst_profile = config.LLM_PROFILES[config.ACTIVE_ANALYST_PROFILE]
+
+if analyst_profile.get("base_url"):
+    analyst_client = AsyncOpenAI(base_url=analyst_profile["base_url"], api_key=analyst_profile["api_key"], timeout=300.0)
+else:
+    analyst_client = AsyncOpenAI(api_key=analyst_profile["api_key"], timeout=300.0)
+    
 # --- Initialize Universal Client ---
 uni_config = config.UNIVERSAL_LLM_CONFIG
 universal_client = AsyncOpenAI(
@@ -354,6 +363,10 @@ def write_file(filepath: str, content: str) -> str:
     If the file already exists, it automatically creates a timestamped backup before overwriting.
     Use this instead of bash 'echo' or 'cat' to write code, markdown, or text files safely.
     """
+
+    if filepath.strip().endswith(".py"):
+        return "SYSTEM ERROR: You are strictly FORBIDDEN from using write_file to create Python (.py) scripts. You MUST use 'forge_and_register_tool' so the Coder LLM can write it properly."
+
     try:
         # Check if we are overwriting an existing file
         if os.path.exists(filepath):
@@ -743,18 +756,19 @@ db_tool_desc = f"""Executes a SQL query against a specified SQLite database.
 'db_path' MUST be an absolute path (e.g., '/app/workspace/state/my_db.db').
 If your query requires standard parameters, pass them as a list in 'parameters'.
 
+CRITICAL RULES:
+- Always use LIMIT in your SELECT queries (e.g., LIMIT 10) to protect your context window!
+- You can ONLY execute ONE statement per tool call! Do NOT chain statements with semicolons (e.g., no `CREATE TABLE...; CREATE TABLE...;`). Call the tool twice instead.
+
 MAGIC VECTOR PIPELINE: If you provide a string in 'text_to_embed', the system will 
 silently generate its {config.EMBEDDING_CONFIG['dimensions']}-dimension vector and APPEND it to the end of your 'parameters' list.
 
-CRITICAL: Always use LIMIT in your SELECT queries (e.g., LIMIT 10) to protect your context window!
-
-Insert Example: 
-  query="INSERT INTO vec_table(rowid, embedding) VALUES (?, ?)"
-  parameters=[1]
-  text_to_embed="My document text"
+TWO-STEP INSERT: You CANNOT insert standard text and vectors in the same query! 
+Step 1: Insert metadata -> query="INSERT INTO docs(id, text) VALUES (?, ?)", parameters=[1, "My text"], text_to_embed=None
+Step 2: Insert vector -> query="INSERT INTO docs_vec(rowid, embedding) VALUES (?, ?)", parameters=[1], text_to_embed="My text"
   
-Search Example:
-  query="SELECT rowid, distance FROM vec_table WHERE embedding MATCH ? ORDER BY distance LIMIT 5"
+SEARCH SYNTAX: sqlite-vec requires the LIMIT to be applied directly to the vector table. If you want to return text metadata alongside the distance, you MUST wrap the MATCH query in a subquery like this:
+  query="SELECT m.*, v.distance FROM (SELECT rowid, distance FROM docs_vec WHERE embedding MATCH ? ORDER BY distance LIMIT 5) v JOIN docs m ON v.rowid = m.id"
   parameters=[]
   text_to_embed="My search query"
 """
@@ -876,6 +890,60 @@ async def fetch_webpage(url: str) -> str:
             
     except Exception as e:
         return f"Failed to fetch {url}. Error: {str(e)}"
+
+
+@mcp.tool()
+async def analyze_file(filepath: str, instruction: str) -> str:
+    """Delegates the analysis of a massive text file, log, or image to the Analyst LLM.
+    Use this to prevent large files from blowing out your context window.
+    'filepath' must be the absolute path to the file.
+    'instruction' must be a specific question or command (e.g., "Summarize this", "Find the error on line 50", "What is in this image?").
+    """
+    if not os.path.exists(filepath):
+        return f"Error: File '{filepath}' does not exist."
+
+    # Guess the file type
+    mime_type, _ = mimetypes.guess_type(filepath)
+    is_image = mime_type and mime_type.startswith('image/')
+
+    api_args = analyst_profile["api_params"].copy()
+    api_args["model"] = analyst_profile["model"]
+    
+    try:
+        if is_image:
+            # --- VISION PIPELINE ---
+            with open(filepath, "rb") as image_file:
+                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+            
+            api_args["messages"] = [
+                {"role": "system", "content": config.PROMPTS["analyst_system"]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": f"Instruction: {instruction}\n\nAnalyze this image:"},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}}
+                ]}
+            ]
+        else:
+            # --- TEXT PIPELINE ---
+            with open(filepath, "r", encoding="utf-8", errors="replace") as text_file:
+                file_content = text_file.read()
+                
+            # Truncate to ~100k chars to prevent the Analyst from crashing
+            if len(file_content) > 100000:
+                file_content = file_content[:100000] + "\n... [TRUNCATED DUE TO SIZE]"
+                
+            api_args["messages"] = [
+                {"role": "system", "content": config.PROMPTS["analyst_system"]},
+                {"role": "user", "content": f"Instruction: {instruction}\n\n--- FILE CONTENT ---\n{file_content}"}
+            ]
+
+        # Call the Analyst Model
+        response = await analyst_client.chat.completions.create(**api_args)
+        answer = response.choices[0].message.content
+        
+        return f"--- ANALYST REPORT FOR {os.path.basename(filepath)} ---\n{answer}"
+        
+    except Exception as e:
+        return f"Analyst failed to process file. Error: {str(e)}"
 
 if __name__ == "__main__":
     mcp.run()
