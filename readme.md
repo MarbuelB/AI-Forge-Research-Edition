@@ -95,16 +95,21 @@ To prevent the Brain from getting lost in the weeds of complex multi-step tasks,
 * **The Master Plan:** The Brain maintains a persistent Markdown file (`active_plan.md`) in its state folder to track overall objectives and checklists. It reads this plan upon waking up and seamlessly updates it when milestones are reached.
 * **The Red Team Loop (Adviser):** If the Brain gets stuck on a coding error or logical dead end, it uses the `consult_adviser` tool. This packages the current plan, registries, and the encountered problem, and sends it to a Senior Adviser LLM. The Adviser generates a timestamped strategic advisory report saved to disk, enabling true autonomous self-correction without user hand-holding.
 
-### 9. Intelligent Loop Detection (The Runaway Train Failsafe)
-To prevent the AI from burning tokens in infinite error loops, the Overseer script tracks consecutive, uninterrupted tool calls. Every 100 tool calls, it triggers a "Soft Pause" by injecting a system prompt that forces the Brain to self-evaluate its progress. If the AI hits 300 consecutive tool chains, the system executes a "Hard Stop," protecting API limits and forcing the AI to await human intervention.
-
+### 9. Intelligent Loop Detection & Circuit Breakers
+To prevent the AI from burning tokens in infinite error loops, the Overseer utilizes two distinct failsafes:
+* **The Micro-Breaker (Failure Streaks):** The script tracks consecutive errors per tool. If the AI goes "blind" and fails to use the exact same tool 3 times in a row, the system forcefully intercepts the prompt with a [CRITICAL SYSTEM ALERT], snapping the AI out of its apology loop and commanding it to pivot its strategy.
+* **The Macro-Breaker (Runaway Trains):** The script tracks uninterrupted tool chains. Every 100 tool calls, it triggers a "Soft Pause" by injecting a system prompt that forces the Brain to self-evaluate. If the AI hits 300 consecutive tool chains, the system executes a "Hard Stop," forcing the AI to await human intervention.
+ 
 ### 10. Perfect Temporal Awareness (The Live Clock)
 Traditional agents lose track of time during long workflows. This framework utilizes a "Sweep & Replace" dynamic time injection. On every single API turn, the AI's context is injected with a Live System Clock down to the exact second. This allows the AI to accurately timestamp files and memories, without bloating the permanent `current_history.json` log with stale timestamps.
 
 ### 11. Self-Healing JSON Interception
 Smaller or quantized models occasionally hallucinate malformed JSON when calling tools. The MCP server sits between the LLM and the tools, intercepting `JSONDecodeError` failures. Instead of crashing the script, it instantly returns a `SYSTEM ERROR` directly to the LLM, prompting it to fix its syntax and try again autonomously.
 
-### 12. Headless CLI & Multi-Mode UI
+### 12. On-Demand Observability (Self-Debugging)
+Standard agents crash silently when background Python dependencies fail. This framework features on-demand internal observability. FastMCP container logs are routed to a persistent container_debug.log file. If a tool fails unpredictably, the Brain is prompted to dynamically act as a Senior Developer: it passes the log file to the Analyst sub-agent, asking it to find the stack trace and summarize the failure. The Brain then autonomously uses the Coder to install the missing dependencies and retries the task.
+
+### 13. Headless CLI & Multi-Mode UI
 The Overseer natively supports multiple visual modes via the command line. Run it in `formatted` mode for a rich, color-coded terminal dashboard, `text` mode for raw streaming, or `silent` mode to run the agent entirely in the background. With piped STDIN support, you can feed massive files directly into the AI through the bash pipeline and have it automatically exit (`-x`) when finished, turning the framework into a pure, headless Unix utility.
 
 ---
@@ -128,7 +133,7 @@ The Overseer natively supports multiple visual modes via the command line. Run i
   * `/memories`: Where the detailed Markdown files live.
   * `/archive`: The dedicated "Soft-Delete" trash bin.
 * **Zero-Trust Architecture:** The container contains absolutely NO sensitive data, API keys, or `.env` files. The AI uses hardcoded dummy keys (e.g., `sk-sandbox-fake-key`) and routes all requests to a local `host.containers.internal` gateway. Authentication and routing are securely handled by a LiteLLM proxy running safely on the Windows/WSL host, making credential theft mathematically impossible.
-* **Context Preservation (I/O Truncation):** If the AI executes a bash command that floods the terminal with thousands of lines, the system automatically intercepts and truncates the output at 5,000 characters. It warns the AI to gracefully redirect large data to files (`> output.txt`), preventing server crashes and context-window exhaustion.
+* **Context Preservation (I/O Truncation):** If the AI executes a bash command or scrapes a webpage that returns a massive payload (e.g., >5,000 characters), the system intercepts it. Instead of flooding the context window, the framework automatically saves the full output to a timestamped text file inside the sandbox. It then returns a tiny preview and a "Pointer" path back to the Brain, explicitly instructing it to delegate the heavy reading to the Analyst LLM.
 * **Network Isolation:** The container runs on an isolated bridge network (`slirp4netns`). It communicates with local/tunneled LLMs strictly via the `host.containers.internal` gateway.
 * **Anti-Deletion Protocol (Soft-Deletes):** The AI is strictly prompted against using destructive commands like `rm` or `DROP TABLE`. Instead, it is trained to use a robust "Soft-Delete" protocol. If it needs to rewrite a Python script or rebuild a database schema, it automatically uses the native `write_file` tool to create timestamped `.bak` copies, or uses bash `mv` to send old databases to the `/archive` folder. This provides a flawless audit trail and guarantees zero data loss during autonomous operations.
 

@@ -8,11 +8,13 @@ import logging
 import re
 import sys
 import shutil
+import shlex
 import argparse
 import sqlite3
 import sqlite_vec
 import array
 import base64
+import urllib.parse
 import mimetypes
 from typing import Any
 from datetime import datetime
@@ -33,6 +35,7 @@ parser = argparse.ArgumentParser(description="Forge God Tools (Containerized)")
 parser.add_argument("--coder", type=int, help="Coder LLM profile index")
 parser.add_argument("--summarizer", type=int, help="Summarizer LLM profile index")
 parser.add_argument("--adviser", type=int, help="Adviser LLM profile index")
+parser.add_argument("--analyst", type=int, help="Analyst LLM profile index")
 args, unknown = parser.parse_known_args() # Ignore other arguments Podman might pass
 # --- HIDE ARGUMENTS FROM FASTMCP ---
 sys.argv = [sys.argv[0]] + unknown
@@ -41,16 +44,25 @@ sys.argv = [sys.argv[0]] + unknown
 if args.coder is not None: config.ACTIVE_CODER_PROFILE = args.coder
 if args.summarizer is not None: config.ACTIVE_SUMMARIZER_PROFILE = args.summarizer
 if args.adviser is not None: config.ACTIVE_ADVISER_PROFILE = args.adviser
+if args.analyst is not None: config.ACTIVE_ANALYST_PROFILE = args.analyst
 
 ## Start the MCP server
 mcp = FastMCP("TheForge")
 
-# --- MCP STREAM PROTECTION ---
-# Suppress all third-party Python logging to prevent them from printing 
-# rogue text to stdout and corrupting the FastMCP JSON-RPC stream.
-logging.getLogger().setLevel(logging.CRITICAL)
-logging.getLogger("httpx").setLevel(logging.CRITICAL)
-logging.getLogger("openai").setLevel(logging.CRITICAL)
+
+# --- MCP STREAM PROTECTION & LOGGING ---
+# Suppress stdout logging to protect FastMCP, but route logs to a file for debugging
+import logging
+log_file_path = "/app/workspace/logs/container_debug.log"
+
+logging.basicConfig(
+    filename=log_file_path,
+    level=logging.WARNING, # Change to logging.INFO if you want maximum detail
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+# Forcefully clear any existing console handlers that might corrupt the JSON-RPC stream
+logging.getLogger().handlers = [h for h in logging.getLogger().handlers if isinstance(h, logging.FileHandler)]
+
 
 WORKSPACE_DIR = "/app/workspace"
 STATE_DIR = os.path.join(WORKSPACE_DIR, "state")
@@ -305,13 +317,18 @@ async def execute_bash(command: Any = None, cmd: Any = None, timeout_seconds: in
     """Executes a bash command STRICTLY inside the sandbox directory. 
     'timeout_seconds' defaults to 60. Increase it up to 600 if you expect a long-running process like a massive download."""
     
-    # 1. Catch if it used 'cmd' instead of 'command'
+    # 1. Block Destructive Commands
+    destructive_patterns = ["rm -rf", "rm -r", "rm ", "mv /app/workspace /", "> /dev/null"]
+    if any(pattern in command.lower() for pattern in destructive_patterns):
+        return "SYSTEM ERROR: Destructive commands (rm) are blocked. Use the archive folder instead."
+
+    # 2. Catch if it used 'cmd' instead of 'command'
     if command is None and cmd is not None:
         return "SYSTEM ERROR: You used the wrong parameter name. You MUST use 'command', not 'cmd'."
     if command is None:
         return "SYSTEM ERROR: Missing required parameter 'command'."
 
-    # 2. Catch if it used a list/array instead of a string
+    # 3. Catch if it used a list/array instead of a string
     if not isinstance(command, str):
         return 'SYSTEM ERROR: The "command" parameter must be a SINGLE string, not a list or array. Example: command="ls -la /app"'
                     
@@ -343,13 +360,23 @@ async def execute_bash(command: Any = None, cmd: Any = None, timeout_seconds: in
         # Decode the byte stream safely
         output = stdout_data.decode('utf-8', errors='replace') if stdout_data else ""
 
-        # Preview + File Redirection Prompt ---
-        if len(output) > 5000:
-            preview = output[:1000] # Give it just enough to see the structure/headers
-            return (f"Exit Code: {process.returncode}\nOutput Preview (First 1000 chars):\n{preview}\n\n"
-                    f"... [SYSTEM WARNING: The full output was over 5000 characters and has been truncated. "
-                    f"Do NOT attempt to parse this preview. If you need the full data, run your command again "
-                    f"and append `> filename.txt` to save it to a file. Then, write a Python tool to extract the specific info.]")
+        # --- THE POINTER APPROACH (Context Protection) ---
+        if len(output) > 10000:
+            # Generate a clean timestamped filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            temp_file_name = f"cmd_output_{timestamp}.txt"
+            temp_file_path = os.path.join(SANDBOX_DIR, temp_file_name)
+            
+            # Save the full massive output safely to the sandbox
+            with open(temp_file_path, "w", encoding="utf-8") as f:
+                f.write(output)
+                
+            preview = output[:3000] # Give it just enough to see the structure/headers
+            
+            return (f"Exit Code: {process.returncode}\n"
+                    f"Output Preview (First 3000 chars):\n{preview}\n\n"
+                    f"... [SYSTEM: The full output ({len(output)} chars) was too large for your context window and was saved to '/app/workspace/sandbox/{temp_file_name}'. "
+                    f"Do NOT attempt to parse this preview. If you need the full data, use the 'analyze_files' tool or bash 'grep'.]")
 
         return f"Exit Code: {process.returncode}\nOutput:\n{output}"
         
@@ -361,11 +388,28 @@ async def execute_bash(command: Any = None, cmd: Any = None, timeout_seconds: in
 def write_file(filepath: str, content: str) -> str:
     """Creates or overwrites a file with the provided content.
     If the file already exists, it automatically creates a timestamped backup before overwriting.
-    Use this instead of bash 'echo' or 'cat' to write code, markdown, or text files safely.
+    Use this instead of bash 'echo' or 'cat' to write markdown, or text files safely.
+    You can only write to 'outputs' or 'sandbox' directories.
+    IMPORTANT: For Python code, use forge_and_register_tool!
     """
 
     if filepath.strip().endswith(".py"):
         return "SYSTEM ERROR: You are strictly FORBIDDEN from using write_file to create Python (.py) scripts. You MUST use 'forge_and_register_tool' so the Coder LLM can write it properly."
+
+    # 1. Resolve the absolute path
+    resolved_path = os.path.realpath(filepath)
+    
+    # 2. Define safe zones
+    allowed_dirs = [
+        os.path.realpath("/app/workspace/outputs"),
+        os.path.realpath("/app/workspace/sandbox")
+    ]
+    
+    # 3. Check if the resolved path starts with any allowed directory
+    is_safe = any(resolved_path.startswith(safe_dir) for safe_dir in allowed_dirs)
+    
+    if not is_safe:
+        return f"SYSTEM ERROR: Path Traversal Blocked. You are only allowed to write files to {allowed_dirs}."
 
     try:
         # Check if we are overwriting an existing file
@@ -685,7 +729,14 @@ async def forge_and_register_tool(category: str, category_description: str, tool
             thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
                 
             token_report = f"[Tokens used by Coder: {tokens_in} in | {tokens_out} out" + (f" ({thinking_tokens} thinking)]" if thinking_tokens > 0 else "]")
-                
+            
+            # --- AUTO-BACKUP SYSTEM ---
+            if os.path.exists(file_path):
+                timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                backup_dir = os.path.join(WORKSPACE_DIR, "archive")
+                backup_path = os.path.join(backup_dir, f"{safe_name}_{timestamp}.bak.py")
+                shutil.copy2(file_path, backup_path)
+            
             with open(file_path, "w") as f: 
                 f.write(code)
 
@@ -698,11 +749,15 @@ async def forge_and_register_tool(category: str, category_description: str, tool
                 
                 # Sanitize the string (in case the AI wrote 'pip install' or 'pixi add')
                 clean_deps = deps.replace("pip install", "").replace("pixi add", "").strip()
-                
-                # Install directly into the Session's persistent delta folder
-                install_cmd = f"{sys.executable} -m pip install --target /app/workspace/custom_packages {clean_deps}"
-                
-                install_check = subprocess.run(install_cmd, shell=True, cwd=WORKSPACE_DIR, capture_output=True, text=True)
+
+                # Safely split the string into a list of arguments, neutralizing semicolons/pipes
+                safe_deps_list = shlex.split(clean_deps) 
+
+                install_cmd = [sys.executable, "-m", "pip", "install", "--target", "/app/workspace/custom_packages"] + safe_deps_list
+
+                # shell=False (the default) prevents any chained command execution
+                install_check = subprocess.run(install_cmd, cwd=WORKSPACE_DIR, capture_output=True, text=True)
+
                 if install_check.returncode == 0:
                     deps_report = f"\n[SYSTEM: Automatically installed '{clean_deps}' into persistent session delta.]"
                 else:
@@ -798,9 +853,14 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, tex
             
             # Append the binary blob to the parameters list silently
             parameters.append(vector_blob)
-
+        
+        upper_query = query.strip().upper()
+        if upper_query.startswith("DROP TABLE") or upper_query.startswith("DELETE FROM"):
+            return "SYSTEM ERROR: 'DROP TABLE' and 'DELETE FROM' are disabled for safety. To 'delete' data, use an 'is_archived' boolean column, or rename the table using ALTER."
+        
         # --- Database Execution ---
         conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
         
@@ -833,8 +893,8 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, tex
                 result_str = json.dumps(data, indent=2)
                 
                 # FAILSAFE 2: Hard limit on character length (in case a single row has massive text)
-                if len(result_str) > 10000:
-                    result_str = result_str[:10000] + "\n\n... [SYSTEM WARNING: JSON output exceeded 10,000 characters and was truncated. Refine your SQL query to select fewer columns or specific rows.]"
+                if len(result_str) > 20000:
+                    result_str = result_str[:20000] + "\n\n... [SYSTEM WARNING: JSON output exceeded 20,000 characters and was truncated. Refine your SQL query to select fewer columns or specific rows.]"
                 else:
                     result_str += warning_msg
         else:
@@ -846,7 +906,7 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, tex
         return result_str
         
     except Exception as e:
-        return f"Database Error: {str(e)}"
+        return f"SYSTEM ERROR: Database Exception: {str(e)}"
 
         
 @mcp.tool()
@@ -865,7 +925,7 @@ async def fetch_webpage(url: str) -> str:
             page = await browser.new_page()
             
             # Navigate and wait for the page to finish loading its network requests (JS rendering)
-            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=60)
             
             # Extract the raw HTML after JS has executed
             html_content = await page.content()
@@ -882,12 +942,27 @@ async def fetch_webpage(url: str) -> str:
             # Clean up excessive newlines to protect the context window
             clean_text = re.sub(r'\n\s*\n', '\n\n', text).strip()
             
-            # Hard limit: Protect the LLM from massive pages
+            # --- THE POINTER APPROACH (Context Protection) ---
             if len(clean_text) > 20000:
-                clean_text = clean_text[:20000] + "\n\n... [SYSTEM WARNING: Content truncated for length. Too much text.]"
+                # Create a safe filename based on the domain name
+                parsed_url = urllib.parse.urlparse(url)
+                safe_domain = re.sub(r'[^a-zA-Z0-9]', '_', parsed_url.hostname or "webpage")
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                temp_file_name = f"web_{safe_domain}_{timestamp}.txt"
+                temp_file_path = os.path.join(SANDBOX_DIR, temp_file_name)
+                
+                # Save the full scraped text
+                with open(temp_file_path, "w", encoding="utf-8") as f:
+                    f.write(f"--- FULL CONTENT FROM {url} ---\n\n{clean_text}")
+                    
+                preview = clean_text[:6000]
+                
+                return (f"--- PREVIEW FROM {url} ---\n\n{preview}\n\n"
+                        f"... [SYSTEM: The webpage was {len(clean_text)} characters long. To protect your context window, "
+                        f"the full text was saved to '/app/workspace/sandbox/{temp_file_name}'. Use the 'analyze_files' tool to read it fully if needed.]")
                 
             return f"--- CONTENT FROM {url} ---\n\n{clean_text}"
-            
+
     except Exception as e:
         return f"Failed to fetch {url}. Error: {str(e)}"
 
@@ -925,11 +1000,11 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
             else:
                 # --- TEXT PIPELINE ---
                 with open(filepath, "r", encoding="utf-8", errors="replace") as text_file:
-                    file_content = text_file.read()
+                    file_content = text_file.read(50000) # Only reads the first 50k characters
                     
                 # Truncate to ~50k chars per file to prevent crashing the Analyst on multi-file requests
-                if len(file_content) > 50000:
-                    file_content = file_content[:50000] + "\n... [TRUNCATED DUE TO SIZE]"
+                if len(file_content) == 50000:
+                    file_content += "\n... [TRUNCATED DUE TO SIZE]"
                     
                 user_content.append({"type": "text", "text": f"\n--- TEXT FILE: {filename} ---\n{file_content}\n"})
 
@@ -937,17 +1012,67 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
             {"role": "system", "content": config.PROMPTS["analyst_system"]},
             {"role": "user", "content": user_content}
         ]
+        
+        # --- 1. FORCE THE JSON SCHEMA ---
+        api_args["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "analyst_report_schema",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "executive_summary": {
+                            "type": "string", 
+                            "description": "A 1-3 sentence definitive answer or core conclusion."
+                        },
+                        "full_report": {
+                            "type": "string", 
+                            "description": "The exhaustive, detailed analysis and breakdown."
+                        }
+                    },
+                    "required": ["executive_summary", "full_report"],
+                    "additionalProperties": False
+                }
+            }
+        }
 
         # Call the Analyst Model
         response = await analyst_client.chat.completions.create(**api_args)
-        answer = response.choices[0].message.content
         
-        # Format the output header
+        # --- 2. PARSE THE JSON ---
+        try:
+            report_data = json.loads(response.choices[0].message.content)
+            ex_summ = report_data.get("executive_summary", "")
+            full_rep = report_data.get("full_report", "")
+        except json.JSONDecodeError:
+            # Fallback just in case the JSON breaks
+            ex_summ = "Failed to parse JSON."
+            full_rep = response.choices[0].message.content
+            
         file_list = ", ".join([os.path.basename(f) for f in filepaths])
-        return f"--- ANALYST REPORT FOR [{file_list}] ---\n{answer}"
+        combined_text = f"--- EXECUTIVE SUMMARY ---\n{ex_summ}\n\n--- DETAILED REPORT ---\n{full_rep}"
         
+        # --- 3. AUTO-SAVE THE FULL COMBINED REPORT ---
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp}_analyst_report.md"
+        filepath = os.path.join(STATE_DIR, filename)
+        
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(combined_text)
+            
+        # --- 4. YOUR DYNAMIC ROUTING LOGIC ---
+        if len(combined_text) > 20000:
+            # Return ONLY the summary
+            return (f"--- ANALYST EXECUTIVE SUMMARY FOR [{file_list}] ---\n{ex_summ}\n\n"
+                    f"... [SYSTEM ALERT: The detailed report was {len(combined_text)} chars long. To protect your context window, "
+                    f"the full analysis was saved to '/app/workspace/state/{filename}'.]")
+        else:
+            # Return BOTH
+            return f"--- ANALYST REPORT FOR [{file_list}] ---\n{combined_text}\n\n[SYSTEM: A backup of this report was saved to '/app/workspace/state/{filename}']"
+
     except Exception as e:
         return f"Analyst failed to process files. Error: {str(e)}"
-
+        
 if __name__ == "__main__":
     mcp.run()

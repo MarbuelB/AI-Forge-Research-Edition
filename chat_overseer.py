@@ -294,6 +294,7 @@ async def run_chat():
                     
                     # Initialize tracker outside the loop
                     cli_prompt_consumed = False
+                    tool_failure_streaks = {}
                     
                     while True:
                         try:
@@ -543,7 +544,38 @@ async def run_chat():
                                     
                                     # --- NEW: Save the real output to our RAM dictionary immediately ---
                                     executed_tool_outputs[tc_id] = output
-                                    
+
+                                    # --- FAILURE STREAK TRACKER ---
+                                    # Determine if the output looks like an error
+                                    is_error = False
+                                    output_lower = output.lower()
+                                    if "system error:" in output_lower or "traceback (most recent" in output_lower or "error executing" in output_lower:
+                                        is_error = True
+                                    elif "exit code:" in output_lower and "exit code: 0" not in output_lower:
+                                        is_error = True
+
+                                    # Update the streak
+                                    if is_error:
+                                        tool_failure_streaks[name] = tool_failure_streaks.get(name, 0) + 1
+                                    else:
+                                        tool_failure_streaks[name] = 0 # Reset on success!
+
+                                    # Trigger the intervention if stuck
+                                    if tool_failure_streaks.get(name, 0) >= 5:
+                                        intervention_msg = (
+                                            f"[CRITICAL SYSTEM ALERT: You have failed to use the '{name}' tool {tool_failure_streaks[name]} times in a row. "
+                                            f"YOU ARE STUCK IN A LOOP. You MUST STOP trying the exact same command. "
+                                            f"Reflect on why this is failing. Consider using 'consult_adviser' for a new strategy, "
+                                            f"or use 'fetch_webpage' to read the documentation for what you are trying to do.]"
+                                        )
+                                        # Append the warning directly to the output so the Brain reads it immediately
+                                        output += f"\n\n{intervention_msg}"
+                                        
+                                        if config.CONSOLE_MODE != "silent":
+                                            print(f"\n\033[91m[SYSTEM: AI is stuck looping on {name}. Injecting forced intervention!]\033[0m")
+                                        
+                                        log_event("SYSTEM", f"Forced intervention triggered for tool: {name}")
+
                                     coder_thoughts = ""
                                     coder_code = ""
 
