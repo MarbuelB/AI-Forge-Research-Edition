@@ -20,8 +20,11 @@ SESSION_ID = None
 HOST_INPUT_DIR = os.path.abspath("./my_host_input")   # Folder you drop files into
 
 # --- UI SETTINGS ---
-# Options: "formatted" (Rich Markdown), "text" (Classic streaming text), "silent" (No console output)
-CONSOLE_MODE = "formatted"
+# Options: "markdown" (Rich formatted UI), "text" (Classic streaming text)
+FORMAT_MODE = "markdown"
+
+# Options: "silent", "minimal" (Brain + Tool Names), "standard" (+ Brain Thinking), "detailed" (+ JSON Args & Outputs)
+VERBOSITY_MODE = "detailed"
 
 # --- EMBEDDING CONFIGURATION ---
 # Hardcoded to prevent dimension mismatch in the vector database.
@@ -242,5 +245,29 @@ LLM_PROFILES = [
                 },
             "seed": None  # <--- Placeholder: Tells the worker this model accepts seeds!
         }
-    }
+    },
+        # [4] Local Model - vLLM - from Podman - testing LLM settings like small context window
+    {
+        "name": "Qwen3.6 35B - vLLM",
+        "base_url": "http://host.containers.internal:4000/v1", 
+        "api_key": "sk-sandbox-fake-key",
+        "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+        "api_params": {
+            "temperature": 0.2,
+            "top_p": 0.2,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "timeout": 180.0, # If the server doesn't reply in 180 seconds, kill it and retry!
+            "max_tokens": 16384,
+            "extra_body": {
+                "top_k": 20,
+                "min_p": 0.0,
+                "repetition_penalty": 1.05,
+                "mm_processor_kwargs": {"fps": 1, "max_frames": 1200, "do_sample_frames": True},
+                "chat_template_kwargs": {"enable_thinking": True}
+                },
+            "seed": None  # <--- Placeholder: Tells the worker this model accepts seeds!
+        }
+    },
+
 ]

@@ -12,6 +12,7 @@ import sys
 import atexit
 from datetime import datetime
 from openai import AsyncOpenAI
+import tiktoken
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from prompt_toolkit import PromptSession
@@ -31,7 +32,8 @@ import config
 # --- CLI ARGUMENT PARSER ---
 parser = argparse.ArgumentParser(description="AI-Forge Overseer")
 parser.add_argument("-p", "--prompt", type=str, help="Initial user prompt")
-parser.add_argument("-f", "--format", choices=["formatted", "text", "silent"], help="Console mode override")
+parser.add_argument("-f", "--format", choices=["markdown", "text"], help="Console format override")
+parser.add_argument("-v", "--verbosity", choices=["silent", "minimal", "standard", "detailed"], help="Console verbosity override")
 parser.add_argument("-s", "--session", type=str, help="Session ID to load or create")
 parser.add_argument("-x", "--exit", action="store_true", help="Auto-exit after finishing the CLI prompt")
 # Add the LLM profile overrides back:
@@ -44,7 +46,8 @@ parser.add_argument("--analyst", type=int, help="Analyst LLM profile index")
 cli_args = parser.parse_args()
 
 # Apply Overrides BEFORE any LLM clients initialize
-if cli_args.format: config.CONSOLE_MODE = cli_args.format
+if cli_args.format: config.FORMAT_MODE = cli_args.format
+if cli_args.verbosity: config.VERBOSITY_MODE = cli_args.verbosity
 if cli_args.session: config.SESSION_ID = cli_args.session
 if cli_args.brain is not None: config.ACTIVE_BRAIN_PROFILE = cli_args.brain
 if cli_args.coder is not None: config.ACTIVE_CODER_PROFILE = cli_args.coder
@@ -74,6 +77,9 @@ COLOR_DARK_GREEN = '\033[32m'
 COLOR_ORANGE = '\033[38;5;208m' # ANSI 256-color orange
 COLOR_DIM = '\033[2m'   # Dim text for "thinking"
 COLOR_RESET = '\033[0m'
+
+# --- LLM setups ---
+tokenizer = tiktoken.get_encoding("cl100k_base")
 
 brain_profile = config.LLM_PROFILES[config.ACTIVE_BRAIN_PROFILE]
 if brain_profile.get("base_url"):
@@ -132,7 +138,7 @@ def save_history(messages):
         json.dump(clean_messages, f, indent=4)
 
 def estimate_tokens(messages):
-    """Rough heuristic: 4 chars = 1 token. Only counts actual content, ignoring JSON boilerplate."""
+    """Uses tiktoken for highly accurate estimation when the API receipt is voided."""
     total_text = ""
     for msg in messages:
         total_text += str(msg.get("content", ""))
@@ -141,12 +147,14 @@ def estimate_tokens(messages):
             for tc in msg["tool_calls"]:
                 total_text += str(tc.get("function", {}).get("arguments", ""))
                 
-    return len(total_text) // 4
-    
-def log_event(role, content, usage=None, thinking=None, text_color=None):
+    # Returns the actual token count instead of a character guess
+    return len(tokenizer.encode(total_text))
+   
+
+def log_event(role, content, usage=None, thinking=None, text_color=None, hide_console=False):
     time_str = datetime.now().strftime("%H:%M:%S")
     
-    # 1. Plain Text Log File (Append to file silently)
+    # 1. Plain Text Log File (Always writes full details)
     file_msg = f"\n[{time_str}] === {role.upper()} ===\n"
     if thinking:
         file_msg += f"<thinking>\n{thinking}\n</thinking>\n\n"
@@ -157,27 +165,30 @@ def log_event(role, content, usage=None, thinking=None, text_color=None):
     with open(LOG_FILE, "a", encoding="utf-8") as f: 
         f.write(file_msg)
 
-    # 2. Console logging
-    if config.CONSOLE_MODE != "silent":
-        if role.upper() not in ["BRAIN"]:
-            if role.upper().startswith("TOOL"):
-                console_header = f"\n{COLOR_BRIGHT_GREEN}[{time_str}] === {role.upper()} ==={COLOR_RESET}"
-                actual_color = text_color if text_color else COLOR_DARK_GREEN
-                console_content = f"{actual_color}{content}{COLOR_RESET}"
-            else:
-                console_header = f"\n{COLOR_BLUE}[{time_str}] === {role.upper()} ==={COLOR_RESET}"
-                console_content = f"{COLOR_RED}{content}{COLOR_RESET}" if role.upper() in ["USER", "YOU"] else content
-                
-            print(f"{console_header}\n{console_content}")
-            if usage and usage.prompt_tokens is not None:
-                print(f"{COLOR_YELLOW}[Tokens: {usage.prompt_tokens} in | {usage.completion_tokens} out]{COLOR_RESET}")
+    # 2. Console logging (Respects Verbosity)
+    if config.VERBOSITY_MODE == "silent" or hide_console:
+        return
+
+    if role.upper() not in ["BRAIN"]:
+        if role.upper().startswith("TOOL"):
+            console_header = f"\n{COLOR_BRIGHT_GREEN}[{time_str}] === {role.upper()} ==={COLOR_RESET}"
+            actual_color = text_color if text_color else COLOR_DARK_GREEN
+            console_content = f"{actual_color}{content}{COLOR_RESET}"
+        else:
+            console_header = f"\n{COLOR_BLUE}[{time_str}] === {role.upper()} ==={COLOR_RESET}"
+            console_content = f"{COLOR_RED}{content}{COLOR_RESET}" if role.upper() in ["USER", "YOU"] else content
+            
+        print(f"{console_header}\n{console_content}")
+        if usage and usage.prompt_tokens is not None:
+            print(f"{COLOR_YELLOW}[Tokens: {usage.prompt_tokens} in | {usage.completion_tokens} out]{COLOR_RESET}")
+            
 
 active_container_name = None
 
 def cleanup_container():
     """Guarantees the container is killed when the python script exits."""
     if active_container_name:
-        if config.CONSOLE_MODE != "silent":
+        if config.VERBOSITY_MODE != "silent":
             print(f"\n\033[91m[SYSTEM] Tearing down container {active_container_name}...\033[0m")
         subprocess.run(
             f"podman rm -f {active_container_name}", 
@@ -204,21 +215,23 @@ async def run_chat():
     quit_app = False
     last_known_tokens = 0 # State tracker for accurate token checking
     
+    help_text = "Commands: '/exit' or '/quit' to quit | UI: '/text', '/markdown' | Verbosity: '/silent', '/minimal', '/standard', '/detailed'"
+    
     if is_resuming:
-        log_event("SYSTEM", f"Successfully restored '{active_session}'. Your forged tools are loaded. Type '/exit' or '/quit' to close.")
+        log_event("SYSTEM", f"Successfully restored '{active_session}'. Your forged tools are loaded.\n{help_text}")
     else:
-        log_event("SYSTEM", f"Started new workspace: '{active_session}'. Type '/exit' or '/quit' to close.")
-
+        log_event("SYSTEM", f"Started new workspace: '{active_session}'.\n{help_text}")
+        
     # THE SELF-HEALING CONNECTION LOOP
     while not quit_app:
         global active_container_name
         active_container_name = f"forge_sandbox_{active_session}_{os.getpid()}"
         # Clear stale Podman WSL state before every single boot/reboot ---
-        if config.CONSOLE_MODE != "silent":
+        if config.VERBOSITY_MODE != "silent":
             print(f"{COLOR_DIM}Sweeping stale Podman state...{COLOR_RESET}")
 
         subprocess.run(
-            f"podman rm -f -i {active_container_name}",
+            f"podman rm -f --ignore {active_container_name}",
             #"podman system prune -f && podman rm -f $(podman ps -aq)",
             #"rm -rf ~/.podman-run/containers ~/.podman-run/libpod/tmp",
             shell=True, 
@@ -304,7 +317,7 @@ async def run_chat():
                                 cli_prompt_consumed = True
                             else:
                                 # 2. Auto-exit for silent mode after CLI prompt is done
-                                if cli_prompt and (config.CONSOLE_MODE == "silent" or cli_args.exit):
+                                if cli_prompt and (config.VERBOSITY_MODE == "silent" or cli_args.exit):
                                     quit_app = True
                                     break
                                     
@@ -316,6 +329,7 @@ async def run_chat():
                                 prompt_text = ANSI(f"\n{COLOR_RED}YOU: {COLOR_RESET}")
                                 user_input = await prompt_session.prompt_async(prompt_text)
                                 
+
                         # Catch Ctrl+C and Ctrl+D gracefully
                         except KeyboardInterrupt:
                             continue
@@ -324,12 +338,34 @@ async def run_chat():
                             break
 
                         user_input = user_input.strip()
-                        if user_input.lower() in ['/quit', '/exit', 'quit', 'exit']: 
+                        
+                        # --- 1. EXIT COMMANDS ---
+                        if user_input.lower() in ['/quit', '/exit']: 
                             quit_app = True
                             break
+                            
+                        # --- 2. DYNAMIC VERBOSITY COMMANDS ---
+                        if user_input.lower() in ['/silent', '/minimal', '/standard', '/detailed']:
+                            new_mode = user_input.lower()[1:] # Slice off the '/'
+                            config.VERBOSITY_MODE = new_mode
+                            
+                            # Give the user immediate visual feedback
+                            print(f"\n{COLOR_BRIGHT_GREEN}[SYSTEM: Console verbosity instantly changed to '{new_mode}']{COLOR_RESET}")
+                            continue # Critical: Skip the rest of the loop so the LLM doesn't see this command!
+
+                        # --- 3. DYNAMIC FORMAT COMMANDS ---
+                        if user_input.lower() in ['/text', '/markdown']:
+                            new_format = user_input.lower()[1:] 
+                            config.FORMAT_MODE = new_format
+                            
+                            print(f"\n{COLOR_BRIGHT_GREEN}[SYSTEM: Console format instantly changed to '{new_format}']{COLOR_RESET}")
+                            continue
+
+                        # --- 4. EMPTY INPUT CHECK ---
                         if not user_input: continue
                             
                         log_event("USER", user_input)
+
                         
                         # Load and save state
                         messages = load_history()
@@ -358,12 +394,12 @@ async def run_chat():
                                 current_token_estimate = last_known_tokens if last_known_tokens > 0 else estimate_tokens(messages)
                                 pct = current_token_estimate / config.MAX_CONTEXT_TOKENS
                                 
-                                if pct >= 0.75:
+                                if pct >= 0.85:
                                     # Prevent appending multiple warnings in a row if the AI ignores it for a few turns
                                     messages = [msg for msg in messages if not (msg.get("role") == "user" and "[SYSTEM WARNING: Your context window is at" in str(msg.get("content")))]
                                     
                                     warn_msg = f"[SYSTEM WARNING: Your context window is at ~{pct*100:.0f}%. "
-                                    if pct >= 0.90: warn_msg += "CRITICAL LIMIT REACHED. You MUST use the compress_and_store_context tool immediately.]"
+                                    if pct >= 0.95: warn_msg += "CRITICAL LIMIT REACHED. You MUST use the compress_and_store_context tool immediately.]"
                                     else: warn_msg += "Consider finishing your current task and using the compress_and_store_context tool soon.]"
                                     
                                     messages.append({"role": "user", "content": warn_msg})
@@ -386,7 +422,7 @@ async def run_chat():
 
                                 response_stream = await brain_client.chat.completions.create(**api_args)
                                 
-                                if config.CONSOLE_MODE != "silent":
+                                if config.VERBOSITY_MODE != "silent":
                                     time_str = datetime.now().strftime("%H:%M:%S")
                                     print(f"\n{COLOR_BLUE}[{time_str}] === BRAIN ==={COLOR_RESET}")
                                 
@@ -396,21 +432,22 @@ async def run_chat():
                                 final_usage = None
                                 
                                 # --- MULTI-MODE CONTEXT ROUTING ---
-                                if config.CONSOLE_MODE == "formatted":
+                                if config.FORMAT_MODE == "markdown" and config.VERBOSITY_MODE != "silent":
                                     display_ctx = Live(console=console, refresh_per_second=4, transient=False)
                                 else:
                                     display_ctx = nullcontext()
 
                                 with display_ctx as live:
                                     async for chunk in response_stream:
-                                        
                                         if chunk.usage:
                                             final_usage = chunk.usage
 
+                                        if not chunk.choices or not chunk.choices[0].delta:
+                                            continue
+                                    
                                         if len(chunk.choices) > 0:
                                             delta = chunk.choices[0].delta
                                             
-                                            # Logic for thinking/content extraction stays the same
                                             chunk_thinking = getattr(delta, 'reasoning_content', None)
                                             if not chunk_thinking and hasattr(delta, "model_extra") and delta.model_extra:
                                                 chunk_thinking = delta.model_extra.get("reasoning_content") or delta.model_extra.get("reasoning")
@@ -418,7 +455,6 @@ async def run_chat():
                                             if chunk_thinking: full_thinking += chunk_thinking
                                             if delta.content: full_content += delta.content
 
-                                            # (Keep your existing tool_calls_dict logic here)
                                             if delta.tool_calls:
                                                 for tc in delta.tool_calls:
                                                     if tc.index not in tool_calls_dict:
@@ -430,37 +466,45 @@ async def run_chat():
                                                     if tc.function.arguments:
                                                         tool_calls_dict[tc.index]["function"]["arguments"] += tc.function.arguments
 
-
                                             # --- CONSOLE MODE DISPATCHER ---
-                                            if config.CONSOLE_MODE == "text":
-                                                # Classic raw streaming
-                                                if chunk_thinking:
-                                                    print(f"{COLOR_DIM}{chunk_thinking}{COLOR_RESET}", end="", flush=True)
-                                                if delta.content:
-                                                    print(delta.content, end="", flush=True)
+                                            if config.VERBOSITY_MODE != "silent":
+                                                if config.FORMAT_MODE == "text":
+                                                    if chunk_thinking and config.VERBOSITY_MODE in ["standard", "detailed"]:
+                                                        print(f"{COLOR_DIM}{chunk_thinking}{COLOR_RESET}", end="", flush=True)
+                                                    if delta.content:
+                                                        print(delta.content, end="", flush=True)
+                                                        
+                                                elif config.FORMAT_MODE == "markdown":
+                                                    display_elements = []
+                                                    if full_thinking and config.VERBOSITY_MODE in ["standard", "detailed"]:
+                                                        
+                                                        # --- Cap the display height to prevent terminal overflow ---
+                                                        think_lines = full_thinking.splitlines()
+                                                        max_lines = 15 # Adjust this number to fit your screen preference!
+                                                        
+                                                        if len(think_lines) > max_lines:
+                                                            display_thinking = "...\n" + "\n".join(think_lines[-max_lines:])
+                                                        else:
+                                                            display_thinking = full_thinking
+                                                            
+                                                        display_elements.append(Panel(
+                                                            Markdown(display_thinking),
+                                                            title="[bold yellow]BRAIN THOUGHTS[/bold yellow]", border_style="yellow", padding=(1, 2), subtitle="[dim white]Internal Logic Loop[/dim white]"
+                                                        ))
+                                                        
+                                                    if full_content:
+                                                        display_elements.append(Markdown(full_content))
                                                     
-                                            elif config.CONSOLE_MODE == "formatted":
-                                                # Rich UI Assembly
-                                                display_elements = []
-                                                if full_thinking:
-                                                    display_elements.append(Panel(
-                                                        Markdown(full_thinking),
-                                                        title="[bold yellow]BRAIN THOUGHTS[/bold yellow]", border_style="yellow", padding=(1, 2), subtitle="[dim white]Internal Logic Loop[/dim white]"
-                                                    ))
-                                                if full_content:
-                                                    display_elements.append(Markdown(full_content))
-                                                
-                                                if not full_content and tool_calls_dict:
-                                                    tool_names = [tc['function']['name'] for tc in tool_calls_dict.values()]
-                                                    display_elements.append(Markdown(f"*Preparing tool calls: {', '.join(f'`{n}`' for n in tool_names)}...*"))
-                                                    
-                                                if display_elements:
-                                                    live.update(Group(*display_elements))
-                                                    
-                                            # If mode is "silent", we do nothing visually!
+                                                    if not full_content and tool_calls_dict:
+                                                        tool_names = [tc['function']['name'] for tc in tool_calls_dict.values()]
+                                                        display_elements.append(Markdown(f"*Preparing tool calls: {', '.join(f'`{n}`' for n in tool_names)}...*"))
+                                                        
+                                                    if display_elements:
+                                                        live.update(Group(*display_elements))
 
-                                if config.CONSOLE_MODE != "silent":
-                                    print() # Drop a single clean newline after the stream is fully finished
+                                # If mode is "silent", we do nothing visually!
+                                if config.VERBOSITY_MODE != "silent":
+                                    print() # Drop a clean newline after the stream is fully finished
                                     
                                 assistant_message = {"role": "assistant", "content": full_content}
                                 
@@ -485,7 +529,7 @@ async def run_chat():
                                     if reasoning_tokens == 0 and full_thinking:
                                         reasoning_tokens = len(full_thinking) // 4
                                         
-                                    if config.CONSOLE_MODE != "silent":   
+                                    if config.VERBOSITY_MODE != "silent":   
                                         if reasoning_tokens > 0:
                                             print(f"{COLOR_YELLOW}[Tokens: {final_usage.prompt_tokens} in | {final_usage.completion_tokens} out (~{reasoning_tokens} thinking)]{COLOR_RESET}")
                                         else:
@@ -522,11 +566,14 @@ async def run_chat():
                                             "content": error_msg
                                         })
                                         save_history(messages)
+                                        last_known_tokens = 0
                                         continue 
 
-                                    log_event("TOOL CALL", f"Requesting: {name}\nArgs: {json.dumps(args, indent=2)}")
+                                    # Hide massive JSON strings from console if in minimal/standard
+                                    hide_args = config.VERBOSITY_MODE in ["minimal", "standard"]
+                                    log_event("TOOL CALL", f"Requesting: {name}\nArgs: {json.dumps(args, indent=2)}", hide_console=hide_args)
 
-                                    if config.CONSOLE_MODE != "silent":                                    
+                                    if config.VERBOSITY_MODE != "silent":                                    
                                         if name == "forge_and_register_tool":
                                             print(f"\n{COLOR_ORANGE}▶ Passing task to Coder... Awaiting response...{COLOR_RESET}")
                                         elif name == "compress_and_store_context":
@@ -537,6 +584,9 @@ async def run_chat():
                                             print(f"\n{COLOR_ORANGE}▶ Spawning Sub-Agent... Awaiting response...{COLOR_RESET}")
                                         elif name == "analyze_files":
                                             print(f"\n{COLOR_ORANGE}▶ Passing files to The Analyst... Awaiting report...{COLOR_RESET}")
+                                        elif hide_args:
+                                            # If we hid the JSON args, print a clean 1-liner so the user knows it's doing something!
+                                            print(f"{COLOR_ORANGE}▶ Running tool: {name}...{COLOR_RESET}")
                                             
                                     start = time.time()
                                     result = await session.call_tool(name, args)
@@ -571,7 +621,7 @@ async def run_chat():
                                         # Append the warning directly to the output so the Brain reads it immediately
                                         output += f"\n\n{intervention_msg}"
                                         
-                                        if config.CONSOLE_MODE != "silent":
+                                        if config.VERBOSITY_MODE != "silent":
                                             print(f"\n\033[91m[SYSTEM: AI is stuck looping on {name}. Injecting forced intervention!]\033[0m")
                                         
                                         log_event("SYSTEM", f"Forced intervention triggered for tool: {name}")
@@ -589,29 +639,39 @@ async def run_chat():
                                         if match: coder_code = match.group(1).strip()
                                         output = re.sub(r"<___CODER_CODE___>.*?</___CODER_CODE___>", "", output, flags=re.DOTALL).strip()
 
+
                                     if coder_thoughts or coder_code:
                                         time_str = datetime.now().strftime("%H:%M:%S")
                                         log_text = f"\n[{time_str}] === CODER (HIDDEN) ===\n"
 
-                                        if config.CONSOLE_MODE != "silent":
+                                        hide_coder = config.VERBOSITY_MODE in ["silent", "minimal", "standard"]
+
+                                        if not hide_coder:
                                             print(f"\n{COLOR_ORANGE}[{time_str}] === CODER (HIDDEN) ==={COLOR_RESET}")
 
                                         if coder_thoughts:
                                             log_text += f"--- THOUGHTS ---\n{coder_thoughts}\n\n"
-                                            if config.CONSOLE_MODE != "silent":
+                                            if not hide_coder:
                                                 print(f"{COLOR_DIM}--- THOUGHTS ---\n{coder_thoughts}\n{COLOR_RESET}")
 
                                         if coder_code:
                                             log_text += f"--- GENERATED CODE ---\n{coder_code}\n\n"
-                                            if config.CONSOLE_MODE != "silent":
+                                            if not hide_coder:
                                                 print(f"--- GENERATED CODE ---\n{coder_code}\n")
 
                                         with open(LOG_FILE, "a", encoding="utf-8") as f:
                                             f.write(log_text)
 
                                     out_color = COLOR_ORANGE if name in ["forge_and_register_tool", "compress_and_store_context"] else COLOR_DARK_GREEN
-                                    log_event(f"TOOL RESULT ({time.time() - start:.2f}s)", output, text_color=out_color)
+                                    
+                                    # Hide massive output dumps from console if in minimal/standard
+                                    hide_output = config.VERBOSITY_MODE in ["minimal", "standard"]
+                                    log_event(f"TOOL RESULT ({time.time() - start:.2f}s)", output, text_color=out_color, hide_console=hide_output)
+                                    
+                                    if hide_output and config.VERBOSITY_MODE != "silent":
+                                        print(f"{COLOR_DARK_GREEN}✓ Tool '{name}' completed ({time.time() - start:.2f}s).{COLOR_RESET}")
 
+                                        
                                     if name == "compress_and_store_context":
                                         print(f"\n{COLOR_ORANGE}[SYSTEM] Reloading compressed state from disk...{COLOR_RESET}")
                                         messages = load_history()
@@ -646,6 +706,7 @@ async def run_chat():
                                             "content": output
                                         })
                                         save_history(messages)
+                                        last_known_tokens = 0
 
                                 # --- ESCALATING LOOP DETECTION (CHECK) ---
                                 consecutive_tool_chains += 1
@@ -658,7 +719,7 @@ async def run_chat():
                                     save_history(messages)
                                     print(f"\n{COLOR_YELLOW}[SYSTEM: Hard pause triggered ({consecutive_tool_chains} chains). Forcing Brain to wait for user.]{COLOR_RESET}")
                                     log_event("SYSTEM", halt_msg)
-                                    consecutive_tool_chains = -999 # Prevent re-triggering while it writes the summary
+                                    consecutive_tool_chains = 0
                                 
                                 elif consecutive_tool_chains > 0 and consecutive_tool_chains % 100 == 0:
                                     # Sweep old soft-pauses

@@ -22,6 +22,9 @@ from openai import AsyncOpenAI
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 
+import tiktoken
+tokenizer = tiktoken.get_encoding("cl100k_base")
+
 import config
 
 # --- HIDE FASTMCP INTERNAL LOGS BEFORE IMPORT ---
@@ -124,6 +127,30 @@ def load_json(filepath):
 def save_json(filepath, data):
     with open(filepath, "w") as f: json.dump(data, f, indent=4)
 
+def get_payload_tokens(messages):
+    """Accurately counts text tokens and adds a safe mathematical buffer for images."""
+    total_text = ""
+    image_count = 0
+    
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):  # Handle vision/multi-part arrays
+            for part in content:
+                if part.get("type") == "text":
+                    total_text += part.get("text", "")
+                elif part.get("type") == "image_url":
+                    image_count += 1
+        else:  # Handle standard string content
+            total_text += str(content)
+            
+    # Measure exact text tokens
+    text_tokens = len(tokenizer.encode(total_text))
+    
+    # Add a safe buffer for images (Most vision models charge ~1000 tokens per image)
+    image_tokens = image_count * 1000 
+    
+    return text_tokens + image_tokens
+    
 # --- MCP TOOLS ---
 @mcp.tool()
 def view_tool_registry(category: str = None) -> str:
@@ -201,6 +228,17 @@ async def consult_adviser(current_plan: str, encountered_problems: str) -> str:
         {"role": "user", "content": user_prompt}
     ]
     
+    # --- DYNAMIC PAYLOAD CHECKER ---
+    max_context = adviser_profile.get("api_params", {}).get("max_tokens", 32768)
+    safe_budget = int(max_context * 0.90)
+    
+    payload_tokens = get_payload_tokens(api_args["messages"])
+    
+    if payload_tokens > safe_budget:
+        return (f"SYSTEM ERROR: The data you sent to the Adviser is too massive! "
+                f"Payload is {payload_tokens} tokens, but the safety limit is {safe_budget}. "
+                f"Please drastically shorten your 'current_plan' and 'encountered_problems' before consulting the Adviser.")
+    
     try:
         # 4. Await the LLM response using the dedicated ADVISER client
         response = await adviser_client.chat.completions.create(**api_args)
@@ -248,7 +286,7 @@ async def query_universal_llm(
             return "--- AVAILABLE MODELS ---\n" + "\n".join(model_names)
         except Exception as e:
             return f"Failed to fetch model list. Error: {str(e)}"
-
+            
     elif action == "chat":
         if not model or not user_prompt:
             return "Error: You must provide a 'model' name and a 'user_prompt' to use the chat action."
@@ -264,6 +302,17 @@ async def query_universal_llm(
             "max_tokens": max_tokens
         }
         
+        # --- NEW: DYNAMIC PAYLOAD CHECKER ---
+        # Since the Universal LLM can be any model, we use the global safety limit
+        safe_budget = int(config.MAX_CONTEXT_TOKENS * 0.90) 
+        
+        payload_tokens = get_payload_tokens(api_args["messages"])
+        
+        if payload_tokens > safe_budget:
+            return (f"SYSTEM ERROR: The prompt you are sending to the Universal Sub-Agent is too massive! "
+                    f"Your payload is {payload_tokens} tokens, but the safety limit is {safe_budget}. "
+                    f"Please shorten your 'user_prompt' or use the 'analyze_files' tool if you need to process large documents.")
+                    
         # Only inject if explicitly passed, as local Ollama instances often reject this flag
         if reasoning_effort:
             api_args["reasoning_effort"] = reasoning_effort
@@ -318,10 +367,8 @@ async def execute_bash(command: Any = None, cmd: Any = None, timeout_seconds: in
     'timeout_seconds' defaults to 60. Increase it up to 600 if you expect a long-running process like a massive download.
     Do NOT use destructive commands! Move files to the archive folder instead."""
     
-    # 1. Block Destructive Commands
-#    destructive_patterns = ["rm -rf", "rm -r", "rm ", "mv /app/workspace /", "> /dev/null"]
-    destructive_patterns = ["rm -rf", "rm -r", "rm "]
-    if any(pattern in command.lower() for pattern in destructive_patterns):
+    # 1. Block Destructive Commands (Using strict word boundaries to avoid false positives like 'find -perm')
+    if re.search(r'\brm\s+-[rRf]+\b', command.lower()) or re.search(r'\brm\s+', command.lower()):
         return "SYSTEM ERROR: Destructive commands (rm) are blocked. Use the archive folder instead."
 
     # 2. Catch if it used 'cmd' instead of 'command'
@@ -407,7 +454,7 @@ def write_file(filepath: str, content: str) -> str:
     ]
     
     # 3. Check if the resolved path starts with any allowed directory
-    is_safe = any(resolved_path.startswith(safe_dir) for safe_dir in allowed_dirs)
+    is_safe = any(os.path.commonpath([resolved_path, safe_dir]) == safe_dir for safe_dir in allowed_dirs)
     
     if not is_safe:
         return f"SYSTEM ERROR: Path Traversal Blocked. You are only allowed to write files to {allowed_dirs}."
@@ -495,14 +542,90 @@ def store_memory(category: str, category_description: str, title: str, short_des
     return f"SUCCESS: Memory '{title}' saved to category '{category}'."
 
 
+
 @mcp.tool()
 async def compress_and_store_context() -> str:
     """Triggers the background Memory Manager to sequence a memory extraction followed by a history compression."""
     current_history = load_json(CURRENT_HISTORY_FILE)
     current_memories = load_json(MEMORY_REGISTRY_FILE)
     
-    bloated_text = json.dumps(current_history, indent=2)
+    # Look up max tokens for Summarizer
+    max_context = summarizer_profile.get("api_params", {}).get("max_tokens", 32768)
+    safe_budget = int(max_context * 0.85)
     
+    # --- Safe string accumulator to prevent MCP stdio corruption ---
+    rolling_log = "" 
+    
+    # --- SMART TOKEN-TARGETED ROLLING SUMMARIZATION ---
+    current_tokens = len(tokenizer.encode(json.dumps(current_history)))
+    
+    # 1. Pre-compute token counts for each message ONCE
+    msg_tokens = [len(tokenizer.encode(json.dumps(msg))) for msg in current_history]
+    current_tokens = sum(msg_tokens)
+    
+    
+    if current_tokens > safe_budget:
+        rolling_log += f"\n\n[SYSTEM METRIC: Pre-compression history exceeded limits ({current_tokens} > {safe_budget}). Executed Smart Rolling Summarization:]\n"
+        
+        while current_tokens > safe_budget and len(current_history) > 3:
+            excess_tokens = current_tokens - safe_budget
+            
+            max_chunk_size = safe_budget - 2000 
+            target_chunk_size = min(excess_tokens + 500, max_chunk_size)
+            
+            chunk_to_compress = []
+            chunk_tokens = 0
+            slice_end_index = 1
+            
+            for i in range(1, len(current_history)):
+                # Use our pre-computed array instead of recalculating!
+                if chunk_tokens + msg_tokens[i] > max_chunk_size and chunk_tokens > 0:
+                    break
+                    
+                chunk_to_compress.append(current_history[i])
+                chunk_tokens += msg_tokens[i]
+                slice_end_index = i + 1
+                
+                if chunk_tokens >= target_chunk_size:
+                    break
+                                
+            # --- Chronological Bulleted List ---
+            chunk_prompt = [
+                {"role": "system", "content": "You are a context compressor. Condense the following chat history into a highly dense, chronological bulleted list of key events, tool executions, and findings. Retain exact file paths, critical data points, and decisions. Be extremely concise. Do not use conversational filler."},
+                {"role": "user", "content": json.dumps(chunk_to_compress)}
+            ]
+            
+            chunk_args = summarizer_profile["api_params"].copy()
+            chunk_args["model"] = summarizer_profile["model"]
+            chunk_args["messages"] = chunk_prompt
+            
+            try:
+                chunk_resp = await summarizer_client.chat.completions.create(**chunk_args)
+                dense_summary = chunk_resp.choices[0].message.content
+                
+                # Formatted clearly so the Brain can read it easily
+                summary_msg = {"role": "system", "content": f"[ARCHIVED HISTORY (Chronological Summary)]\n{dense_summary}"}
+                
+                # Calculate the token size of the new summary message
+                summary_tokens = len(tokenizer.encode(json.dumps(summary_msg)))
+                
+                # Splice the history array
+                current_history = [current_history[0]] + [summary_msg] + current_history[slice_end_index:]
+                
+                # Splicing the token array mathematically (O(1) speed!)
+                msg_tokens = [msg_tokens[0]] + [summary_tokens] + msg_tokens[slice_end_index:]
+                current_tokens = sum(msg_tokens)
+                
+                rolling_log += f"- Compressed a {chunk_tokens}-token chunk. New total: {current_tokens} tokens.\n"
+                            
+            except Exception as e:
+                rolling_log += f"- Error during chunk compression: {e}. Falling back to single-message truncation to survive.\n"
+                current_history.pop(1)
+                current_tokens = len(tokenizer.encode(json.dumps(current_history)))
+
+    # Serialize compactly to save token overhead before sending to the main summarizer
+    bloated_text = json.dumps(current_history)
+        
     # ==========================================
     # STEP 1: EXTRACT MEMORIES (Strict Schema)
     # ==========================================
@@ -626,7 +749,6 @@ async def compress_and_store_context() -> str:
         }
     }
 
-
     api_args["messages"] = [
         {"role": "system", "content": (
             "You are a context compressor. Analyze the bloated chat log. "
@@ -652,14 +774,11 @@ async def compress_and_store_context() -> str:
         
         # Overwrite the active working memory
         new_history = comp_data.get("compressed_history", [])
-        
-        # Forcefully inject the real system prompt at the very top.
         new_history.insert(0, {"role": "system", "content": config.PROMPTS["overseer_system"]})
-        
         save_json(CURRENT_HISTORY_FILE, new_history)
         
-        return f"SUCCESS: Context compressed and old history moved to {os.path.basename(backup_file)}. \nNew detailed memories extracted to disk: {added_titles}. \n[SYSTEM INSTRUCTION: Your context has been reset, and any requested memory extraction has been completed. Review your 'Active Plan'. If the user's last command was simply to compress/save memory, do NOT do it again—simply tell them it is complete.]"
-
+        return f"SUCCESS: Context compressed and old history moved to {os.path.basename(backup_file)}.{rolling_log}\nNew detailed memories extracted to disk: {added_titles}. \n[SYSTEM INSTRUCTION: Your context has been reset, and any requested memory extraction has been completed. Review your 'Active Plan'. If the user's last command was simply to compress/save memory, do NOT do it again—simply tell them it is complete.]"
+        
     except Exception as e:
         return f"FAILED during History Compression Phase. Error: {str(e)}"
 
@@ -756,15 +875,20 @@ async def forge_and_register_tool(category: str, category_description: str, tool
 
                 install_cmd = [sys.executable, "-m", "pip", "install", "--target", "/app/workspace/custom_packages"] + safe_deps_list
 
-                # shell=False (the default) prevents any chained command execution
-                install_check = subprocess.run(install_cmd, cwd=WORKSPACE_DIR, capture_output=True, text=True)
+                # Use asyncio.to_thread so we don't freeze the MCP server during downloads!
+                install_check = await asyncio.to_thread(
+                    subprocess.run, install_cmd, cwd=WORKSPACE_DIR, capture_output=True, text=True
+                )
 
                 if install_check.returncode == 0:
                     deps_report = f"\n[SYSTEM: Automatically installed '{clean_deps}' into persistent session delta.]"
                 else:
                     deps_report = f"\n[SYSTEM WARNING: Failed to auto-install dependencies: {install_check.stderr}]"
             
-            check = subprocess.run([sys.executable, "-m", "py_compile", filename], cwd=FORGED_TOOLS_DIR, capture_output=True, text=True)
+            # Non-blocking compile check
+            check = await asyncio.to_thread(
+                subprocess.run, [sys.executable, "-m", "py_compile", filename], cwd=FORGED_TOOLS_DIR, capture_output=True, text=True
+            )
             
             if check.returncode == 0:
                 registry = load_json(TOOL_REGISTRY_FILE)
@@ -795,6 +919,9 @@ async def forge_and_register_tool(category: str, category_description: str, tool
                     
                 return report
             else:
+                # Clean up the broken script so it doesn't clutter the directory
+                if os.path.exists(file_path):
+                    os.remove(file_path)
                 error_msg = f"Your code failed syntax validation with error:\n{check.stderr}\nPlease fix it and try again. Output ONLY valid python."
                 messages.append({"role": "assistant", "content": code})
                 messages.append({"role": "user", "content": error_msg})
@@ -876,7 +1003,7 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, tex
             cursor.execute(query)
             
         # --- Output Formatting & CONTEXT PROTECTION ---
-        if query.strip().upper().startswith(("SELECT", "PRAGMA")):
+        if cursor.description: # True if the query actually returns data (catches CTEs safely)
             rows = cursor.fetchall()
             
             if not rows:
@@ -891,7 +1018,8 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, tex
                 
                 # Native, clean conversion to dictionaries
                 data = [dict(row) for row in rows]
-                result_str = json.dumps(data, indent=2)
+                # default=str safely casts sqlite-vec BLOBs/bytes into strings so JSON doesn't crash
+                result_str = json.dumps(data, indent=2, default=str)
                 
                 # FAILSAFE 2: Hard limit on character length (in case a single row has massive text)
                 if len(result_str) > 20000:
@@ -926,7 +1054,7 @@ async def fetch_webpage(url: str) -> str:
             page = await browser.new_page()
             
             # Navigate and wait for the page to finish loading its network requests (JS rendering)
-            await page.goto(url, wait_until="domcontentloaded", timeout=60)
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             
             # Extract the raw HTML after JS has executed
             html_content = await page.content()
@@ -1014,6 +1142,20 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
             {"role": "user", "content": user_content}
         ]
         
+        # --- DYNAMIC PAYLOAD CHECKER ---
+        # 1. Look up the max context limit for the Analyst profile (defaulting to 32k if missing)
+        max_context = analyst_profile.get("api_params", {}).get("max_tokens", 32768)
+        safe_budget = int(max_context * 0.90) # Leave 10% for the response!
+        
+        # 2. Accurately measure what we are about to send
+        payload_tokens = get_payload_tokens(api_args["messages"])
+        
+        # 3. Bounce the request back to the Brain if it's too massive
+        if payload_tokens > safe_budget:
+            return (f"SYSTEM ERROR: The files you asked the Analyst to read are too massive! "
+                    f"Your payload is {payload_tokens} tokens, but the safety limit is {safe_budget} tokens. "
+                    f"Please run 'analyze_files' on fewer files at a time, or use bash tools like 'head', 'tail', or 'grep' to narrow down the data first.")
+                    
         # --- 1. FORCE THE JSON SCHEMA ---
         api_args["response_format"] = {
             "type": "json_schema",

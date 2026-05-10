@@ -13,6 +13,7 @@ mcp = ">=1.27.0,<2"
 fastmcp = ">=3.2.4,<4"
 prompt_toolkit = ">=3.0.52,<4"
 rich = ">=15.0.0,<16"
+tiktoken = ">=0.12.0,<0.13"
 
 [pypi-dependencies]
 sqlite-vec = ">=0.1.9, <0.2"

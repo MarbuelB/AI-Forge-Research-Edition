@@ -57,6 +57,7 @@ This project utilizes multiple distinct Large Language Models (LLMs) to maximize
 * **The Adviser (The Strategist):** A slow, extremely heavy reasoning model (e.g., DeepSeek-R1, Qwen 397B). It is invoked exclusively when the Brain encounters critical bottlenecks or requires strategic redirection.
 * **The Analyst (The Eyes & Data Miner):** A specialized context-isolation and vision agent. When the Brain needs to read a massive 50,000-line error log, parse a raw data dump, or look at an image, it delegates the file to the Analyst. The Analyst processes the heavy payload and returns a highly concentrated summary, keeping the Brain's context window clean, fast, and immune to data-bloat.
 * **Universal Sub-Agents:** The Brain has the ability to dynamically spawn its own temporary LLM sub-agents to delegate isolated tasks, test prompt engineering, or request second opinions using custom temperature and parameters.
+* **Dynamic Payload Airlocks:** The framework utilizes a pre-flight token calculator (via `tiktoken`) for all sub-agent delegations. If the Brain attempts to send a 100,000-token log file to the Analyst or Adviser that exceeds 90% of their specific context window, the framework intercepts the request, blocks the API call, and bounces a `SYSTEM ERROR` back to the Brain instructing it to use `grep` or chunk the files first. This completely eliminates silent API truncation and OOM crashes.
 
 ### 2. The Auto-Retry Loop
 LLMs sometimes make syntax errors. Instead of burdening the Brain's context window with Python tracebacks, the system contains an internal validation loop. If the newly written code fails a `py_compile` check, it automatically increments the generation seed and asks the Coder model to try again, completely hiding this debugging process from the main chat.
@@ -109,8 +110,8 @@ Smaller or quantized models occasionally hallucinate malformed JSON when calling
 ### 12. On-Demand Observability (Self-Debugging)
 Standard agents crash silently when background Python dependencies fail. This framework features on-demand internal observability. FastMCP container logs are routed to a persistent container_debug.log file. If a tool fails unpredictably, the Brain is prompted to dynamically act as a Senior Developer: it passes the log file to the Analyst sub-agent, asking it to find the stack trace and summarize the failure. The Brain then autonomously uses the Coder to install the missing dependencies and retries the task.
 
-### 13. Headless CLI & Multi-Mode UI
-The Overseer natively supports multiple visual modes via the command line. Run it in `formatted` mode for a rich, color-coded terminal dashboard, `text` mode for raw streaming, or `silent` mode to run the agent entirely in the background. With piped STDIN support, you can feed massive files directly into the AI through the bash pipeline and have it automatically exit (`-x`) when finished, turning the framework into a pure, headless Unix utility.
+### 13. Dynamic UI & Verbosity Control
+The Overseer natively decouples **Format** (how it looks) from **Verbosity** (how much it tells you). You can run it in `markdown` mode for a rich, color-coded terminal dashboard, or `text` mode for raw streaming. Furthermore, you have total runtime control: you can instantly change the UI by typing slash commands (`/silent`, `/minimal`, `/standard`, `/detailed`, `/text`, `/markdown`) directly into the chat prompt. This allows you to jump from a highly detailed matrix-style debugging view to a minimal, clean UI on the fly without ever restarting your container or dropping your session state!
 
 ---
 
@@ -136,6 +137,7 @@ The Overseer natively supports multiple visual modes via the command line. Run i
 * **Context Preservation (I/O Truncation):** If the AI executes a bash command or scrapes a webpage that returns a massive payload (e.g., >5,000 characters), the system intercepts it. Instead of flooding the context window, the framework automatically saves the full output to a timestamped text file inside the sandbox. It then returns a tiny preview and a "Pointer" path back to the Brain, explicitly instructing it to delegate the heavy reading to the Analyst LLM.
 * **Network Isolation:** The container runs on an isolated bridge network (`slirp4netns`). It communicates with local/tunneled LLMs strictly via the `host.containers.internal` gateway.
 * **Anti-Deletion Protocol (Soft-Deletes):** The AI is strictly prompted against using destructive commands like `rm` or `DROP TABLE`. Instead, it is trained to use a robust "Soft-Delete" protocol. If it needs to rewrite a Python script or rebuild a database schema, it automatically uses the native `write_file` tool to create timestamped `.bak` copies, or uses bash `mv` to send old databases to the `/archive` folder. This provides a flawless audit trail and guarantees zero data loss during autonomous operations.
+* **Strict Command Sanitization:** The `execute_bash` tool doesn't just rely on the Podman boundaries. It employs strict regex to block destructive commands (`rm -rf`), prevents command chaining via newline injection bypasses, and strictly limits output redirection (`>`, `>>`) to the `/sandbox/` and `/outputs/` directories, preventing the AI from hijacking its own `.bashrc` or staging payloads in `/tmp/`. Path traversal (`../`) is mathematically blocked using `os.path.commonpath`.
 
 ---
 
@@ -175,7 +177,7 @@ Create a new directory for your project, initialize Pixi, and add the required l
     mkdir ai_workspace
     cd ai_workspace
     pixi init
-    pixi add python openai mcp fastmcp prompt_toolkit rich
+    pixi add python openai mcp fastmcp prompt_toolkit rich tiktoken
 
 ### Step 4: Set Up the Host Proxy (Zero-Trust Routing)
 To keep secrets completely out of the sandbox, we run a LiteLLM proxy on the host machine. The AI uses fake keys, and the proxy attaches the real ones.
@@ -301,18 +303,19 @@ The Overseer can be launched as a standard interactive chat or driven entirely v
 **CLI Arguments & Headless Execution:**
 You can override configurations, pipe in files, and trigger headless background tasks using the built-in CLI flags:
 * `-p`, `--prompt`: Pass an initial prompt directly (e.g., `-p "Analyze the data"`).
-* `-f`, `--format`: Override the UI mode. Options: `formatted` (Rich markdown panels), `text` (classic streaming), `silent` (pure background execution with zero console output).
+* `-f`, `--format`: Override the visual format. Options: `markdown` (Rich Markdown panels), `text` (classic streaming text).
+* `-v`, `--verbosity`: Override the console output level. Options: `silent` (pure background execution), `minimal` (hides massive JSON args and tool outputs), `standard` (shows AI thinking but hides JSON), `detailed` (shows all raw data).
 * `-s`, `--session`: Override the `SESSION_ID` to load or create a specific workspace (e.g., `-s "Project_X"`).
 * `-x`, `--exit`: Auto-exit back to your bash terminal when the AI finishes its tasks (perfect for single-shot scripts).
 * `--brain`, `--coder`, `--summarizer`, `--adviser`, `--analyst`: Pass the index number of your LLM profiles to override the active models dynamically.
 
 **Advanced Usage Examples:**
 * **Rich Interactive Mode with Specific Models:**
-  `pixi run python chat_overseer.py -f formatted -s "Test_2" --brain 2 --coder 3`
+  `pixi run python chat_overseer.py -f markdown -v standard -s "Test_2" --brain 2 --coder 3`
 * **Headless Background Task (Auto-Exits when done):**
-  `pixi run python chat_overseer.py -f silent -s "Research" -x -p "Scrape the latest papers on CRISPR and save to outputs/summary.md"`
+  `pixi run python chat_overseer.py -v silent -s "Research" -x -p "Scrape the latest papers on CRISPR and save to outputs/summary.md"`
 * **Unix Pipeline (Pipe files directly into the AI):**
-  `cat error_log.txt | pixi run python chat_overseer.py -f text -x -p "Find the bug and write a python fix to outputs/fix.py"`
+  `cat error_log.txt | pixi run python chat_overseer.py -f text -v minimal -x -p "Find the bug and write a python fix to outputs/fix.py"`
 
 ### Session Management (Config Fallback)
 If you don't use the `-s` flag, the framework falls back to your `config.py`. **Always use strings for Session IDs**.
@@ -343,6 +346,8 @@ If the session grows too long, the system will inject a dynamic warning promptin
 5. The system backs up the bloated history to the `histories/` folder for your observation, and overwrites the active `current_history.json`.
 6. The Brain reloads instantly with a clean context window, reads its next steps, and continues working automatically.
 
+* **Infinite Context Scaling (Smart Rolling Summarization):** Standard agents suffer from permanent amnesia when their context window fills up. This framework uses a token-aware rolling summarizer. If the history exceeds 85% of the safe limit, the background manager dynamically calculates the exact token excess, bites off the oldest chunk of messages, and compresses them into a highly dense chronological bulleted list. It recursively splices these summaries back into the history until the context is safe, guaranteeing zero data loss even during multi-day autonomous runs.
+
 ---
 
 ### 🐝 Swarm Mode (Parallel Execution)
@@ -355,10 +360,10 @@ You can use `tmux` to launch a multi-agent swarm in a 2x2 split-pane dashboard. 
       split-window -h \; \
       send-keys "pixi run python chat_overseer.py -f text -s 'Swarm_Text_2'" C-m \; \
       split-window -v \; \
-      send-keys "pixi run python chat_overseer.py -f formatted -s 'Swarm_MD_2'" C-m \; \
+      send-keys "pixi run python chat_overseer.py -f markdown -s 'Swarm_MD_2'" C-m \; \
       select-pane -t 0 \; \
       split-window -v \; \
-      send-keys "pixi run python chat_overseer.py -f formatted -s 'Swarm_MD_1'" C-m \; \
+      send-keys "pixi run python chat_overseer.py -f markdown -s 'Swarm_MD_1'" C-m \; \
       select-layout tiled \; \
       attach-session -t forge_swarm
 
