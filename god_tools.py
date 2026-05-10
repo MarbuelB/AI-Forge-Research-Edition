@@ -960,6 +960,9 @@ Search Syntax Example:
 
 @mcp.tool(description=db_tool_desc)
 async def query_sqlite_db(db_path: str, query: str, parameters: list = None, search_text_to_embed: str = None) -> str:
+
+    conn = None
+
     try:
         # --- Handle Search Embedding Injection ---
         if search_text_to_embed:
@@ -1033,59 +1036,77 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, sea
                     result_str += warning_msg
                     
         conn.commit()
-        conn.close()
         return result_str
-        
+
     except Exception as e:
         return f"SYSTEM ERROR: Database Exception: {str(e)}"
+    finally:
+        if conn:
+            conn.close() # GUARANTEES the lock is released!
 
 
 @mcp.tool()
-async def batch_generate_embeddings(db_path: str, vec_table: str, rowids: list[int], texts_to_embed: list[str]) -> str:
+async def batch_generate_embeddings(db_path: str, vec_table: str, source_query: str) -> str:
     """
-    Generates vector embeddings in bulk and inserts them into a vec0 virtual table.
-    Use this AFTER you have already inserted your data into a standard SQLite metadata table.
-    You must provide a list of 'rowids' (from your metadata table) and a perfectly matching list of 'texts_to_embed'.
+    Generates vector embeddings in bulk natively from the database and inserts them into a vec0 virtual table.
+    This completely bypasses the context window!
+    'source_query' MUST be a SELECT statement returning EXACTLY two columns:
+    1. The integer ID (which maps to the vec_table's rowid).
+    2. The text string to be embedded.
+    Example: "SELECT id, description FROM tools WHERE id NOT IN (SELECT rowid FROM tools_vec)"
     """
-    if not rowids or not texts_to_embed:
-        return "SYSTEM ERROR: The lists cannot be empty."
+    if not source_query.strip().upper().startswith("SELECT"):
+        return "SYSTEM ERROR: 'source_query' must be a SELECT statement."
         
-    if len(rowids) != len(texts_to_embed):
-        return f"SYSTEM ERROR: Mismatch! You provided {len(rowids)} rowids but {len(texts_to_embed)} texts."
-        
+    conn = None # Initialize empty so the finally block doesn't crash
+
     try:
-        # 1. Generate ALL embeddings in a single lightning-fast API call
-        response = await universal_client.embeddings.create(
-            model=config.EMBEDDING_CONFIG["model"],
-            input=texts_to_embed
-        )
-        
-        # 2. Connect to the SQLite database
+        # 1. Connect and LOAD THE VECTOR EXTENSION IMMEDIATELY
         conn = sqlite3.connect(db_path)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
         cursor = conn.cursor()
         
-        inserted_count = 0
+        # Now it is safe to execute queries that reference virtual vec0 tables!
+        cursor.execute(source_query)
+        rows = cursor.fetchall()
         
-        # 3. Insert ONLY into the vec_table
+        if not rows:
+            conn.close()
+            return "SUCCESS: source_query returned 0 rows. Nothing to embed."
+            
+        rowids = []
+        texts_to_embed = []
+        for row in rows:
+            if len(row) != 2:
+                conn.close()
+                return f"SYSTEM ERROR: source_query must return exactly 2 columns (id, text). Yours returned {len(row)}."
+            rowids.append(row[0])
+            texts_to_embed.append(str(row[1]))
+            
+        # 2. Generate Embeddings via the API in one massive batch
+        response = await universal_client.embeddings.create(
+            model=config.EMBEDDING_CONFIG["model"],
+            input=texts_to_embed
+        )
+        
+        # 3. Insert the embeddings
+        inserted_count = 0
         for i, rowid in enumerate(rowids):
             embedding_vector = response.data[i].embedding
             vector_blob = array.array('f', embedding_vector).tobytes()
-            
-            # Insert the vector using the provided rowid to link them
             cursor.execute(f"INSERT INTO {vec_table}(rowid, embedding) VALUES (?, ?)", (rowid, vector_blob))
             inserted_count += 1
             
         conn.commit()
-        conn.close()
-        
-        return f"SUCCESS: Batch processed {inserted_count} embeddings and inserted them into {vec_table}."
+        return f"SUCCESS: Natively extracted {inserted_count} rows..."
         
     except Exception as e:
         return f"SYSTEM ERROR: Batch Embedding Failed. {str(e)}"
-        
+    finally:
+        if conn:
+            conn.close() # GUARANTEES the lock is released!
 
 @mcp.tool()
 async def search_web(query: str, max_results: int = 5) -> str:

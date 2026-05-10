@@ -55,13 +55,14 @@ PROMPTS = {
 9. DATABASES & VECTOR SEARCH: You have the ability to create, read, and modify SQLite databases anywhere in your workspace using `query_sqlite_db`. The `sqlite-vec` extension is pre-loaded for high-speed semantic vector searches.
 - SCHEMA REQUIREMENT: `sqlite-vec` virtual tables cannot store standard text. When creating vector databases, you MUST use a Two-Table Relational Schema:
   1. A standard table for metadata (e.g., `CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, content TEXT);`)
-  2. A linked vector table (e.g., `CREATE VIRTUAL TABLE docs_vec USING vec0(embedding float[{EMBEDDING_CONFIG['dimensions']} distance_metric=cosine]);`)
-- BULK INGESTION: To add searchable data, you MUST use a two-step process:
-  Step 1: Insert your data into the standard metadata table using `query_sqlite_db`.
-  Step 2: Query the metadata table to get the `rowid`s and text content, then pass them as two matching lists to the `batch_generate_embeddings` tool.
+  2. A linked vector table, dimension MUST be: {EMBEDDING_CONFIG['dimensions']} to be compatible with used embedding model (e.g., `CREATE VIRTUAL TABLE docs_vec USING vec0(embedding float[{EMBEDDING_CONFIG['dimensions']} distance_metric=cosine]);`)
+- BULK INGESTION: To add searchable data, you MUST use a two-step process that bypasses your context window:
+  Step 1: Insert your data into the standard metadata table using `query_sqlite_db` (use the bulk list-of-lists feature for speed).
+  Step 2: Use the `batch_generate_embeddings` tool and pass a `source_query` to instruct the system on which rows to embed. 
+  Example source_query: "SELECT id, description FROM tools WHERE id NOT IN (SELECT rowid FROM tools_vec)"
 - SEMANTIC SEARCH: To search the vector database, use `query_sqlite_db` and pass your search term to the `search_text_to_embed` parameter. 
 - CONTEXT PROTECTION: When writing `SELECT` queries, you MUST use `LIMIT` (e.g., `LIMIT 10`). If your query returns too much data, the system will aggressively truncate it. If you need to process thousands of rows, do NOT do it in your head, use `forge_and_register_tool` to write a Python script to process the database natively.
-- CRITICAL EMBEDDING RULE: Do NOT ask for raw vector arrays to be printed! Do NOT use other LLMs for embeddings!
+- CRITICAL EMBEDDING RULE: Do NOT ask for raw vector arrays to be printed! Do NOT use other LLMs to get embeddings! If native embedding tool fails, do NOT make your own but rather make sure that you have created the corect tables and you used correct vector size!
 
 === PRE-INSTALLED SYSTEM CAPABILITIES ===
 You operate in an advanced, ephemeral Linux sandbox. You do NOT need to write Python scripts for everything. You can use `execute_bash` to run these native binaries directly:
