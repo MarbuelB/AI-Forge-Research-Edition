@@ -474,9 +474,11 @@ def write_file(filepath: str, content: str) -> str:
         if os.path.exists(filepath):
             # Create a backup using your exact datetime idea!
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            backup_path = f"{filepath}.{timestamp}.bak"
+            filename = os.path.basename(filepath)
+            backup_dir = "/app/workspace/archive"
+            backup_path = os.path.join(backup_dir, f"{filename}.{timestamp}.bak")
             shutil.copy2(filepath, backup_path)
-            backup_msg = f"(Old version backed up to {os.path.basename(backup_path)})"
+            backup_msg = f"(Old version backed up to archive/{os.path.basename(backup_path)})"
         else:
             backup_msg = "(New file created)"
             
