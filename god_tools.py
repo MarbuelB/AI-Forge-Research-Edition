@@ -139,6 +139,12 @@ def save_json(filepath, data):
     # If the system crashes during step 1, the original file is untouched!
     os.replace(temp_path, filepath)
 
+def sqlite_authorizer(action, arg1, arg2, dbname, source):
+    # 9 = SQLITE_DELETE, 11 = SQLITE_DROP_TABLE
+    if action in (sqlite3.SQLITE_DELETE, sqlite3.SQLITE_DROP_TABLE):
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
 def get_payload_tokens(messages):
     """Accurately counts text tokens and adds a safe mathematical buffer for images."""
     total_text = ""
@@ -154,6 +160,11 @@ def get_payload_tokens(messages):
                     image_count += 1
         else:  # Handle standard string content
             total_text += str(content)
+            
+        # Count tool arguments if they exist
+        if "tool_calls" in msg and msg["tool_calls"]:
+            for tc in msg["tool_calls"]:
+                total_text += str(tc.get("function", {}).get("arguments", ""))
             
     # Measure exact text tokens
     text_tokens = len(tokenizer.encode(total_text))
@@ -251,10 +262,22 @@ async def consult_adviser(current_plan: str, encountered_problems: str) -> str:
                 f"Payload is {payload_tokens} tokens, but the safety limit is {safe_budget}. "
                 f"Please drastically shorten your 'current_plan' and 'encountered_problems' before consulting the Adviser.")
     
+    if config.VERBOSITY_MODE != "silent":
+        sys.stderr.write(f"\n\033[93m[System: Sending prompt to Adviser (~{payload_tokens} estimated tokens)...\033[0m\n")
+        
     try:
         # 4. Await the LLM response using the dedicated ADVISER client
         response = await adviser_client.chat.completions.create(**api_args)
         advice_text = response.choices[0].message.content
+        
+        # Log token usage
+        tokens_in = response.usage.prompt_tokens if response.usage else 0
+        tokens_out = response.usage.completion_tokens if response.usage else 0
+        thinking_tokens = 0
+        if response.usage:
+            if hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details:
+                thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0)
+        config.log_token_usage(STATE_DIR, "adviser", tokens_in, tokens_out, thinking_tokens)
         
         # 5. Format the filename to start with the date (e.g., 20260503_204530_advice.md)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -330,8 +353,20 @@ async def query_universal_llm(
         if reasoning_effort:
             api_args["reasoning_effort"] = reasoning_effort
             
+        if config.VERBOSITY_MODE != "silent":
+            sys.stderr.write(f"\n\033[93m[System: Sending prompt to Universal Sub-Agent ({model}) (~{payload_tokens} estimated tokens)...\033[0m\n")
+            
         try:
             response = await universal_client.chat.completions.create(**api_args)
+            
+            # Log token usage
+            tokens_in = response.usage.prompt_tokens if response.usage else 0
+            tokens_out = response.usage.completion_tokens if response.usage else 0
+            thinking_tokens = 0
+            if response.usage:
+                if hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details:
+                    thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0)
+            config.log_token_usage(STATE_DIR, "universal", tokens_in, tokens_out, thinking_tokens)
             
             # 1. Safeguard against NoneType
             content = response.choices[0].message.content or ""
@@ -395,10 +430,15 @@ async def execute_bash(command: Any = None, cmd: Any = None, timeout_seconds: in
         return 'SYSTEM ERROR: The "command" parameter must be a SINGLE string, not a list or array. Example: command="ls -la /app"'
 
     try:
-        # Launch the subprocess asynchronously
+        # Force environmental safety boundaries for dynamic scripts
+        current_env = os.environ.copy()
+        current_env["PYTHONPATH"] = f"/app/workspace/custom_packages:{current_env.get('PYTHONPATH', '')}"
+
+        # Launch the subprocess asynchronously with explicitly bounded environments
         process = await asyncio.create_subprocess_shell(
             command, 
             cwd=SANDBOX_DIR,
+            env=current_env,
             stdout=asyncio.subprocess.PIPE,     # Capture stdout
             stderr=asyncio.subprocess.STDOUT,   # Merge stderr into stdout
             stdin=asyncio.subprocess.DEVNULL,   # Prevents children from stealing input stream
@@ -614,8 +654,19 @@ async def compress_and_store_context() -> str:
             chunk_args["model"] = summarizer_profile["model"]
             chunk_args["messages"] = chunk_prompt
             
+            if config.VERBOSITY_MODE != "silent":
+                payload_tokens = get_payload_tokens(chunk_prompt)
+                sys.stderr.write(f"\n\033[93m[System: Summarizer chunk payload is ~{payload_tokens} estimated tokens]\033[0m\n")
+            
             try:
                 chunk_resp = await summarizer_client.chat.completions.create(**chunk_args)
+                
+                # Log token usage
+                tokens_in = chunk_resp.usage.prompt_tokens if chunk_resp.usage else 0
+                tokens_out = chunk_resp.usage.completion_tokens if chunk_resp.usage else 0
+                thinking_tokens = getattr(chunk_resp.usage.completion_tokens_details, 'reasoning_tokens', 0) if chunk_resp.usage and hasattr(chunk_resp.usage, 'completion_tokens_details') and chunk_resp.usage.completion_tokens_details else 0
+                config.log_token_usage(STATE_DIR, "summarizer", tokens_in, tokens_out, thinking_tokens)
+                
                 dense_summary = chunk_resp.choices[0].message.content
                 
                 # Formatted clearly so the Brain can read it easily
@@ -693,8 +744,19 @@ async def compress_and_store_context() -> str:
     ]
     api_args["response_format"] = memory_schema
 
+    if config.VERBOSITY_MODE != "silent":
+        payload_tokens = get_payload_tokens(api_args["messages"])
+        sys.stderr.write(f"\n\033[93m[System: Summarizer memory extraction payload is ~{payload_tokens} estimated tokens]\033[0m\n")
+
     try:
         mem_response = await summarizer_client.chat.completions.create(**api_args)
+        
+        # Log token usage
+        tokens_in = mem_response.usage.prompt_tokens if mem_response.usage else 0
+        tokens_out = mem_response.usage.completion_tokens if mem_response.usage else 0
+        thinking_tokens = getattr(mem_response.usage.completion_tokens_details, 'reasoning_tokens', 0) if mem_response.usage and hasattr(mem_response.usage, 'completion_tokens_details') and mem_response.usage.completion_tokens_details else 0
+        config.log_token_usage(STATE_DIR, "summarizer", tokens_in, tokens_out, thinking_tokens)
+        
         mem_data = json.loads(mem_response.choices[0].message.content)
         
         added_titles = []
@@ -779,8 +841,19 @@ async def compress_and_store_context() -> str:
         
     api_args["response_format"] = compression_schema
 
+    if config.VERBOSITY_MODE != "silent":
+        payload_tokens = get_payload_tokens(api_args["messages"])
+        sys.stderr.write(f"\n\033[93m[System: Summarizer history compression payload is ~{payload_tokens} estimated tokens]\033[0m\n")
+
     try:
         comp_response = await summarizer_client.chat.completions.create(**api_args)
+        
+        # Log token usage
+        tokens_in = comp_response.usage.prompt_tokens if comp_response.usage else 0
+        tokens_out = comp_response.usage.completion_tokens if comp_response.usage else 0
+        thinking_tokens = getattr(comp_response.usage.completion_tokens_details, 'reasoning_tokens', 0) if comp_response.usage and hasattr(comp_response.usage, 'completion_tokens_details') and comp_response.usage.completion_tokens_details else 0
+        config.log_token_usage(STATE_DIR, "summarizer", tokens_in, tokens_out, thinking_tokens)
+        
         comp_data = json.loads(comp_response.choices[0].message.content)
         
         # Backup the old bloated history before we overwrite it
@@ -832,6 +905,10 @@ async def forge_and_register_plugin(category: str, category_description: str, pl
                 base_seed = api_args.get("seed") or 1000
                 api_args["seed"] = base_seed + attempt
             
+            if config.VERBOSITY_MODE != "silent":
+                payload_tokens = get_payload_tokens(messages)
+                sys.stderr.write(f"\n\033[93m[System: Coder payload is ~{payload_tokens} estimated tokens]\033[0m\n")
+            
             response = await coder_client.chat.completions.create(**api_args)
             coder_msg = response.choices[0].message
             
@@ -862,6 +939,8 @@ async def forge_and_register_plugin(category: str, category_description: str, pl
             tokens_in = response.usage.prompt_tokens if response.usage else 0
             tokens_out = response.usage.completion_tokens if response.usage else 0
             thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
+            
+            config.log_token_usage(STATE_DIR, "coder", tokens_in, tokens_out, thinking_tokens)
                 
             token_report = f"[Tokens used by Coder: {tokens_in} in | {tokens_out} out" + (f" ({thinking_tokens} thinking)]" if thinking_tokens > 0 else "]")
             
@@ -890,15 +969,20 @@ async def forge_and_register_plugin(category: str, category_description: str, pl
 
                 install_cmd = [sys.executable, "-m", "pip", "install", "--target", "/app/workspace/custom_packages"] + safe_deps_list
 
-                # Use asyncio.to_thread so we don't freeze the MCP server during downloads!
-                install_check = await asyncio.to_thread(
-                    subprocess.run, install_cmd, cwd=WORKSPACE_DIR, capture_output=True, text=True
+                # Execute package ingestion with a fully asynchronous process layout to protect the RPC stream
+                proc_install = await asyncio.create_subprocess_exec(
+                    *install_cmd,
+                    cwd=WORKSPACE_DIR,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
                 )
+                stdout_install, stderr_install = await proc_install.communicate()
 
-                if install_check.returncode == 0:
+                if proc_install.returncode == 0:
                     deps_report = f"\n[SYSTEM: Automatically installed '{clean_deps}' into persistent session delta.]"
                 else:
-                    deps_report = f"\n[SYSTEM WARNING: Failed to auto-install dependencies: {install_check.stderr}]"
+                    err_clean = stderr_install.decode('utf-8', errors='replace')
+                    deps_report = f"\n[SYSTEM WARNING: Failed to auto-install dependencies: {err_clean}]"
             
             # Non-blocking compile check
             check = await asyncio.to_thread(
@@ -966,6 +1050,11 @@ Search Syntax Example:
 @mcp.tool(description=db_tool_desc)
 async def query_sqlite_db(db_path: str, query: str, parameters: list = None, search_text_to_embed: str = None) -> str:
 
+    # Validate database path is inside workspace
+    resolved_db = os.path.abspath(db_path)
+    if not (resolved_db == "/app/workspace" or resolved_db.startswith("/app/workspace/")):
+        return "SYSTEM ERROR: Database path must be inside /app/workspace"
+
     conn = None
 
     try:
@@ -975,6 +1064,11 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, sea
                 model=config.EMBEDDING_CONFIG["model"],
                 input=search_text_to_embed
             )
+            
+            # Log embedding token usage
+            tokens_in = response.usage.prompt_tokens if response.usage else 0
+            config.log_token_usage(STATE_DIR, "embedding", tokens_in, 0, 0)
+            
             embedding_vector = response.data[0].embedding
             vector_blob = array.array('f', embedding_vector).tobytes()
             
@@ -984,15 +1078,13 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, sea
                 return "SYSTEM ERROR: You cannot use 'search_text_to_embed' simultaneously with bulk (list of lists) parameters."
             parameters.append(vector_blob)
         
-        if re.search(r"\b(DROP\s+TABLE|DELETE\s+FROM)\b", query, re.IGNORECASE):
-            return "SYSTEM ERROR: 'DROP TABLE' and 'DELETE FROM' are disabled for safety. To 'delete' data, rename the table using ALTER."
-        
         # --- Database Execution ---
         db_dir = os.path.dirname(db_path)
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
             
         conn = sqlite3.connect(db_path)
+        conn.set_authorizer(sqlite_authorizer)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
@@ -1001,24 +1093,37 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, sea
         
         is_bulk_operation = False
         
-        if parameters:
-            # Detect Bulk Insert (List of Lists)
-            if len(parameters) > 0 and isinstance(parameters[0], list):
-                cursor.executemany(query, parameters)
-                is_bulk_operation = True
-            else:
-                cursor.execute(query, parameters)
-        else:
-            try:
-                cursor.execute(query)
-            except Exception as e:
-                # Catch multi-statement attempts and cleanly route them to executescript
-                if "one statement at a time" in str(e).lower() or "can only execute one statement" in str(e).lower():
-                    cursor.executescript(query)
+        try:
+            if parameters:
+                # Detect Bulk Insert (List of Lists)
+                if len(parameters) > 0 and isinstance(parameters[0], list):
+                    cursor.executemany(query, parameters)
                     is_bulk_operation = True
                 else:
-                    raise e
-            
+                    cursor.execute(query, parameters)
+            else:
+                try:
+                    cursor.execute(query)
+                except Exception as e:
+                    # Catch multi-statement attempts and cleanly route them to executescript
+                    if "one statement at a time" in str(e).lower() or "can only execute one statement" in str(e).lower():
+                        # Manually check for forbidden destructive actions since executescript bypasses the authorizer
+                        forbidden_patterns = [r'\bdrop\s+table\b', r'\bdelete\s+from\b', r'\btruncate\b']
+                        if any(re.search(pat, query.lower()) for pat in forbidden_patterns):
+                            return "SYSTEM ERROR: Destructive database modifications (DROP/DELETE) are blocked in multi-statement queries."
+                        
+                        cursor.executescript(query)
+                        conn.commit()
+                        return f"Multi-statement script executed successfully. Rows affected: {cursor.rowcount}"
+                    else:
+                        raise e
+
+        except Exception as db_exec_error:
+            # Force structural rollbacks immediately if transaction validation fails to avoid frozen journal locks
+            if conn:
+                conn.rollback()
+            raise db_exec_error
+                        
         # --- Output Formatting & CONTEXT PROTECTION ---
         if is_bulk_operation or cursor.description is None:
             # executescript and executemany don't return fetchable rows
@@ -1063,6 +1168,11 @@ async def batch_generate_embeddings(db_path: str, vec_table: str, source_query: 
     2. The text string to be embedded.
     Example: "SELECT id, description FROM tools WHERE id NOT IN (SELECT rowid FROM tools_vec)"
     """
+    # Validate database path is inside workspace
+    resolved_db = os.path.abspath(db_path)
+    if not (resolved_db == "/app/workspace" or resolved_db.startswith("/app/workspace/")):
+        return "SYSTEM ERROR: Database path must be inside /app/workspace"
+
     if not source_query.strip().upper().startswith("SELECT"):
         return "SYSTEM ERROR: 'source_query' must be a SELECT statement."
         
@@ -1071,6 +1181,7 @@ async def batch_generate_embeddings(db_path: str, vec_table: str, source_query: 
     try:
         # 1. Connect and LOAD THE VECTOR EXTENSION IMMEDIATELY
         conn = sqlite3.connect(db_path)
+        conn.set_authorizer(sqlite_authorizer)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
@@ -1098,6 +1209,10 @@ async def batch_generate_embeddings(db_path: str, vec_table: str, source_query: 
             model=config.EMBEDDING_CONFIG["model"],
             input=texts_to_embed
         )
+        
+        # Log embedding token usage
+        tokens_in = response.usage.prompt_tokens if response.usage else 0
+        config.log_token_usage(STATE_DIR, "embedding", tokens_in, 0, 0)
         
         # 3. Insert the embeddings
         inserted_count = 0
@@ -1137,19 +1252,20 @@ async def search_web(query: str, max_results: int = 5) -> str:
                     '--disable-blink-features=AutomationControlled' 
                 ]
             )
-            
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080},
-                locale="en-US"
-            )
-            
-            page = await context.new_page()
-            
-            # Navigate to the search page
-            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            html_content = await page.content()
-            await browser.close()
+            try:
+                context = await browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    viewport={"width": 1920, "height": 1080},
+                    locale="en-US"
+                )
+                
+                page = await context.new_page()
+                
+                # Navigate to the search page
+                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                html_content = await page.content()
+            finally:
+                await browser.close()
             
         # Parse the raw HTML using BeautifulSoup
         soup = BeautifulSoup(html_content, 'html.parser')
@@ -1208,23 +1324,24 @@ async def fetch_webpage(url: str) -> str:
                     '--disable-blink-features=AutomationControlled' 
                 ]
             )
-            
-            # Spoof a realistic Windows Chrome browser
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080},
-                locale="en-US",
-                timezone_id="America/New_York"
-            )
-            
-            page = await context.new_page()
-                        
-            # Navigate and wait for the page to finish loading its network requests (JS rendering)
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                        
-            # Extract the raw HTML after JS has executed
-            html_content = await page.content()
-            await browser.close()
+            try:
+                # Spoof a realistic Windows Chrome browser
+                context = await browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    viewport={"width": 1920, "height": 1080},
+                    locale="en-US",
+                    timezone_id="America/New_York"
+                )
+                
+                page = await context.new_page()
+                            
+                # Navigate and wait for the page to finish loading its network requests (JS rendering)
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                            
+                # Extract the raw HTML after JS has executed
+                html_content = await page.content()
+            finally:
+                await browser.close()
             
             # Use BeautifulSoup to aggressively strip out layout garbage
             soup = BeautifulSoup(html_content, 'html.parser')
@@ -1346,8 +1463,17 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
             }
         }
 
+        if config.VERBOSITY_MODE != "silent":
+            sys.stderr.write(f"\n\033[93m[System: Analyst payload is ~{payload_tokens} estimated tokens]\033[0m\n")
+
         # Call the Analyst Model
         response = await analyst_client.chat.completions.create(**api_args)
+        
+        # Log token usage
+        tokens_in = response.usage.prompt_tokens if response.usage else 0
+        tokens_out = response.usage.completion_tokens if response.usage else 0
+        thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
+        config.log_token_usage(STATE_DIR, "analyst", tokens_in, tokens_out, thinking_tokens)
         
         # --- 2. PARSE THE JSON ---
         try:
@@ -1408,9 +1534,7 @@ async def commission_architect(skill_name: str, objective: str, brain_notes: str
     Use this immediately after solving a complex problem to permanently document it.
     Passes raw notes to the Architect agent, who formats and saves it as a new Skill.
     """
-    if config.VERBOSITY_MODE != "silent":
-        print(f"\n\033[38;5;208m▶ [SYSTEM] Waking up the Architect to draft skill: {skill_name}...\033[0m")
-        
+    # Waking up notification is handled in the host runner (chat_overseer.py) to prevent stdout stream corruption.
     architect_user = f"Skill Name: {skill_name}\nObjective: {objective}\nBrain's Notes:\n{brain_notes}"
     client = AsyncOpenAI(
         base_url=config.LLM_PROFILES[config.ACTIVE_ARCHITECT_PROFILE]["base_url"],
@@ -1418,14 +1542,26 @@ async def commission_architect(skill_name: str, objective: str, brain_notes: str
     )
     
     try:
+        messages = [
+            {"role": "system", "content": config.SYSTEM_PROMPTS["architect"]},
+            {"role": "user", "content": architect_user}
+        ]
+        
+        if config.VERBOSITY_MODE != "silent":
+            payload_tokens = get_payload_tokens(messages)
+            sys.stderr.write(f"\n\033[93m[System: Architect payload is ~{payload_tokens} estimated tokens]\033[0m\n")
+
         response = await client.chat.completions.create(
             model=config.LLM_PROFILES[config.ACTIVE_ARCHITECT_PROFILE]["model"],
-            messages=[
-                {"role": "system", "content": config.SYSTEM_PROMPTS["architect"]},
-                {"role": "user", "content": architect_user}
-            ],
+            messages=messages,
             **config.LLM_PROFILES[config.ACTIVE_ARCHITECT_PROFILE].get("api_params", {})
         )
+        
+        # Log token usage
+        tokens_in = response.usage.prompt_tokens if response.usage else 0
+        tokens_out = response.usage.completion_tokens if response.usage else 0
+        thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
+        config.log_token_usage(STATE_DIR, "architect", tokens_in, tokens_out, thinking_tokens)
         
         formatted_skill_md = response.choices[0].message.content.strip()
         if formatted_skill_md.startswith("```markdown"):

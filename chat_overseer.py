@@ -172,7 +172,7 @@ def save_history(messages):
         clean_messages.append(clean_msg)
         
     # 1. Write to a temporary file
-    temp_path = f"{CURRENT_HISTORY_FILE}.tmp"
+    temp_path = f"{CURRENT_HISTORY_FILE}.{os.getpid()}.tmp"
     with open(temp_path, "w", encoding="utf-8") as f: 
         json.dump(clean_messages, f, indent=4)
         
@@ -243,6 +243,9 @@ def cleanup_container():
 atexit.register(cleanup_container)
 
 async def run_chat():
+    state_dir = os.path.join(SESSION_DIR, "state")
+    totals = config.get_token_totals(state_dir)
+    grand = totals.get("_grand_total", {"total": 0, "prompt": 0, "completion": 0, "thinking": 0})
     banner = (
         f"Session: [{active_session}]\n"
         f"Brain:      {config.LLM_PROFILES[config.ACTIVE_BRAIN_PROFILE]['name']}\n"
@@ -251,13 +254,15 @@ async def run_chat():
         f"Adviser:    {config.LLM_PROFILES[config.ACTIVE_ADVISER_PROFILE]['name']}\n"
         f"Analyst:    {config.LLM_PROFILES[config.ACTIVE_ANALYST_PROFILE]['name']}\n"
         f"Architect:  {config.LLM_PROFILES[config.ACTIVE_ARCHITECT_PROFILE]['name']}\n"
-        f"Log saved to: {LOG_FILE}"
+        f"Log saved to: {LOG_FILE}\n"
+        f"Accumulated Session Tokens: {grand['total']} ({grand['prompt']} in, {grand['completion']} out, {grand['thinking']} thinking)"
     )
     log_event("SYSTEM", banner)
     
     prompt_session = None
     quit_app = False
     last_known_tokens = 0 # State tracker for accurate token checking
+    tool_schemas_overhead = 0 # Estimate of token cost for registered tool schemas
     
     help_text = "Commands: '/exit' or '/quit' to quit | UI: '/text', '/markdown' | Verbosity: '/silent', '/minimal', '/standard', '/detailed'"
     
@@ -306,7 +311,11 @@ async def run_chat():
                     f"--name={active_container_name}", # True unique identifier
                     "--network=slirp4netns", # networking mode built specifically for rootless Podman
                     "--add-host=host.containers.internal:host-gateway",
-                    "--security-opt=no-new-privileges:true", # Prevent privilege escalation
+                    # Core Security Protections
+                    "--security-opt", "no-new-privileges=true",
+                    # This safely hides vulnerable kernel symbols without crashing Podman!
+                    "--security-opt", "mask=/proc/kallsyms",
+                    "--security-opt", "mask=/proc/modules",
                     "--cap-drop=ALL",         # Drop all Linux capabilities
                     "--cpus=4.0",            # Limit to 4 CPU cores
                     "--memory=16g",           # Limit to 16 GB of RAM
@@ -351,6 +360,9 @@ async def run_chat():
                         } 
                         for t in mcp_tools.tools
                     ]
+                    
+                    # Calculate token overhead of the registered tool schemas
+                    tool_schemas_overhead = len(tokenizer.encode(json.dumps(openai_tools)))
                     
                     # Initialize tracker outside the loop
                     cli_prompt_consumed = False
@@ -438,7 +450,9 @@ async def run_chat():
                                 })
 
                                 # --- 2. TOKEN WARNING INJECTION ---
-                                current_token_estimate = last_known_tokens if last_known_tokens > 0 else estimate_tokens(messages)
+                                payload_tokens = estimate_tokens(messages)
+                                # Estimate total official context window (messages payload + tool schemas + formatting overhead (4 tokens per message))
+                                current_token_estimate = payload_tokens + tool_schemas_overhead + (len(messages) * 4)
                                 pct = current_token_estimate / config.MAX_CONTEXT_TOKENS
                                 
                                 if pct >= 0.85:
@@ -466,6 +480,9 @@ async def run_chat():
                                 
                                 if "seed" in api_args:
                                     api_args["seed"] = api_args.get("seed") or 42
+
+                                if config.VERBOSITY_MODE != "silent":
+                                    sys.stderr.write(f"\n{COLOR_YELLOW}[System: Brain payload is ~{payload_tokens} estimated tokens (Estimated total context window: ~{current_token_estimate})]{COLOR_RESET}\n")
 
                                 response_stream = await brain_client.chat.completions.create(**api_args)
                                 
@@ -576,6 +593,14 @@ async def run_chat():
                                     if reasoning_tokens == 0 and full_thinking:
                                         reasoning_tokens = len(full_thinking) // 4
                                         
+                                    config.log_token_usage(
+                                        os.path.join(SESSION_DIR, "state"),
+                                        "brain",
+                                        final_usage.prompt_tokens,
+                                        final_usage.completion_tokens,
+                                        reasoning_tokens
+                                    )
+                                        
                                     if config.VERBOSITY_MODE != "silent":   
                                         if reasoning_tokens > 0:
                                             print(f"{COLOR_YELLOW}[Tokens: {final_usage.prompt_tokens} in | {final_usage.completion_tokens} out (~{reasoning_tokens} thinking)]{COLOR_RESET}")
@@ -631,13 +656,30 @@ async def run_chat():
                                             print(f"\n{COLOR_ORANGE}▶ Spawning Sub-Agent... Awaiting response...{COLOR_RESET}")
                                         elif name == "analyze_files":
                                             print(f"\n{COLOR_ORANGE}▶ Passing files to The Analyst... Awaiting report...{COLOR_RESET}")
+                                        elif name == "commission_architect":
+                                            print(f"\n{COLOR_ORANGE}▶ Waking up the Architect to draft skill...{COLOR_RESET}")
                                         elif hide_args:
                                             # If we hid the JSON args, print a clean 1-liner so the user knows it's doing something!
                                             print(f"{COLOR_ORANGE}▶ Running tool: {name}...{COLOR_RESET}")
                                             
                                     start = time.time()
+                                    state_dir = os.path.join(SESSION_DIR, "state")
+                                    totals_before = config.get_token_totals(state_dir)
+                                    
                                     result = await session.call_tool(name, args)
                                     output = result.content[0].text
+                                    
+                                    totals_after = config.get_token_totals(state_dir)
+                                    token_diff = config.get_totals_diff(totals_before, totals_after)
+                                    if token_diff and config.VERBOSITY_MODE != "silent":
+                                        diff_parts = []
+                                        for agent, details in token_diff.items():
+                                            part = f"{agent}: +{details['total']} ({details['prompt']} in, {details['completion']} out"
+                                            if details['thinking'] > 0:
+                                                part += f", {details['thinking']} thinking"
+                                            part += ")"
+                                            diff_parts.append(part)
+                                        print(f"{COLOR_YELLOW}[Tokens used: {', '.join(diff_parts)}]{COLOR_RESET}")
                                     
                                     # --- NEW: Save the real output to our RAM dictionary immediately ---
                                     executed_tool_outputs[tc_id] = output
@@ -709,14 +751,17 @@ async def run_chat():
                                         with open(LOG_FILE, "a", encoding="utf-8") as f:
                                             f.write(log_text)
 
-                                    out_color = COLOR_ORANGE if name in ["forge_and_register_plugin", "compress_and_store_context"] else COLOR_DARK_GREEN
+                                    out_color = COLOR_ORANGE if name in ["forge_and_register_plugin", "compress_and_store_context", "commission_architect", "consult_adviser", "query_universal_llm", "analyze_files"] else COLOR_DARK_GREEN
                                     
                                     # Hide massive output dumps from console if in minimal/standard
                                     hide_output = config.VERBOSITY_MODE in ["minimal", "standard"]
                                     log_event(f"TOOL RESULT ({time.time() - start:.2f}s)", output, text_color=out_color, hide_console=hide_output)
                                     
                                     if hide_output and config.VERBOSITY_MODE != "silent":
-                                        print(f"{COLOR_DARK_GREEN}✓ Tool '{name}' completed ({time.time() - start:.2f}s).{COLOR_RESET}")
+                                        if name in ["commission_architect", "consult_adviser", "query_universal_llm", "analyze_files", "forge_and_register_plugin"]:
+                                            print(f"{out_color}{output}{COLOR_RESET}")
+                                        else:
+                                            print(f"{COLOR_DARK_GREEN}✓ Tool '{name}' completed ({time.time() - start:.2f}s).{COLOR_RESET}")
                                         
                                     if name == "compress_and_store_context":
                                         print(f"\n{COLOR_ORANGE}[SYSTEM] Reloading compressed state from disk...{COLOR_RESET}")
@@ -785,33 +830,46 @@ async def run_chat():
                                 
                                 messages = load_history()
                                 messages.append({
-                                    "role": "user", 
-                                    "content": "[SYSTEM ALERT: The user pressed Ctrl+C to instantly abort the previous text generation or tool execution. Stop what you were doing, acknowledge the interruption, and await new instructions.]"
-                                })
+                                     "role": "user", 
+                                     "content": "[SYSTEM ALERT: The user pressed Ctrl+C to instantly abort the previous text generation or tool execution. Stop what you were doing, acknowledge the interruption, and await new instructions.]"
+                                 })
                                 save_history(messages)
                                 break
+                        if config.VERBOSITY_MODE != "silent":
+                            state_dir = os.path.join(SESSION_DIR, "state")
+                            totals = config.get_token_totals(state_dir)
+                            if totals:
+                                totals_parts = []
+                                for agent, details in totals.items():
+                                    if agent == "_grand_total":
+                                        continue
+                                    part = f"{agent}: {details['total']}"
+                                    if details['thinking'] > 0:
+                                        part += f" ({details['thinking']} thinking)"
+                                    totals_parts.append(part)
+                                grand = totals.get("_grand_total", {"total": 0, "thinking": 0})
+                                grand_str = f"grand: {grand['total']}"
+                                if grand['thinking'] > 0:
+                                    grand_str += f" ({grand['thinking']} thinking)"
+                                totals_parts.append(grand_str)
+                                print(f"\n{COLOR_YELLOW}[Session Totals: {' | '.join(totals_parts)}]{COLOR_RESET}")
                                 
         # 3. CATCH DEAD CONTAINERS AND RESTART
-        except Exception as e:
-            
-            print(f"\n{COLOR_RED}[CRASH DETECTED] {type(e).__name__}: {str(e)}{COLOR_RESET}")
-            
-            # UNPACK THE EXCEPTION GROUP ---
-            print(f"{COLOR_YELLOW}--- TRACEBACK ---{COLOR_RESET}")
-            traceback.print_exc()
-            print(f"{COLOR_YELLOW}-----------------{COLOR_RESET}")
-            
-            print(f"\n{COLOR_YELLOW}[SYSTEM] Sandbox connection dropped or API failed. Restarting loop...{COLOR_RESET}")
-            
-            await asyncio.sleep(1) # Give the OS a second to clean up the dead Podman process
-        except BaseExceptionGroup:
-            # anyio throws BaseExceptionGroup when background tasks (like reading stdio) crash
-            print(f"\n{COLOR_YELLOW}[SYSTEM] Sandbox connection dropped (Likely due to interrupt). Restarting container...{COLOR_RESET}")
-            await asyncio.sleep(1)
         except (KeyboardInterrupt, asyncio.CancelledError):
             print(f"\n{COLOR_YELLOW}[SYSTEM] Hard interrupt detected. Resetting sandbox...{COLOR_RESET}")
             await asyncio.sleep(1)
-
+        except Exception as e:
+            # Check if it's an ExceptionGroup variant safely across Python versions
+            if type(e).__name__ in ["BaseExceptionGroup", "ExceptionGroup"]:
+                print(f"\n{COLOR_YELLOW}[SYSTEM] Sandbox connection dropped (Task Group Interrupt). Restarting container...{COLOR_RESET}")
+            else:
+                print(f"\n{COLOR_RED}[CRASH DETECTED] {type(e).__name__}: {str(e)}{COLOR_RESET}")
+                print(f"{COLOR_YELLOW}--- TRACEBACK ---{COLOR_RESET}")
+                traceback.print_exc()
+                print(f"{COLOR_YELLOW}-----------------{COLOR_RESET}")
+                print(f"\n{COLOR_YELLOW}[SYSTEM] Sandbox connection dropped or API failed. Restarting loop...{COLOR_RESET}")
+            await asyncio.sleep(1)
+            
 if __name__ == "__main__":
     try:
         asyncio.run(run_chat())

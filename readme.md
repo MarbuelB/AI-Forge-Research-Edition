@@ -371,9 +371,11 @@ You can use `tmux` to launch a multi-agent swarm in a 2x2 split-pane dashboard. 
 
 ## 📖 Monitoring & Logs
 
-Every interaction is mirrored to a timestamped log file inside your active session folder (e.g., `sessions/Session_ID_.../logs/`). This includes the Brain's reasoning tokens, tool payloads, and the Coder's intercepted internal thoughts which are hidden from the Brain to save context space.
+* **Interaction Logs:** Every interaction is mirrored to a timestamped log file inside your active session folder (e.g., `sessions/Session_ID_.../logs/chat_log_<timestamp>.txt`). This includes the Brain's reasoning tokens, tool payloads, and the Coder's intercepted internal thoughts (which are hidden from the Brain to save context space).
+* **Token Usage Tracking:** Session-wide token consumption is logged atomically in `sessions/Session_ID_.../state/token_usage.json`. This tracks prompt, completion, and thinking tokens across all roles, including the Brain, Coder, Adviser, Analyst, and **Embedding generation** operations.
+* **Context Warning Logic:** The system uses `tiktoken` to estimate the **total official context window** size dynamically. This estimate accounts for the raw message payload, the size of all registered tool schemas, and chat wrapper template overhead. When the total context usage exceeds 85% of `config.MAX_CONTEXT_TOKENS` (60,000 tokens), the system alerts the Brain to trigger memory compression.
 
-You can safely type `/exit` or `quit` at any time to shut down the system and instantly destroy the temporary container.
+You can safely type `/exit` or `/quit` at any time to shut down the system and instantly destroy the temporary container.
 
 
 ### ⚠️ Disclaimer: Web Scraping & API Limits

@@ -198,7 +198,7 @@ LLM_PROFILES = [
         "name": "Qwen3.6 35B - vLLM",
         "base_url": "http://localhost:4000/v1", 
         "api_key": "sk-sandbox-fake-key",
-        "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+        "model": "Qwen/Qwen3.6-35B-A3B-FP8", #"Qwen/Qwen3.6-27B-FP8"
         "api_params": {
             "temperature": 0.2,
             "top_p": 0.2,
@@ -340,3 +340,139 @@ LLM_PROFILES = [
     },
 
 ]
+
+# --- TOKEN TRACKING UTILITIES ---
+def log_token_usage(state_dir, agent_name, prompt_tokens, completion_tokens, thinking_tokens=0):
+    """Logs token usage for an agent call to a shared state file."""
+    import json
+    import os
+    import time
+    from datetime import datetime
+
+    file_path = os.path.join(state_dir, "token_usage.json")
+    
+    # Ensure state directory exists
+    os.makedirs(state_dir, exist_ok=True)
+    
+    # Acquire file-level lock to prevent concurrent write race conditions
+    lock_file = f"{file_path}.lock"
+    acquired = False
+    for _ in range(100):  # Wait up to 10 seconds total
+        try:
+            fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            acquired = True
+            break
+        except FileExistsError:
+            try:
+                mtime = os.path.getmtime(lock_file)
+                if time.time() - mtime > 10.0:
+                    try:
+                        os.remove(lock_file)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            time.sleep(0.1)
+
+    try:
+        data = {}
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                pass
+                
+        if "totals" not in data:
+            data["totals"] = {}
+        if "history" not in data:
+            data["history"] = []
+            
+        # Update agent totals
+        if agent_name not in data["totals"]:
+            data["totals"][agent_name] = {"prompt": 0, "completion": 0, "thinking": 0, "total": 0}
+            
+        agent_totals = data["totals"][agent_name]
+        agent_totals["prompt"] += prompt_tokens
+        agent_totals["completion"] += completion_tokens
+        agent_totals["thinking"] += thinking_tokens
+        agent_totals["total"] += (prompt_tokens + completion_tokens)
+        
+        # Update grand totals
+        if "_grand_total" not in data["totals"]:
+            data["totals"]["_grand_total"] = {"prompt": 0, "completion": 0, "thinking": 0, "total": 0}
+            
+        grand = data["totals"]["_grand_total"]
+        grand["prompt"] += prompt_tokens
+        grand["completion"] += completion_tokens
+        grand["thinking"] += thinking_tokens
+        grand["total"] += (prompt_tokens + completion_tokens)
+        
+        # Append to history
+        data["history"].append({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "agent": agent_name,
+            "prompt": prompt_tokens,
+            "completion": completion_tokens,
+            "thinking": thinking_tokens,
+            "total": prompt_tokens + completion_tokens
+        })
+        
+        # Save atomically
+        temp_path = f"{file_path}.tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+            os.replace(temp_path, file_path)
+        except Exception:
+            # Fallback
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=4)
+            except Exception:
+                pass
+    finally:
+        if acquired:
+            try:
+                os.remove(lock_file)
+            except Exception:
+                pass
+
+def get_token_totals(state_dir):
+    """Retrieves current token totals from the state file."""
+    import json
+    import os
+    
+    file_path = os.path.join(state_dir, "token_usage.json")
+    if not os.path.exists(file_path):
+        return {}
+        
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("totals", {})
+    except Exception:
+        return {}
+
+def get_totals_diff(before, after):
+    """Computes the difference between two totals dictionaries."""
+    diff = {}
+    for agent, details in after.items():
+        if agent == "_grand_total":
+            continue
+        prev_details = before.get(agent, {"prompt": 0, "completion": 0, "thinking": 0, "total": 0})
+        prompt_diff = details["prompt"] - prev_details["prompt"]
+        completion_diff = details["completion"] - prev_details["completion"]
+        thinking_diff = details["thinking"] - prev_details["thinking"]
+        total_diff = details["total"] - prev_details["total"]
+        
+        if total_diff > 0:
+            diff[agent] = {
+                "prompt": prompt_diff,
+                "completion": completion_diff,
+                "thinking": thinking_diff,
+                "total": total_diff
+            }
+    return diff
+
