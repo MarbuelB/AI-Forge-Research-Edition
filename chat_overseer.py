@@ -15,6 +15,45 @@ from openai import AsyncOpenAI
 import tiktoken
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+# --- MONKEY-PATCH MCP TO PREVENT CRASHES ON STDOUT POLLUTION ---
+from mcp.types import JSONRPCMessage
+
+_original_model_validate_json = JSONRPCMessage.model_validate_json
+
+@classmethod
+def robust_model_validate_json(cls, json_data: str | bytes, *args, **kwargs):
+    if isinstance(json_data, bytes):
+        line = json_data.decode('utf-8', errors='replace')
+    else:
+        line = json_data
+
+    # Try validating directly first
+    try:
+        return _original_model_validate_json(json_data, *args, **kwargs)
+    except Exception as original_exc:
+        # Try to extract the JSON-RPC object if there is pollution around it
+        try:
+            start_idx = line.find('{')
+            if start_idx != -1:
+                end_idx = line.rfind('}')
+                if end_idx != -1 and end_idx > start_idx:
+                    cleaned_json = line[start_idx:end_idx + 1]
+                    # Verify it's valid JSON
+                    json.loads(cleaned_json)
+                    return _original_model_validate_json(cleaned_json, *args, **kwargs)
+        except Exception:
+            pass
+        
+        # If it's completely non-JSON (like a print or system warning),
+        # return a dummy notification to prevent the stdout_reader task from crashing.
+        try:
+            dummy_notification = '{"jsonrpc": "2.0", "method": "dummy/ignore"}'
+            return _original_model_validate_json(dummy_notification, *args, **kwargs)
+        except Exception:
+            raise original_exc
+
+JSONRPCMessage.model_validate_json = robust_model_validate_json
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import ANSI
 from contextlib import nullcontext
@@ -323,23 +362,30 @@ async def run_chat():
                     "--userns=keep-id",
                     "--device=nvidia.com/gpu=all", # GPU Passthrough!
 #                    "--storage-opt", "size=10G", # Limits the container's scratch space, does not work on WSL2
+                    "--env", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                     "-v", f"{SESSION_DIR}:/app/workspace:Z",
                     "-v", f"{os.path.abspath('./config.py')}:/app/config.py:ro,Z",
                     "-v", f"{os.path.abspath('./god_tools.py')}:/app/god_tools.py:ro,Z",
                     "-v", f"{os.path.abspath('./chat_overseer.py')}:/app/chat_overseer.py:ro,Z", # it can read own code
                     "-v", f"{config.HOST_INPUT_DIR}:/app/host_input:ro,Z", # same for all sessions, read only
+                    
                     "ai-forge",
                     "bash", "-c", f"""
                     # 1. Ensure the persistent custom packages folder exists
                     mkdir -p /app/workspace/custom_packages
                     
-                    # 2. Tell Python to load packages from both the Pixi Base AND the Session Delta
-                    export PYTHONPATH=/app/workspace/custom_packages:$PYTHONPATH
+                    # 2. APPLICATION PROTECTION: Prevent write access to the Pixi core environment
+                    chmod -R a-w /app/.pixi/envs/default/lib/python3.14/site-packages 2>/dev/null
+                    chmod -R a-w /app/.pixi/envs/default/lib/python3.14/lib-dynload 2>/dev/null
                     
-                    # 3. Start the MCP server using the Base Image's heavy Pixi environment
+                    # 3. Tell Python to prioritize system modules over the workspace scratchpad
+                    export PYTHONPATH=/usr/lib/python3.14:/usr/local/lib/python3.14:/app/workspace/custom_packages
+                    
+                    # 4. Start the MCP server safely
                     cd /app/workspace
                     {god_tools_cmd}
                     """
+                   
                 ]
             )
             
