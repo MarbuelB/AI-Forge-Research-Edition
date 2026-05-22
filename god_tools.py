@@ -410,33 +410,33 @@ async def query_universal_llm(
 
 
 @mcp.tool()
-async def execute_bash(command: Any = None, cmd: Any = None, timeout_seconds: int = 60) -> str:
+async def execute_bash(command: str, timeout_seconds: int = 60) -> str:
     """Executes a bash command STRICTLY inside the sandbox directory. 
     'timeout_seconds' defaults to 60. Increase it up to 600 if you expect a long-running process like a massive download.
     Do NOT use destructive commands! Move files to the archive folder instead."""
     
-    # 1. Block Destructive Commands (Using strict word boundaries to avoid false positives like 'find -perm')
+    # 1. Catch empty inputs or incorrect types immediately
+    if not command or not isinstance(command, str):
+        return 'SYSTEM ERROR: The "command" parameter must be a non-empty string. Example: command="ls -la"'
+
+    # 2. Block Destructive Commands (Using strict word boundaries to avoid false positives)
     if re.search(r'\brm\s+-[rRf]+\b', command.lower()) or re.search(r'\brm\s+', command.lower()):
         return "SYSTEM ERROR: Destructive commands (rm) are blocked. Use the archive folder instead."
 
-    # 2. Catch if it used 'cmd' instead of 'command'
-    if command is None and cmd is not None:
-        return "SYSTEM ERROR: You used the wrong parameter name. You MUST use 'command', not 'cmd'."
-    if command is None:
-        return "SYSTEM ERROR: Missing required parameter 'command'."
-
-    # 3. Catch if it used a list/array instead of a string
-    if not isinstance(command, str):
-        return 'SYSTEM ERROR: The "command" parameter must be a SINGLE string, not a list or array. Example: command="ls -la /app"'
-
     try:
-        # Force environmental safety boundaries for dynamic scripts
+        # 3. HARDENING: Split the command string into a secure arguments array
+        # This completely neutralizes shell chaining operators like &&, ;, and |
+        cmd_args = shlex.split(command)
+        if not cmd_args:
+            return "SYSTEM ERROR: Empty command payload."
+
         current_env = os.environ.copy()
         current_env["PYTHONPATH"] = f"/app/workspace/custom_packages:{current_env.get('PYTHONPATH', '')}"
 
-        # Launch the subprocess asynchronously with explicitly bounded environments
-        process = await asyncio.create_subprocess_shell(
-            command, 
+        # 4. Switch to create_subprocess_exec for true string parameter boundaries
+        process = await asyncio.create_subprocess_exec(
+            cmd_args[0],
+            *cmd_args[1:], 
             cwd=SANDBOX_DIR,
             env=current_env,
             stdout=asyncio.subprocess.PIPE,     # Capture stdout
@@ -1168,6 +1168,10 @@ async def batch_generate_embeddings(db_path: str, vec_table: str, source_query: 
     2. The text string to be embedded.
     Example: "SELECT id, description FROM tools WHERE id NOT IN (SELECT rowid FROM tools_vec)"
     """
+    # HARDENING: Validate table names to prevent SQL injection compilation tricks
+    if not re.match(r'^[a-zA-Z0-9_]+$', vec_table):
+        return "SYSTEM ERROR: Invalid characters detected in table name parameters."
+    
     # Validate database path is inside workspace
     resolved_db = os.path.abspath(db_path)
     if not (resolved_db == "/app/workspace" or resolved_db.startswith("/app/workspace/")):

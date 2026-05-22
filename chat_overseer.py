@@ -362,7 +362,14 @@ async def run_chat():
                     "--userns=keep-id",
                     "--device=nvidia.com/gpu=all", # GPU Passthrough!
 #                    "--storage-opt", "size=10G", # Limits the container's scratch space, does not work on WSL2
-                    "--env", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    "--env", "PYTHONSAFEPATH=1",
+                    "--env", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/app/.pixi/envs/default/bin",
+                    # MANDATORY HARDENING: Blinds the container to unused high-risk SUID paths entirely
+                    "-v", "/dev/null:/usr/bin/su:ro",
+                    "-v", "/dev/null:/usr/bin/mount:ro",
+                    "-v", "/dev/null:/usr/bin/passwd:ro",
+                    "-v", "/dev/null:/usr/bin/gpasswd:ro",
+                    
                     "-v", f"{SESSION_DIR}:/app/workspace:Z",
                     "-v", f"{os.path.abspath('./config.py')}:/app/config.py:ro,Z",
                     "-v", f"{os.path.abspath('./god_tools.py')}:/app/god_tools.py:ro,Z",
@@ -374,14 +381,18 @@ async def run_chat():
                     # 1. Ensure the persistent custom packages folder exists
                     mkdir -p /app/workspace/custom_packages
                     
-                    # 2. APPLICATION PROTECTION: Prevent write access to the Pixi core environment
-                    chmod -R a-w /app/.pixi/envs/default/lib/python3.14/site-packages 2>/dev/null
-                    chmod -R a-w /app/.pixi/envs/default/lib/python3.14/lib-dynload 2>/dev/null
+                    # 2. APPLICATION PROTECTION: Lock down standard library and user site-packages
+                    mkdir -p /home/agent/.local/lib/python3.14/site-packages
+                    chmod -R a-w /home/agent/.local/
+                    chmod -R a-w /app/__pycache__ 2>/dev/null
                     
-                    # 3. Tell Python to prioritize system modules over the workspace scratchpad
-                    export PYTHONPATH=/usr/lib/python3.14:/usr/local/lib/python3.14:/app/workspace/custom_packages
+                    # 3. HARDENING: Freeze the Pixi environment binary path to block PATH hijacking
+                    chmod -R a-w /app/.pixi/envs/default/bin/ 2>/dev/null
                     
-                    # 4. Start the MCP server safely
+                    # 4. Force immutable system pathways before custom scratchpads
+                    export PYTHONPATH=/app:/usr/local/lib/python3.14:/usr/lib/python3.14:/app/workspace/custom_packages
+                    
+                    # 5. Start the MCP server safely
                     cd /app/workspace
                     {god_tools_cmd}
                     """
