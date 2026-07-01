@@ -1015,8 +1015,12 @@ rand = "0.8"
                 elif target_lang == "cpp":
                     run_hint = f"execute_bash('g++ -std=c++17 {file_path} -o {file_path}_bin && {file_path}_bin')"
                 elif target_lang == "rust":
-                    # Instructs the Brain to use cargo scripts or sandboxed layouts directly to avoid dependency resolution blocks
-                    run_hint = f"Create a project workspace inside /app/workspace/sandbox/rust_project, copy this file to src/main.rs, define your dependencies in Cargo.toml, and run via execute_bash('cd /app/workspace/sandbox/rust_project && cargo run')"
+                    run_hint = (
+                        f"execute_bash('mkdir -p /app/workspace/sandbox/{safe_name}_project/src && "
+                        f"printf \"[package]\\nname = \\\"{safe_name}\\\"\\nversion = \\\"0.1.0\\\"\\nedition = \\\"2021\\\"\\n\\n[dependencies]\\nrand = \\\"0.8\\\"\\n\" > /app/workspace/sandbox/{safe_name}_project/Cargo.toml && "
+                        f"cp {file_path} /app/workspace/sandbox/{safe_name}_project/src/main.rs && "
+                        f"cd /app/workspace/sandbox/{safe_name}_project && cargo run')"
+                    )
 
                 report = f"SUCCESS (Attempt {attempt+1}): {language.upper()} Asset '{plugin_name}' saved to registry.\n"
                 report += f"[Tokens: {tokens_in} in | {tokens_out} out]\n{deps_report}Execution Blueprint: {run_hint}\n\n<___CODER_CODE___>\n{code}\n</___CODER_CODE___>"
@@ -1032,6 +1036,125 @@ rand = "0.8"
             
     return f"FAILED: Coder could not validate artifact constraints after {config.MAX_PLUGIN_RETRIES} runs."
 
+
+@mcp.tool()
+async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
+    """Delegates a targeted code modification task directly to the Coder agent.
+    The Coder will natively read the existing file from disk, isolate the target lines, 
+    and output ONLY the precise text replacement blocks required to satisfy the objective.
+    Use this for modifying massive scripts to save context space.
+    
+    Parameters:
+    - filepath: Absolute path to the file to modify.
+    - edit_objective: Clear instruction on what needs to be changed, added, or fixed.
+    """
+    if not os.path.exists(filepath):
+        return f"SYSTEM ERROR: Target file '{filepath}' does not exist."
+
+    # 1. Natively read the file content from disk so the Coder can see it
+    with open(filepath, "r", encoding="utf-8") as f:
+        current_code = f.read()
+
+    # 2. Spawn a specialized system prompt forcing the Coder to emit a structured search/replace format
+    coder_sys = (
+        "You are an expert full-stack developer operating as a surgical script-patching agent.\n"
+        "Your objective is to modify an existing script without changing unneeded blocks.\n"
+        "Analyze the provided source code, identify the precise snippet needing correction, "
+        "and return a clean JSON object structure containing two keys: 'search_string' and 'replace_string'.\n"
+        "CRITICAL: The 'search_string' MUST exist inside the source code word-for-word, down to the exact spacing and newlines.\n"
+        "Output ONLY a valid, single JSON block wrapped inside a standard markdown json code block token. No conversational filler text."
+    )
+
+    coder_user = (
+        f"--- TARGET FILE LOCATION ---\n{filepath}\n\n"
+        f"--- EDIT OBJECTIVE ---\n{edit_objective}\n\n"
+        f"--- CURRENT ON-DISK SOURCE CODE ---\n{current_code}\n\n"
+        "Perform your analysis and return the json code block immediately."
+    )
+
+    messages = [
+        {"role": "system", "content": coder_sys},
+        {"role": "user", "content": coder_user}
+    ]
+
+    try:
+        api_args = coder_profile["api_params"].copy()
+        api_args["model"] = coder_profile["model"]
+        api_args["messages"] = messages
+        api_args["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "surgical_edit_schema",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "search_string": {"type": "string", "description": "The exact block of code to search for."},
+                        "replace_string": {"type": "string", "description": "The new block of code to swap in."}
+                    },
+                    "required": ["search_string", "replace_string"],
+                    "additionalProperties": False
+                }
+            }
+        }
+
+
+        response = await coder_client.chat.completions.create(**api_args)
+        raw_json_str = response.choices[0].message.content or ""
+        
+        # Log Coder token usage
+        tokens_in = response.usage.prompt_tokens if response.usage else 0
+        tokens_out = response.usage.completion_tokens if response.usage else 0
+        config.log_token_usage(STATE_DIR, "coder", tokens_in, tokens_out, 0)
+
+        if "```" in raw_json_str:
+            match = re.search(r"```(?:json)?\s*(.*?)\s*```", raw_json_str, re.DOTALL)
+            if match:
+                raw_json_str = match.group(1).strip()
+
+        # Parse structural change instructions safely
+        edit_data = json.loads(raw_json_str)
+        search_block = edit_data["search_string"]
+        replace_block = edit_data["replace_string"]
+
+        if search_block not in current_code:
+            return "SYSTEM ERROR: The Coder generated a 'search_string' that does not match the actual file lines exactly. Aborting modifications for safety."
+
+        # Apply surgical transformation
+        updated_code = current_code.replace(search_block, replace_block, 1)
+
+        # Archive backup snapshot
+        filename = os.path.basename(filepath)
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        backup_path = f"/app/workspace/archive/{filename}.{timestamp}.surgical.bak"
+        with open(backup_path, "w", encoding="utf-8") as f:
+            f.write(current_code)
+
+        # Write applied changes back onto disk safely
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(updated_code)
+
+        # Dynamic Git Commit Tracking Checkpoint
+        if os.path.exists("/app/workspace/.git"):
+            cmd = f"git add {shlex.quote(filepath)} && git commit -m 'feat(coder): surgical patch applied for {shlex.quote(edit_objective[:40])}'"
+            proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            await proc.communicate()
+
+        registry = load_json(TOOL_REGISTRY_FILE)
+        blueprint_hint = ""
+        for category_data in registry.values():
+            for name, t_data in category_data.get("tools", {}).items():
+                if t_data.get("path") == filepath:
+                    lang = t_data.get("language", "python")
+                    if lang == "rust":
+                        blueprint_hint = "\nREMINDER: This is a Rust asset. You MUST copy this updated file from plugins into your sandbox Cargo project structure (src/main.rs) and re-run compilation."
+                    elif lang == "cpp":
+                        blueprint_hint = "\nREMINDER: This is a C++ asset. Ensure you re-compile the source file using g++ before executing the binary path."
+
+        return f"SUCCESS: Coder surgically patched '{filepath}' to achieve the objective. Backup generated: {os.path.basename(backup_path)}.{blueprint_hint}"
+
+    except Exception as e:
+        return f"SYSTEM ERROR: Surgical Coder sequence aborted. Error: {str(e)}"
 
 db_tool_desc = f"""Executes a SQL query against a specified SQLite database.
 'db_path' MUST be an absolute path (e.g., '/app/workspace/state/my_db.db').

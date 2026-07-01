@@ -378,21 +378,46 @@ async def run_chat():
                     
                     "ai-forge",
                     "bash", "-c", f"""
-                    # 1. Ensure the persistent custom packages folder exists
+                    # 1. Initialize safe agent Git credentials quietly
+                    git config --global user.name "AI-Forge-Agent"
+                    git config --global user.email "agent@sandbox.local"
+
+                    # FIX 1: Explicitly tell Git never to print diagnostic hints to stdout
+                    git config --global advice.detachedHead false
+                    git config --global advice.initBranch false
+
+                    git config --global init.defaultBranch main
+
+                    # 2. Ensure the persistent custom packages folder exists
                     mkdir -p /app/workspace/custom_packages
+
+                    # 3. Setup or detect an active Git repository in the workspace
+                    if [ ! -d "/app/workspace/.git" ]; then
+                        cd /app/workspace
+                        
+                        # FIX 2: Mute git init output by redirecting it entirely to /dev/null
+                        git init > /dev/null
+                        
+                        # Create a base ignore pattern so the agent doesn't track massive logs or databases
+                        echo -e "logs/\nstate/\nsandbox/\ncustom_packages/\n*.db\n*.tmp\n*.bak" > .gitignore
+                        
+                        # FIX 3: Mute the initial commit tracking messages
+                        git add .gitignore > /dev/null 2>&1
+                        git commit -m "chore: initial sandbox tracking initialization" > /dev/null 2>&1
+                    fi
                     
-                    # 2. APPLICATION PROTECTION: Lock down standard library and user site-packages
+                    # 4. APPLICATION PROTECTION: Lock down standard library and user site-packages
                     mkdir -p /home/agent/.local/lib/python3.14/site-packages
                     chmod -R a-w /home/agent/.local/ 2>/dev/null
                     chmod -R a-w /app/__pycache__ 2>/dev/null
                     
-                    # 3. HARDENING: Freeze the Pixi environment binary path to block PATH hijacking
+                    # 5. HARDENING: Freeze the Pixi environment binary path to block PATH hijacking
                     chmod -R a-w /app/.pixi/envs/default/bin/ 2>/dev/null
                     
-                    # 4. CORRECT ENVIRONMENT ALIGNMENT: Prepend framework paths while preserving Pixi site-packages
+                    # 6. CORRECT ENVIRONMENT ALIGNMENT: Prepend framework paths while preserving Pixi site-packages
                     export PYTHONPATH=/app:/app/workspace/custom_packages:$PYTHONPATH
                     
-                    # 5. Start the MCP server safely
+                    # 7. Start the MCP server safely
                     cd /app/workspace
                     {god_tools_cmd}
                     """                   
