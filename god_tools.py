@@ -424,25 +424,21 @@ async def execute_bash(command: str, timeout_seconds: int = 60) -> str:
         return "SYSTEM ERROR: Destructive commands (rm) are blocked. Use the archive folder instead."
 
     try:
-        # 3. HARDENING: Split the command string into a secure arguments array
-        # This completely neutralizes shell chaining operators like &&, ;, and |
-        cmd_args = shlex.split(command)
-        if not cmd_args:
+        if not command.strip():
             return "SYSTEM ERROR: Empty command payload."
 
         current_env = os.environ.copy()
         current_env["PYTHONPATH"] = f"/app/workspace/custom_packages:{current_env.get('PYTHONPATH', '')}"
 
-        # 4. Switch to create_subprocess_exec for true string parameter boundaries
-        process = await asyncio.create_subprocess_exec(
-            cmd_args[0],
-            *cmd_args[1:], 
+        # Utilizes an asynchronous shell context to permit multi-language execution pipelines (&&, |, >) safely within container borders
+        process = await asyncio.create_subprocess_shell(
+            command,
             cwd=SANDBOX_DIR,
             env=current_env,
-            stdout=asyncio.subprocess.PIPE,     # Capture stdout
-            stderr=asyncio.subprocess.STDOUT,   # Merge stderr into stdout
-            stdin=asyncio.subprocess.DEVNULL,   # Prevents children from stealing input stream
-            start_new_session=True              # Traps grandchild daemons in isolated process group
+            stdout=asyncio.subprocess.PIPE,     
+            stderr=asyncio.subprocess.STDOUT,   
+            stdin=asyncio.subprocess.DEVNULL,   
+            start_new_session=True              
         )
 
         try:
@@ -491,11 +487,13 @@ def write_file(filepath: str, content: str) -> str:
     If the file already exists, it automatically creates a timestamped backup before overwriting.
     Use this instead of bash 'echo' or 'cat' to write markdown, or text files safely.
     You can only write to 'outputs' or 'sandbox' directories.
-    IMPORTANT: For Python code, use forge_and_register_plugin!
+    IMPORTANT: For any source code files (Python, JS, TS, Rust, C++), you MUST use forge_and_register_plugin!
     """
-
-    if filepath.strip().endswith(".py"):
-        return "SYSTEM ERROR: You are strictly FORBIDDEN from using write_file to create Python (.py) scripts. You MUST use 'forge_and_register_plugin' so the Coder LLM can write it properly."
+    
+    # Enforces code containment by routing all source code modifications through the syntax checking pipeline
+    forbidden_extensions = (".py", ".js", ".ts", ".rs", ".cpp", ".c", ".hpp")
+    if filepath.strip().lower().endswith(forbidden_extensions):
+        return f"SYSTEM ERROR: You are strictly FORBIDDEN from using write_file to create source code scripts directly. You MUST use 'forge_and_register_plugin' with the appropriate 'language' parameter so the Coder agent can generate and validate it safely."
 
     # 1. Resolve the absolute path
     resolved_path = os.path.realpath(filepath)
@@ -872,27 +870,41 @@ async def compress_and_store_context() -> str:
 
 
 @mcp.tool()
-async def forge_and_register_plugin(category: str, category_description: str, plugin_name: str, plugin_description: str, objective: str) -> str:
-    """Delegates writing a Python script to the Coder LLM, and registers it with rich metadata.
-    'category_description' explains what the category is for (updates existing descriptions).
-    'plugin_description' should explain what the plugin does and what arguments/parameters it expects.
-    'objective' is the raw instruction sent to the coder.
+async def forge_and_register_plugin(category: str, category_description: str, plugin_name: str, plugin_description: str, objective: str, language: str = "python") -> str:
+    """Delegates code writing to the Coder LLM and maps the artifact with rich metadata execution patterns.
+    'plugin_name' should exclude standard trailing extensions.
+    'language' parameter supports exact validation strategies: 'python', 'javascript', 'typescript', 'rust', 'cpp'.
     """
+    lang_map = {
+        "python": {"ext": ".py", "block": "python"},
+        "javascript": {"ext": ".js", "block": "javascript"},
+        "typescript": {"ext": ".ts", "block": "typescript"},
+        "rust": {"ext": ".rs", "block": "rust"},
+        "cpp": {"ext": ".cpp", "block": "cpp"}
+    }
+    target_lang = language.lower() if language.lower() in lang_map else "python"
+    ext = lang_map[target_lang]["ext"]
+    md_block = lang_map[target_lang]["block"]
 
-    # --- SECURE PATH SANITIZATION ---
     safe_name = os.path.basename(plugin_name)
-    if safe_name.endswith('.py'):
-        safe_name = safe_name[:-3]
+    for k_ext in [".py", ".js", ".ts", ".rs", ".cpp"]:
+        if safe_name.endswith(k_ext): safe_name = safe_name[:-len(k_ext)]
     safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', safe_name)
-    if not safe_name:
-        safe_name = "default_plugin_name"
+    if not safe_name: safe_name = "default_plugin_name"
 
-    filename = f"{safe_name}.py"
+    filename = f"{safe_name}{ext}"
     file_path = os.path.join(PLUGINS_DIR, filename)
     
+    # Context prompt adjustment to switch constraints seamlessly
+    coder_sys = config.PROMPTS["coder_system"]
+    if target_lang != "python":
+        coder_sys = re.sub(r"write robust, standalone Python scripts", f"write robust standalone {language} assets", coder_sys)
+        coder_sys = re.sub(r"Output ONLY valid, executable Python code", f"Output ONLY valid executable {language} source code", coder_sys)
+        coder_sys = re.sub(r"```python", f"```{md_block}", coder_sys)
+
     messages = [
-        {"role": "system", "content": config.PROMPTS["coder_system"]},
-        {"role": "user", "content": config.PROMPTS["coder_user"].format(objective=objective)}
+        {"role": "system", "content": coder_sys},
+        {"role": "user", "content": f"Language Selection: {target_lang}\n\n" + config.PROMPTS["coder_user"].format(objective=objective)}
     ]
     
     for attempt in range(config.MAX_PLUGIN_RETRIES):
@@ -900,25 +912,16 @@ async def forge_and_register_plugin(category: str, category_description: str, pl
             api_args = coder_profile["api_params"].copy()
             api_args["model"] = coder_profile["model"]
             api_args["messages"] = messages
-            
             if "seed" in api_args:
-                base_seed = api_args.get("seed") or 1000
-                api_args["seed"] = base_seed + attempt
+                api_args["seed"] = (api_args.get("seed") or 1000) + attempt
             
             if config.VERBOSITY_MODE != "silent":
-                payload_tokens = get_payload_tokens(messages)
-                sys.stderr.write(f"\n\033[93m[System: Coder payload is ~{payload_tokens} estimated tokens]\033[0m\n")
+                sys.stderr.write(f"\n\033[93m[System: Coder ({target_lang}) payload is ~{get_payload_tokens(messages)} estimated tokens]\033[0m\n")
             
             response = await coder_client.chat.completions.create(**api_args)
             coder_msg = response.choices[0].message
             
-            # --- Extract reasoning/content ---
-            coder_thinking = getattr(coder_msg, 'reasoning_content', None)
-            if not coder_thinking and hasattr(coder_msg, 'model_extra') and coder_msg.model_extra:
-                coder_thinking = coder_msg.model_extra.get('reasoning_content') or coder_msg.model_extra.get('reasoning')
-            if not coder_thinking:
-                coder_thinking = getattr(coder_msg, 'reasoning', None)
-
+            coder_thinking = getattr(coder_msg, 'reasoning_content', None) or (coder_msg.model_extra.get('reasoning_content') if hasattr(coder_msg, 'model_extra') and coder_msg.model_extra else None)
             raw_content = coder_msg.content or ""
             
             if not coder_thinking and "<think>" in raw_content:
@@ -927,109 +930,107 @@ async def forge_and_register_plugin(category: str, category_description: str, pl
                     coder_thinking = think_match.group(1).strip()
                     raw_content = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
             
-            # --- Robust Code Extraction ---
-            match = re.search(r"```python[ \t]*\r?\n(.*?)\r?\n```", raw_content, re.DOTALL)
-            if match:
-                code = match.group(1).strip()
-            else:
-                # Fallback just in case the LLM completely forgot the markdown wrappers
-                code = raw_content.replace("```python", "").replace("```", "").strip()
+            match = re.search(rf"```{md_block}[ \t]*\r?\n(.*?)\r?\n```", raw_content, re.DOTALL)
+            code = match.group(1).strip() if match else raw_content.replace(f"```{md_block}", "").replace("```", "").strip()
     
-            # --- Extract Token Counts ---
             tokens_in = response.usage.prompt_tokens if response.usage else 0
             tokens_out = response.usage.completion_tokens if response.usage else 0
             thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
-            
             config.log_token_usage(STATE_DIR, "coder", tokens_in, tokens_out, thinking_tokens)
-                
-            token_report = f"[Tokens used by Coder: {tokens_in} in | {tokens_out} out" + (f" ({thinking_tokens} thinking)]" if thinking_tokens > 0 else "]")
             
-            # --- AUTO-BACKUP SYSTEM ---
             if os.path.exists(file_path):
-                timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-                backup_dir = os.path.join(WORKSPACE_DIR, "archive")
-                backup_path = os.path.join(backup_dir, f"{safe_name}_{timestamp}.bak.py")
-                shutil.copy2(file_path, backup_path)
+                shutil.copy2(file_path, os.path.join(WORKSPACE_DIR, "archive", f"{safe_name}_{datetime.now().strftime('%Y%m%d%H%M%S')}.bak{ext}"))
             
-            with open(file_path, "w") as f: 
+            with open(file_path, "w", encoding="utf-8") as f: 
                 f.write(code)
 
-            # --- Auto-Install Dependencies (Layered Delta Method) ---
-            requires_match = re.search(r"# REQUIRES:\s*(.*)", code, re.IGNORECASE)
             deps_report = ""
-            if requires_match:
-                # Extract whatever the AI wrote
-                deps = requires_match.group(1).strip()
+            if target_lang == "python":
+                requires_match = re.search(r"# REQUIRES:\s*(.*)", code, re.IGNORECASE)
+                if requires_match:
+                    safe_deps_list = shlex.split(requires_match.group(1).replace("pip install", "").replace("pixi add", "").strip())
+                    proc_install = await asyncio.create_subprocess_exec(
+                        sys.executable, "-m", "pip", "install", "--target", "/app/workspace/custom_packages", *safe_deps_list,
+                        cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                    )
+                    _, stderr_install = await proc_install.communicate()
+                    deps_report = f"\n[SYSTEM: Installed custom dependencies]" if proc_install.returncode == 0 else f"\n[SYSTEM WARNING: Dependency fault: {stderr_install.decode('utf-8', errors='replace')}]"
+
+            # Dynamic platform syntax compile evaluations across all supported execution architectures
+            is_valid = True
+            err_msg = ""
+            if target_lang == "python":
+                check = await asyncio.to_thread(subprocess.run, [sys.executable, "-m", "py_compile", filename], cwd=PLUGINS_DIR, capture_output=True, text=True)
+                if check.returncode != 0: is_valid = False; err_msg = check.stderr
+            elif target_lang == "javascript":
+                check = await asyncio.to_thread(subprocess.run, ["node", "--check", filename], cwd=PLUGINS_DIR, capture_output=True, text=True)
+                if check.returncode != 0: is_valid = False; err_msg = check.stderr
+            elif target_lang == "typescript":
+                # Leverages Node's native type stripping to safely perform syntax parsing on TypeScript files
+                check = await asyncio.to_thread(subprocess.run, ["node", "--experimental-strip-types", "--check", filename], cwd=PLUGINS_DIR, capture_output=True, text=True)
+                if check.returncode != 0: is_valid = False; err_msg = check.stderr
+            elif target_lang == "rust":
+                # Flawless validation: Provisions an isolated cargo scratchpad project to resolve external crates automatically
+                scratch_dir = "/app/workspace/sandbox/.check_rust"
+                os.makedirs(os.path.join(scratch_dir, "src"), exist_ok=True)
                 
-                # Sanitize the string (in case the AI wrote 'pip install' or 'pixi add')
-                clean_deps = deps.replace("pip install", "").replace("pixi add", "").strip()
+                # Pre-configures Cargo structure to support baseline mathematics and randomness utilities natively
+                cargo_toml_content = """[package]
+name = "check_rust"
+version = "0.1.0"
+edition = "2021"
 
-                # Safely split the string into a list of arguments, neutralizing semicolons/pipes
-                safe_deps_list = shlex.split(clean_deps) 
+[dependencies]
+rand = "0.8"
+"""
+                with open(os.path.join(scratch_dir, "Cargo.toml"), "w", encoding="utf-8") as f:
+                    f.write(cargo_toml_content)
+                    
+                # Copies the forged target source file into the scratchpad context entrypoint
+                shutil.copy2(file_path, os.path.join(scratch_dir, "src", "main.rs"))
+                
+                # Executes cargo check - verifies language tokens and syncs library assets simultaneously
+                check = await asyncio.to_thread(subprocess.run, ["cargo", "check", "-q"], cwd=scratch_dir, capture_output=True, text=True)
+                if check.returncode != 0: 
+                    is_valid = False
+                    err_msg = check.stderr
 
-                install_cmd = [sys.executable, "-m", "pip", "install", "--target", "/app/workspace/custom_packages"] + safe_deps_list
+            elif target_lang == "cpp":
+                # GNU compiler syntax check mode - parses headers and code templates without linking output files
+                check = await asyncio.to_thread(subprocess.run, ["g++", "-fsyntax-only", "-std=c++17", filename], cwd=PLUGINS_DIR, capture_output=True, text=True)
+                if check.returncode != 0: is_valid = False; err_msg = check.stderr
 
-                # Execute package ingestion with a fully asynchronous process layout to protect the RPC stream
-                proc_install = await asyncio.create_subprocess_exec(
-                    *install_cmd,
-                    cwd=WORKSPACE_DIR,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout_install, stderr_install = await proc_install.communicate()
-
-                if proc_install.returncode == 0:
-                    deps_report = f"\n[SYSTEM: Automatically installed '{clean_deps}' into persistent session delta.]"
-                else:
-                    err_clean = stderr_install.decode('utf-8', errors='replace')
-                    deps_report = f"\n[SYSTEM WARNING: Failed to auto-install dependencies: {err_clean}]"
-            
-            # Non-blocking compile check
-            check = await asyncio.to_thread(
-                subprocess.run, [sys.executable, "-m", "py_compile", filename], cwd=PLUGINS_DIR, capture_output=True, text=True
-            )
-            
-            if check.returncode == 0:
+            if is_valid:
                 registry = load_json(TOOL_REGISTRY_FILE)
-                
-                if category not in registry: 
-                    registry[category] = {"category_description": category_description, "tools": {}}
-                
-                registry[category]["category_description"] = category_description
-                
-                # Save the rich tool data pointing to the new folder
-                registry[category]["tools"][plugin_name] = {
-                    "path": f"/app/workspace/plugins/{filename}",
-                    "description": plugin_description,
-                    "usage_objective": objective
-                }
+                if category not in registry: registry[category] = {"category_description": category_description, "tools": {}}
+                registry[category]["tools"][plugin_name] = {"path": file_path, "description": plugin_description, "language": target_lang, "usage_objective": objective}
                 save_json(TOOL_REGISTRY_FILE, registry)
                 
-                report = f"SUCCESS (Attempt {attempt+1}): Plugin '{plugin_name}' forged in '{category}'.\n"
-                report += f"{token_report}\n"
-                report += deps_report
-                
-                report += f"Run via: execute_bash('pixi run python /app/workspace/plugins/{filename}')\n\n"
-                
-                report += f"\n<___CODER_CODE___>\n{code}\n</___CODER_CODE___>"
-                
-                if coder_thinking:
-                    report += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
-                    
+                if target_lang == "python":
+                    run_hint = f"execute_bash('python {file_path}')"
+                elif target_lang == "javascript":
+                    run_hint = f"execute_bash('node {file_path}')"
+                elif target_lang == "typescript":
+                    run_hint = f"execute_bash('tsx {file_path}')"
+                elif target_lang == "cpp":
+                    run_hint = f"execute_bash('g++ -std=c++17 {file_path} -o {file_path}_bin && {file_path}_bin')"
+                elif target_lang == "rust":
+                    # Instructs the Brain to use cargo scripts or sandboxed layouts directly to avoid dependency resolution blocks
+                    run_hint = f"Create a project workspace inside /app/workspace/sandbox/rust_project, copy this file to src/main.rs, define your dependencies in Cargo.toml, and run via execute_bash('cd /app/workspace/sandbox/rust_project && cargo run')"
+
+                report = f"SUCCESS (Attempt {attempt+1}): {language.upper()} Asset '{plugin_name}' saved to registry.\n"
+                report += f"[Tokens: {tokens_in} in | {tokens_out} out]\n{deps_report}Execution Blueprint: {run_hint}\n\n<___CODER_CODE___>\n{code}\n</___CODER_CODE___>"
+                if coder_thinking: report += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
                 return report
             else:
-                # Clean up the broken script so it doesn't clutter the directory
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                error_msg = f"Your code failed syntax validation with error:\n{check.stderr}\nPlease fix it and try again. Output ONLY valid python."
+                if os.path.exists(file_path): os.remove(file_path)
                 messages.append({"role": "assistant", "content": code})
-                messages.append({"role": "user", "content": error_msg})
+                messages.append({"role": "user", "content": f"Code validation failed. Error:\n{err_msg}\nPlease patch the syntax rules and return the raw block."})
                 
         except Exception as e:
-            error_trace = traceback.format_exc()
-            return f"Fatal API Error during forging attempt {attempt+1}.\nError: {str(e)}\n\nDetailed Traceback:\n{error_trace}"
+            return f"Fatal Forging Exception on attempt {attempt+1}: {str(e)}"
             
-    return f"FAILED: Coder LLM could not produce valid code after {config.MAX_PLUGIN_RETRIES} attempts."
+    return f"FAILED: Coder could not validate artifact constraints after {config.MAX_PLUGIN_RETRIES} runs."
 
 
 db_tool_desc = f"""Executes a SQL query against a specified SQLite database.

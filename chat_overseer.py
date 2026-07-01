@@ -363,7 +363,7 @@ async def run_chat():
                     "--device=nvidia.com/gpu=all", # GPU Passthrough!
 #                    "--storage-opt", "size=10G", # Limits the container's scratch space, does not work on WSL2
                     "--env", "PYTHONSAFEPATH=1",
-                    "--env", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/app/.pixi/envs/default/bin",
+                    "--env", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/app/.pixi/envs/default/bin:/home/agent/.cargo/bin",
                     # MANDATORY HARDENING: Blinds the container to unused high-risk SUID paths entirely
                     "-v", "/dev/null:/usr/bin/su:ro",
                     "-v", "/dev/null:/usr/bin/mount:ro",
@@ -383,20 +383,19 @@ async def run_chat():
                     
                     # 2. APPLICATION PROTECTION: Lock down standard library and user site-packages
                     mkdir -p /home/agent/.local/lib/python3.14/site-packages
-                    chmod -R a-w /home/agent/.local/
+                    chmod -R a-w /home/agent/.local/ 2>/dev/null
                     chmod -R a-w /app/__pycache__ 2>/dev/null
                     
                     # 3. HARDENING: Freeze the Pixi environment binary path to block PATH hijacking
                     chmod -R a-w /app/.pixi/envs/default/bin/ 2>/dev/null
                     
-                    # 4. Force immutable system pathways before custom scratchpads
-                    export PYTHONPATH=/app:/usr/local/lib/python3.14:/usr/lib/python3.14:/app/workspace/custom_packages
+                    # 4. CORRECT ENVIRONMENT ALIGNMENT: Prepend framework paths while preserving Pixi site-packages
+                    export PYTHONPATH=/app:/app/workspace/custom_packages:$PYTHONPATH
                     
                     # 5. Start the MCP server safely
                     cd /app/workspace
                     {god_tools_cmd}
-                    """
-                   
+                    """                   
                 ]
             )
             
@@ -916,9 +915,14 @@ async def run_chat():
             print(f"\n{COLOR_YELLOW}[SYSTEM] Hard interrupt detected. Resetting sandbox...{COLOR_RESET}")
             await asyncio.sleep(1)
         except Exception as e:
-            # Check if it's an ExceptionGroup variant safely across Python versions
-            if type(e).__name__ in ["BaseExceptionGroup", "ExceptionGroup"]:
-                print(f"\n{COLOR_YELLOW}[SYSTEM] Sandbox connection dropped (Task Group Interrupt). Restarting container...{COLOR_RESET}")
+            # Unwraps ExceptionGroups to print the real underlying API/network failures
+            if type(e).__name__ in ["BaseExceptionGroup", "ExceptionGroup"] and hasattr(e, "exceptions"):
+                print(f"\n{COLOR_RED}[CRASH DETECTED] Wrapped Exception Group Context Triggered:{COLOR_RESET}")
+                for sub_exception in e.exceptions:
+                    print(f"{COLOR_YELLOW}- Internal Error Type: {type(sub_exception).__name__}: {str(sub_exception)}{COLOR_RESET}")
+                    print(f"{COLOR_DIM}--- SUB-TRACEBACK ---{COLOR_RESET}")
+                    traceback.print_exception(type(sub_exception), sub_exception, sub_exception.__traceback__)
+                    print(f"{COLOR_DIM}---------------------{COLOR_RESET}")
             else:
                 print(f"\n{COLOR_RED}[CRASH DETECTED] {type(e).__name__}: {str(e)}{COLOR_RESET}")
                 print(f"{COLOR_YELLOW}--- TRACEBACK ---{COLOR_RESET}")
@@ -926,7 +930,7 @@ async def run_chat():
                 print(f"{COLOR_YELLOW}-----------------{COLOR_RESET}")
                 print(f"\n{COLOR_YELLOW}[SYSTEM] Sandbox connection dropped or API failed. Restarting loop...{COLOR_RESET}")
             await asyncio.sleep(1)
-            
+
 if __name__ == "__main__":
     try:
         asyncio.run(run_chat())

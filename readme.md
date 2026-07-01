@@ -2,7 +2,7 @@
 
 A zero-trust AI architecture utilizing a multi-agent system to dynamically forge local tools, featuring persistent sessions, WSL2 isolation, GPU acceleration, and auto-healing debugging loops.
 
-Rather than relying on a static set of pre-programmed tools, this framework empowers an AI to write, debug, and execute its own Python tools on the fly using the Model Context Protocol (MCP). By separating the "Brain" (logical reasoning) from the "Coder" (code generation), the "Summarizer" (memory management), and the "Adviser" (strategic correction), the system acts as a persistent, self-expanding AI operating system capable of acting as an autonomous researcher—scraping the web, downloading massive datasets, testing hypotheses, training machine learning models, and rendering publication-ready reports while safely bridging massive LLMs with your local hardware.
+Rather than relying on a static set of pre-programmed tools, this framework empowers an AI to write, compile, debug, and execute its own multi-language tools (Python, JavaScript, TypeScript, Rust, C++) on the fly using the Model Context Protocol (MCP). By separating the "Brain" (logical reasoning) from the "Coder" (code generation), the "Summarizer" (memory management), and the "Adviser" (strategic correction), the system acts as a persistent, self-expanding AI operating system capable of acting as an autonomous researcher—scraping the web, downloading massive datasets, testing hypotheses, training machine learning models, and rendering publication-ready reports while safely bridging massive LLMs with your local hardware.
 
 ---
 
@@ -52,7 +52,7 @@ You will now automatically be logged in as the restricted `agent` user, trapped 
 ### 1. The Multi-Agent Architecture
 This project utilizes multiple distinct Large Language Models (LLMs) to maximize efficiency and accuracy:
 * **The Brain (The Overseer):** A fast, high-parameter reasoning model. It communicates with the user, plans out the necessary steps, and orchestrates the execution of tools.
-* **The Coder (The Hands):** A specialized coding model operating inside the Forge sandbox. It operates invisibly in the background. When the Brain needs a new tool, the Coder writes the Python script, validates its syntax, and saves it.
+* **The Coder (The Hands):** A specialized multi-language engineering model operating inside the Forge sandbox. It operates invisibly in the background. When the Brain needs a new component, the Coder outputs the target source files, triggers automated syntax validation passes, and manages compilation schemas dynamically.
 * **The Summarizer (The Memory Manager):** A background agent responsible for context compression using strict JSON schemas.
 * **The Adviser (The Strategist):** A slow, extremely heavy reasoning model (e.g., DeepSeek-R1, Qwen 397B). It is invoked exclusively when the Brain encounters critical bottlenecks or requires strategic redirection.
 * **The Analyst (The Eyes & Data Miner):** A specialized context-isolation and vision agent. When the Brain needs to read a massive 50,000-line error log, parse a raw data dump, or look at an image, it delegates the file to the Analyst. The Analyst processes the heavy payload and returns a highly concentrated summary, keeping the Brain's context window clean, fast, and immune to data-bloat.

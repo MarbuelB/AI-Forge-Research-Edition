@@ -1,0 +1,2 @@
+Environments are installed in a custom detached-environments directory: C:\Users\marek\AppData\Local\rattler\cache\envs\ai_workspace-17624651154394007133\envs.
+Symlinks are not supported on this platform so environments will not be reachable from the default ('.pixi/envs') directory.
