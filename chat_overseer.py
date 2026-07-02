@@ -366,8 +366,6 @@ async def run_chat():
 
         subprocess.run(
             f"podman rm -f --ignore {active_container_name}",
-            #"podman system prune -f && podman rm -f $(podman ps -aq)",
-            #"rm -rf ~/.podman-run/containers ~/.podman-run/libpod/tmp",
             shell=True, 
             stderr=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL
@@ -643,25 +641,31 @@ async def run_chat():
                                             
                                             if chunk_thinking: 
                                                 full_thinking += chunk_thinking
-                                                # Guard the internal thinking phase loop channel
+                                                # Only check if we have enough content to warrant a loop check
                                                 if len(full_thinking) > 500:
-                                                    is_loop, loop_size = detect_text_loop(full_thinking, required_repeats=3)
+                                                    # Feed ONLY the last 10000 characters into the detector.
+                                                    tail_buffer = full_thinking[-10000:]
+                                                    is_loop, loop_size = detect_text_loop(tail_buffer, required_repeats=3)
+
                                                     if is_loop:
                                                         print(f"\n{COLOR_RED}[SYSTEM CIRCUIT BREAKER] Thinking repetition detected. Halting stream...{COLOR_RESET}")
-                                                        # Backtrack exactly by the size of the looping window
-                                                        full_thinking = clean_tail_by_alphanumeric_count(full_thinking, loop_size) + "\n\n[SYSTEM NOTICE: Thinking loop halted due to repetition.]"
+                                                        full_thinking = clean_tail_by_alphanumeric_count(full_thinking, loop_size * 3) + "\n\n[SYSTEM NOTICE: Thinking loop halted due to repetition.]"
                                                         loop_interrupted = True
                                                         break
 
                                             if delta.content: 
                                                 full_content += delta.content
-                                                # Guard the output text content loop channel
+                                                # Only check if we have enough content to warrant a loop check
                                                 if len(full_content) > 500:
-                                                    is_loop, loop_size = detect_text_loop(full_content, required_repeats=3)
+                                                    # Feed ONLY the last 10000 characters into the detector.
+                                                    tail_buffer = full_content[-10000:]
+                                                    is_loop, loop_size = detect_text_loop(tail_buffer, required_repeats=3)
+
                                                     if is_loop:
                                                         print(f"\n{COLOR_RED}[SYSTEM CIRCUIT BREAKER] Text output repetition detected. Halting stream...{COLOR_RESET}")
-                                                        # Backtrack exactly by the size of the looping window
-                                                        full_content = clean_tail_by_alphanumeric_count(full_content, loop_size) + "\n\n[SYSTEM NOTICE: Generation halted due to repetition loop.]"
+                                                        total_chars_to_purge = loop_size * 3
+                                                        full_content = clean_tail_by_alphanumeric_count(full_content, total_chars_to_purge)
+                                                        full_content += "\n\n[SYSTEM NOTICE: Generation halted due to a repetition loop.]"
                                                         loop_interrupted = True
                                                         break
 
@@ -934,34 +938,6 @@ async def run_chat():
                                             print(f"{out_color}{output}{COLOR_RESET}")
                                         else:
                                             print(f"{COLOR_DARK_GREEN}✓ Tool '{name}' completed ({time.time() - start:.2f}s).{COLOR_RESET}")
-
-                                # This is a previous version of "waking-up" behaviour, it was causing restarts or tasks that were already done. 
-                                    """
-                                    if name == "compress_and_store_context":
-                                        print(f"\n{COLOR_ORANGE}[SYSTEM] Reloading compressed state from disk...{COLOR_RESET}")
-                                        messages = load_history()
-                                        messages.append(assistant_message)
-                                        
-                                        # --- NEW: Rebuild sequence using the RAM cache! ---
-                                        for tc in assistant_message["tool_calls"]:
-                                            current_tc_id = tc["id"]
-                                            current_tc_name = tc["function"]["name"]
-                                            
-                                            # Pull the real output if it ran, otherwise fallback
-                                            final_content = executed_tool_outputs.get(current_tc_id, "[SYSTEM NOTE: Tool execution aborted due to memory compression priority.]")
-                                            
-                                            messages.append({
-                                                "role": "tool",
-                                                "tool_call_id": current_tc_id,
-                                                "name": current_tc_name,
-                                                "content": final_content
-                                            })
-                                        
-                                        save_history(messages)
-                                        last_known_tokens = 0 
-                                        consecutive_tool_chains = 0
-                                        break
-                                    """
 
                                     if name == "compress_and_store_context":
                                         print(f"\n{COLOR_ORANGE}[SYSTEM] Memory compression cycle complete. Waking up with pristine context...{COLOR_RESET}")
