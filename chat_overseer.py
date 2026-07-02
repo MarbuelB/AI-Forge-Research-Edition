@@ -230,7 +230,50 @@ def estimate_tokens(messages):
                 
     # Returns the actual token count instead of a character guess
     return len(tokenizer.encode(total_text))
-   
+
+
+def detect_text_loop(text: str, min_loop_length: int = 120, required_repeats: int = 3) -> tuple[bool, int]:
+    """Normalized loop detector. Strips structural formatting noise to catch 
+    loops that contain minor spacing, newline, or character variations.
+    Returns (True, loop_size) if a loop repeating more than required_repeats is found.
+    """
+    # Remove all spaces, newlines, and punctuation, forcing pure lowercase alphanumeric text
+    clean_text = re.sub(r'[^a-zA-Z0-9]', '', text.lower())
+    L = len(clean_text)
+    
+    if L < min_loop_length * (required_repeats + 1):
+        return False, 0
+        
+    # Widened evaluation window to catch large multi-paragraph loops
+    max_check_window = min(L // (required_repeats + 1), 3000)
+    for size in range(min_loop_length, max_check_window + 1):
+        chunk = clean_text[-size:]
+        is_loop = True
+        for r in range(1, required_repeats + 1):
+            start_idx = - (r + 1) * size
+            end_idx = - r * size  # ◄--- FIX: Clean, fixed negative indexing slices perfectly
+            prev_chunk = clean_text[start_idx:end_idx]
+            if prev_chunk != chunk:
+                is_loop = False
+                break
+        if is_loop:
+            return True, size
+            
+    return False, 0
+
+def clean_tail_by_alphanumeric_count(raw_text: str, alpha_count_to_remove: int) -> str:
+    """Removes characters from the trailing end of raw_text until exactly 
+    alpha_count_to_remove alphanumeric characters have been stripped out.
+    Guarantees perfect word boundaries without trimming trailing words in half.
+    """
+    removed_alpha = 0
+    idx = len(raw_text) - 1
+    while idx >= 0 and removed_alpha < alpha_count_to_remove:
+        if raw_text[idx].isalnum():
+            removed_alpha += 1
+        idx -= 1
+    return raw_text[:idx + 1]
+
 
 def log_event(role, content, usage=None, thinking=None, text_color=None, hide_console=False):
     time_str = datetime.now().strftime("%H:%M:%S")
@@ -575,6 +618,7 @@ async def run_chat():
                                 full_thinking = ""
                                 tool_calls_dict = {}
                                 final_usage = None
+                                loop_interrupted = False  # Track if a loop circuit breaker trips
                                 
                                 # --- MULTI-MODE CONTEXT ROUTING ---
                                 if config.FORMAT_MODE == "markdown" and config.VERBOSITY_MODE != "silent":
@@ -597,8 +641,29 @@ async def run_chat():
                                             if not chunk_thinking and hasattr(delta, "model_extra") and delta.model_extra:
                                                 chunk_thinking = delta.model_extra.get("reasoning_content") or delta.model_extra.get("reasoning")
                                             
-                                            if chunk_thinking: full_thinking += chunk_thinking
-                                            if delta.content: full_content += delta.content
+                                            if chunk_thinking: 
+                                                full_thinking += chunk_thinking
+                                                # Guard the internal thinking phase loop channel
+                                                if len(full_thinking) > 500:
+                                                    is_loop, loop_size = detect_text_loop(full_thinking, required_repeats=3)
+                                                    if is_loop:
+                                                        print(f"\n{COLOR_RED}[SYSTEM CIRCUIT BREAKER] Thinking repetition detected. Halting stream...{COLOR_RESET}")
+                                                        # Backtrack exactly by the size of the looping window
+                                                        full_thinking = clean_tail_by_alphanumeric_count(full_thinking, loop_size) + "\n\n[SYSTEM NOTICE: Thinking loop halted due to repetition.]"
+                                                        loop_interrupted = True
+                                                        break
+
+                                            if delta.content: 
+                                                full_content += delta.content
+                                                # Guard the output text content loop channel
+                                                if len(full_content) > 500:
+                                                    is_loop, loop_size = detect_text_loop(full_content, required_repeats=3)
+                                                    if is_loop:
+                                                        print(f"\n{COLOR_RED}[SYSTEM CIRCUIT BREAKER] Text output repetition detected. Halting stream...{COLOR_RESET}")
+                                                        # Backtrack exactly by the size of the looping window
+                                                        full_content = clean_tail_by_alphanumeric_count(full_content, loop_size) + "\n\n[SYSTEM NOTICE: Generation halted due to repetition loop.]"
+                                                        loop_interrupted = True
+                                                        break
 
                                             if delta.tool_calls:
                                                 for tc in delta.tool_calls:
@@ -625,7 +690,7 @@ async def run_chat():
                                                         
                                                         # --- Cap the display height to prevent terminal overflow ---
                                                         think_lines = full_thinking.splitlines()
-                                                        max_lines = 15 # Adjust this number to fit your screen preference!
+                                                        max_lines = 15
                                                         
                                                         if len(think_lines) > max_lines:
                                                             display_thinking = "...\n" + "\n".join(think_lines[-max_lines:])
@@ -656,14 +721,40 @@ async def run_chat():
                                 if full_thinking:
                                     assistant_message["reasoning_content"] = full_thinking
 
-                                if tool_calls_dict:
+                                # Strictly omit any parsed tools if the stream was forcefully aborted
+                                if tool_calls_dict and not loop_interrupted:
                                     assistant_message["tool_calls"] = list(tool_calls_dict.values())
                                     
                                 messages = load_history()
                                 messages.append(assistant_message)
-                                save_history(messages)
-                                log_event("BRAIN", full_content, final_usage, full_thinking)
                                 
+                                # Process state saving depending on loop status
+                                if loop_interrupted:
+                                    messages.append({
+                                        "role": "user", 
+                                        "content": (
+                                            "[CRITICAL INTERVENTION: Your stream was automatically halted because a highly repetitive text sequence or looping thought-pattern was detected."
+                                            "1. IF YOU ARE TRAPPED IN AN UNINTENDED ERROR/CODE LOOP: Stop immediately. Do NOT apologize. Change your strategy, use 'manage_plan' to pivot, or use 'consult_adviser' to analyze your project workspace files. "
+                                            "2. IF YOU ARE INTENTIONALLY GENERATING REPETITIVE DATA FOR A USER TEST: Acknowledge that the system's streaming guardrail was tripped by the repetition. Do NOT keep trying to stream the exact same multi-paragraph payload out to the console. Instead, use 'write_file' to dump the requested repetitive dataset cleanly into an output file for the user, summarize what you did in a brief sentence, and wait for new instructions.]"
+                                            )
+                                    })
+                                    save_history(messages)
+                                    log_event("BRAIN", full_content, final_usage, full_thinking)
+                                    
+                                    # ◄--- Keeps session statistics completely accurate! ---
+                                    if final_usage:
+                                        reasoning_tokens = getattr(final_usage.completion_tokens_details, 'reasoning_tokens', 0) if hasattr(final_usage, 'completion_tokens_details') and final_usage.completion_tokens_details else 0
+                                        if reasoning_tokens == 0 and full_thinking: 
+                                            reasoning_tokens = len(full_thinking) // 4
+                                        config.log_token_usage(os.path.join(SESSION_DIR, "state"), "brain", final_usage.prompt_tokens, final_usage.completion_tokens, reasoning_tokens)
+
+                                    last_known_tokens = 0
+                                    consecutive_tool_chains = 0
+                                    continue
+                                else:
+                                    save_history(messages)
+                                    log_event("BRAIN", full_content, final_usage, full_thinking)
+
                                 # Update exact token count state for the next loop!
                                 if final_usage:
                                     last_known_tokens = final_usage.prompt_tokens + final_usage.completion_tokens
@@ -843,7 +934,9 @@ async def run_chat():
                                             print(f"{out_color}{output}{COLOR_RESET}")
                                         else:
                                             print(f"{COLOR_DARK_GREEN}✓ Tool '{name}' completed ({time.time() - start:.2f}s).{COLOR_RESET}")
-                                        
+
+                                # This is a previous version of "waking-up" behaviour, it was causing restarts or tasks that were already done. 
+                                    """
                                     if name == "compress_and_store_context":
                                         print(f"\n{COLOR_ORANGE}[SYSTEM] Reloading compressed state from disk...{COLOR_RESET}")
                                         messages = load_history()
@@ -867,8 +960,15 @@ async def run_chat():
                                         save_history(messages)
                                         last_known_tokens = 0 
                                         consecutive_tool_chains = 0
-                                        break 
-                                    
+                                        break
+                                    """
+
+                                    if name == "compress_and_store_context":
+                                        print(f"\n{COLOR_ORANGE}[SYSTEM] Memory compression cycle complete. Waking up with pristine context...{COLOR_RESET}")
+                                        last_known_tokens = 0 
+                                        consecutive_tool_chains = 0
+                                        break
+
                                     else:
                                         messages = load_history()
                                         messages.append({
@@ -883,7 +983,7 @@ async def run_chat():
                                 # --- ESCALATING LOOP DETECTION (CHECK) ---
                                 consecutive_tool_chains += 1
 
-                                if consecutive_tool_chains >= 300:
+                                if consecutive_tool_chains >= 1000:
                                     # Hard Stop: Protect the API limits
                                     halt_msg = f"[SYSTEM METRIC: You have executed {consecutive_tool_chains} consecutive tool chains. For safety and observability, you MUST STOP using tools now. Summarize your progress and ask the user for permission to continue.]"
                                     messages = load_history()
@@ -893,7 +993,7 @@ async def run_chat():
                                     log_event("SYSTEM", halt_msg)
                                     consecutive_tool_chains = 0
                                 
-                                elif consecutive_tool_chains > 0 and consecutive_tool_chains % 100 == 0:
+                                elif consecutive_tool_chains > 0 and consecutive_tool_chains % 300 == 0:
                                     # Sweep old soft-pauses
                                     messages = [msg for msg in messages if not (msg.get("role") == "user" and "[SYSTEM METRIC: You have executed" in str(msg.get("content")))]
                                     # Soft Reflection: Ask the AI to evaluate itself

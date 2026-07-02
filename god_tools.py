@@ -173,7 +173,47 @@ def get_payload_tokens(messages):
     image_tokens = image_count * 1000 
     
     return text_tokens + image_tokens
-    
+
+
+def gather_agent_context(filepaths: list[str] = None, max_chars_per_file: int = 40000) -> str:
+    """Natively extracts and strings together absolute file contents inside the sandbox environment, 
+    allowing sub-agents to read project code states without blowing out the main Overseer memory bank.
+    """
+    if not filepaths:
+        return ""
+        
+    context_str = "\n\n=== ATTACHED AGENT CONTEXT BACKGROUND ENVIRONMENT ==="
+    for path in filepaths:
+        resolved_path = os.path.abspath(path)
+        if os.path.exists(resolved_path):
+            try:
+                if not resolved_path.startswith("/app/workspace"):
+                    context_str += f"\n\n[ACCESS DENIED: Path '{os.path.basename(resolved_path)}' falls outside safe workspace boundaries.]"
+                    continue
+                    
+                # Check raw file size before reading to protect system memory
+                file_size_bytes = os.path.getsize(resolved_path)
+                if file_size_bytes > 5_000_000: # 5MB limit safety cutoff
+                    context_str += f"\n\n--- REFERENCE FILE STATE: {os.path.basename(resolved_path)} ---\n[SYSTEM NOTICE: This file is too massive ({file_size_bytes / 1024 / 1024:.2f} MB) to read directly. Use dedicated grep or chunk analysis tools.]"
+                    continue
+
+                with open(resolved_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read(max_chars_per_file)
+                    
+                    # Calculate estimated token overhead for safe budgeting
+                    est_tokens = len(tokenizer.encode(content))
+                    
+                    context_str += f"\n\n--- REFERENCE FILE STATE: {os.path.basename(resolved_path)} (~{est_tokens} tokens) ---\n{content}"
+                    if len(content) >= max_chars_per_file:
+                        context_str += "\n... [TRUNCATED NATIVELY DUE TO SUB-AGENT CONTEXT BUDGET LIMITS] ..."
+            except Exception as e:
+                context_str += f"\n\n[READ FAULT: {os.path.basename(resolved_path)} - Error: {str(e)}]"
+        else:
+            context_str += f"\n\n[FILE TARGET NOT FOUND: {path}]"
+            
+    return context_str + "\n=======================================================\n\n"
+
+
 # --- MCP TOOLS ---
 @mcp.tool()
 def view_tool_registry(category: str = None) -> str:
@@ -216,38 +256,31 @@ def manage_plan(action: str, content: str = None) -> str:
     else:
         return "Error: Invalid action. Must be 'read' or 'write'."
 
-
 @mcp.tool()
-async def consult_adviser(current_plan: str, encountered_problems: str) -> str:
+async def consult_adviser(current_plan: str, encountered_problems: str, context_filepaths: list[str] = None) -> str:
     """Consults the Senior Adviser AI for strategic guidance.
     Pass your current plan and a detailed description of the problems or bottlenecks you are facing.
     The Adviser will review your available tools and memories and return a strategic document.
+    'context_filepaths' provides explicit absolute paths to failing scripts, profiles, or log segments to audit.
     """
-    # 1. Load current registries quietly
     tool_registry = load_json(TOOL_REGISTRY_FILE)
     memory_registry = load_json(MEMORY_REGISTRY_FILE)
     
-    # 2. Build the System & User Prompts for the Adviser
-    sys_prompt = (
-        "You are the Senior Scientific Adviser. Your job is to analyze the Brain's current plan, "
-        "the problems they are facing, and their available tools and memories. "
-        "Provide actionable, highly strategic advice. Suggest exactly what tools they should forge, "
-        "how they should alter their plan, or what alternative technical approaches to take. "
-        "Do NOT write code. Write a clear, structured advisory report."
-    )
+    # ◄--- Gather background file targets ---
+    file_environmental_context = gather_agent_context(context_filepaths)
     
     user_prompt = (
         f"--- CURRENT TOOL REGISTRY ---\n{json.dumps(tool_registry, indent=2)}\n\n"
         f"--- CURRENT MEMORY REGISTRY ---\n{json.dumps(memory_registry, indent=2)}\n\n"
+        f"--- ATTACHED ENVIRONMENT CODE ANALYSIS EVIDENCE ---\n{file_environmental_context}\n"
         f"--- CURRENT PLAN ---\n{current_plan}\n\n"
         f"--- ENCOUNTERED PROBLEMS & REQUEST FOR ADVICE ---\n{encountered_problems}"
     )
 
-    # 3. Setup the API arguments using the dedicated ADVISER profile
     api_args = adviser_profile["api_params"].copy()
     api_args["model"] = adviser_profile["model"]
     api_args["messages"] = [
-        {"role": "system", "content": sys_prompt},
+        {"role": "system", "content": config.SYSTEM_PROMPTS["adviser"]},
         {"role": "user", "content": user_prompt}
     ]
     
@@ -304,7 +337,8 @@ async def query_universal_llm(
     temperature: float = 0.7,
     top_p: float = 1.0,
     max_tokens: int = 32768,
-    reasoning_effort: str = None
+    reasoning_effort: str = None,
+    context_filepaths: list[str] = None  # ◄--- Added parameter
 ) -> str:
     """Queries an available LLM endpoint to run experiments or delegate sub-tasks.
     'action' must be either 'list_models' or 'chat'.
@@ -312,11 +346,11 @@ async def query_universal_llm(
     If action is 'chat', you MUST provide 'model' and 'user_prompt'. 
     You may optionally tune 'system_prompt', 'temperature' (0.0 - 2.0), 'top_p', 'max_tokens', and 'reasoning_effort' ('low', 'medium', 'high' for supported reasoning models).
     Use this only if the Analyst or the Adviser fail to answer questions or run out of ideas.
+    'context_filepaths' allows passing a list of absolute paths to files this sub-agent should read before executing instructions.
     """
     
     if action == "list_models":
         try:
-            # Fetches from <base_url>/v1/models
             models_response = await universal_client.models.list()
             model_names = [m.id for m in models_response.data]
             return "--- AVAILABLE MODELS ---\n" + "\n".join(model_names)
@@ -327,31 +361,31 @@ async def query_universal_llm(
         if not model or not user_prompt:
             return "Error: You must provide a 'model' name and a 'user_prompt' to use the chat action."
             
+        # ◄--- Extract background context files quietly ---
+        file_environmental_context = gather_agent_context(context_filepaths)
+        final_user_payload = f"{file_environmental_context}{user_prompt}"
+
         api_args = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "user", "content": final_user_payload}
             ],
             "temperature": temperature,
             "top_p": top_p,
             "max_tokens": max_tokens
         }
         
-        # --- NEW: DYNAMIC PAYLOAD CHECKER ---
-        # Since the Universal LLM can be any model, we use the global safety limit
         safe_budget = int(config.MAX_CONTEXT_TOKENS * 0.90) 
-        
         payload_tokens = get_payload_tokens(api_args["messages"])
         
         if payload_tokens > safe_budget:
-            return (f"SYSTEM ERROR: The prompt you are sending to the Universal Sub-Agent is too massive! "
+            return (f"SYSTEM ERROR: The prompt and attached context files sent to the Universal Sub-Agent are too massive! "
                     f"Your payload is {payload_tokens} tokens, but the safety limit is {safe_budget}. "
-                    f"Please shorten your 'user_prompt' or use the 'analyze_files' tool if you need to process large documents.")
+                    f"Please refine your 'context_filepaths' selection.")
                     
-        # Only inject if explicitly passed, as local Ollama instances often reject this flag
         if reasoning_effort:
-            api_args["reasoning_effort"] = reasoning_effort
+            api_args["extra_body"] = {"reasoning_effort": reasoning_effort}
             
         if config.VERBOSITY_MODE != "silent":
             sys.stderr.write(f"\n\033[93m[System: Sending prompt to Universal Sub-Agent ({model}) (~{payload_tokens} estimated tokens)...\033[0m\n")
@@ -359,7 +393,6 @@ async def query_universal_llm(
         try:
             response = await universal_client.chat.completions.create(**api_args)
             
-            # Log token usage
             tokens_in = response.usage.prompt_tokens if response.usage else 0
             tokens_out = response.usage.completion_tokens if response.usage else 0
             thinking_tokens = 0
@@ -368,37 +401,26 @@ async def query_universal_llm(
                     thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0)
             config.log_token_usage(STATE_DIR, "universal", tokens_in, tokens_out, thinking_tokens)
             
-            # 1. Safeguard against NoneType
             content = response.choices[0].message.content or ""
             finish_reason = response.choices[0].finish_reason or "unknown"
             
-            # 2. Extract official reasoning tokens (for vLLM / LiteLLM / DeepSeek official)
             thinking = getattr(response.choices[0].message, 'reasoning_content', None)
             if not thinking and hasattr(response.choices[0].message, 'model_extra') and response.choices[0].message.model_extra:
                 thinking = response.choices[0].message.model_extra.get('reasoning_content')
             
-            # 3. Fallback for Ollama (which stuffs reasoning inside the main content block)
             if not thinking and "<think>" in content:
                 think_match = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
                 if think_match:
                     thinking = think_match.group(1).strip()
-                    # Strip it out of the main content so we don't print it twice
                     content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
             
-            result_str = f"--- RESPONSE FROM {model} (Temp: {temperature}, Top-p: {top_p}) ---\n"
-            
+            result_str = f"--- RESPONSE FROM {model} ---\n"
             if thinking:
                 result_str += f"<thinking>\n{thinking}\n</thinking>\n\n"
-                
             result_str += content
             
-            # 4. Debug helper: If it's completely empty, tell the Brain why!
             if not content.strip() and not thinking:
-                result_str += f"\n[SYSTEM WARNING: The model returned an empty response. Finish Reason: '{finish_reason}'. "
-                if finish_reason == "length":
-                    result_str += "You likely requested more max_tokens than the local server's context window allows.]"
-                else:
-                    result_str += "The local model immediately aborted generation.]"
+                result_str += f"\n[SYSTEM WARNING: Empty response. Finish Reason: '{finish_reason}']"
             
             return result_str
             
@@ -407,7 +429,6 @@ async def query_universal_llm(
                         
     else:
         return "Error: Invalid action. Must be 'list_models' or 'chat'."
-
 
 @mcp.tool()
 async def execute_bash(command: str, timeout_seconds: int = 60) -> str:
@@ -644,10 +665,10 @@ async def compress_and_store_context() -> str:
                                 
             # --- Chronological Bulleted List ---
             chunk_prompt = [
-                {"role": "system", "content": "You are a context compressor. Condense the following chat history into a highly dense, chronological bulleted list of key events, tool executions, and findings. Retain exact file paths, critical data points, and decisions. Be extremely concise. Do not use conversational filler."},
+                {"role": "system", "content": config.SYSTEM_PROMPTS["summarizer"]},
                 {"role": "user", "content": json.dumps(chunk_to_compress)}
             ]
-            
+           
             chunk_args = summarizer_profile["api_params"].copy()
             chunk_args["model"] = summarizer_profile["model"]
             chunk_args["messages"] = chunk_prompt
@@ -870,10 +891,19 @@ async def compress_and_store_context() -> str:
 
 
 @mcp.tool()
-async def forge_and_register_plugin(category: str, category_description: str, plugin_name: str, plugin_description: str, objective: str, language: str = "python") -> str:
+async def forge_and_register_plugin(
+    category: str, 
+    category_description: str, 
+    plugin_name: str, 
+    plugin_description: str, 
+    objective: str, 
+    language: str = "python",
+    context_filepaths: list[str] = None  # ◄--- Universal Context Entrypoint
+) -> str:
     """Delegates code writing to the Coder LLM and maps the artifact with rich metadata execution patterns.
     'plugin_name' should exclude standard trailing extensions.
     'language' parameter supports exact validation strategies: 'python', 'javascript', 'typescript', 'rust', 'cpp'.
+    'context_filepaths' allows passing a list of absolute file paths that the Coder must read to adapt to your existing systems.
     """
     lang_map = {
         "python": {"ext": ".py", "block": "python"},
@@ -895,16 +925,18 @@ async def forge_and_register_plugin(category: str, category_description: str, pl
     filename = f"{safe_name}{ext}"
     file_path = os.path.join(PLUGINS_DIR, filename)
     
-    # Context prompt adjustment to switch constraints seamlessly
-    coder_sys = config.PROMPTS["coder_system"]
+    coder_sys = config.SYSTEM_PROMPTS["coder"]
     if target_lang != "python":
         coder_sys = re.sub(r"write robust, standalone Python scripts", f"write robust standalone {language} assets", coder_sys)
         coder_sys = re.sub(r"Output ONLY valid, executable Python code", f"Output ONLY valid executable {language} source code", coder_sys)
         coder_sys = re.sub(r"```python", f"```{md_block}", coder_sys)
 
+    # ◄--- Gather background context files seamlessly ---
+    file_environmental_context = gather_agent_context(context_filepaths)
+
     messages = [
         {"role": "system", "content": coder_sys},
-        {"role": "user", "content": f"Language Selection: {target_lang}\n\n" + config.PROMPTS["coder_user"].format(objective=objective)}
+        {"role": "user", "content": f"Language Selection: {target_lang}\n{file_environmental_context}\n\n" + config.PROMPTS["coder_user"].format(objective=objective)}
     ]
     
     for attempt in range(config.MAX_PLUGIN_RETRIES):
@@ -1657,13 +1689,15 @@ def load_skill(skill_name: str) -> str:
 
 
 @mcp.tool()
-async def commission_architect(skill_name: str, objective: str, brain_notes: str) -> str:
-    """
-    Use this immediately after solving a complex problem to permanently document it.
+async def commission_architect(skill_name: str, objective: str, brain_notes: str, context_filepaths: list[str] = None) -> str:
+    """Use this immediately after solving a complex problem to permanently document it as a system skill.
     Passes raw notes to the Architect agent, who formats and saves it as a new Skill.
+    'context_filepaths' can take target code implementations or terminal output histories to extract instructions from.
     """
-    # Waking up notification is handled in the host runner (chat_overseer.py) to prevent stdout stream corruption.
-    architect_user = f"Skill Name: {skill_name}\nObjective: {objective}\nBrain's Notes:\n{brain_notes}"
+    # ◄--- Gather background reference metrics ---
+    file_environmental_context = gather_agent_context(context_filepaths)
+
+    architect_user = f"{file_environmental_context}Skill Name: {skill_name}\nObjective: {objective}\nBrain's Notes:\n{brain_notes}"
     client = AsyncOpenAI(
         base_url=config.LLM_PROFILES[config.ACTIVE_ARCHITECT_PROFILE]["base_url"],
         api_key=config.LLM_PROFILES[config.ACTIVE_ARCHITECT_PROFILE]["api_key"]
