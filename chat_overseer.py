@@ -891,41 +891,59 @@ async def run_chat():
                                         
                                         log_event("SYSTEM", f"Forced intervention triggered for tool: {name}")
 
-                                    coder_thoughts = ""
-                                    coder_code = ""
+                                    # --- SUBAGENT HIDDEN THOUGHTS & ARTIFACTS LOGGING ---
+                                    subagent_specs = [
+                                        ("CODER", r"<___CODER_THOUGHTS___>(.*?)</___CODER_THOUGHTS___>", r"<___CODER_CODE___>(.*?)</___CODER_CODE___>", "GENERATED CODE / EDIT"),
+                                        ("ADVISER", r"<___ADVISER_THOUGHTS___>(.*?)</___ADVISER_THOUGHTS___>", r"<___ADVISER_REPORT___>(.*?)</___ADVISER_REPORT___>", "ADVISER REPORT"),
+                                        ("ANALYST", r"<___ANALYST_THOUGHTS___>(.*?)</___ANALYST_THOUGHTS___>", r"<___ANALYST_REPORT___>(.*?)</___ANALYST_REPORT___>", "ANALYST REPORT"),
+                                        ("ARCHITECT", r"<___ARCHITECT_THOUGHTS___>(.*?)</___ARCHITECT_THOUGHTS___>", r"<___ARCHITECT_SKILL___>(.*?)</___ARCHITECT_SKILL___>", "GENERATED SKILL"),
+                                        ("SUMMARIZER", r"<___SUMMARIZER_THOUGHTS___>(.*?)</___SUMMARIZER_THOUGHTS___>", r"<___SUMMARIZER_OUTPUT___>(.*?)</___SUMMARIZER_OUTPUT___>", "SUMMARIZER OUTPUT"),
+                                        ("UNIVERSAL SUB-AGENT", r"<___UNIVERSAL_THOUGHTS___>(.*?)</___UNIVERSAL_THOUGHTS___>", r"<___UNIVERSAL_OUTPUT___(?:\s+model=\"([^\"]*)\")?>(.*?)</___UNIVERSAL_OUTPUT___>", "RAW OUTPUT"),
+                                    ]
 
-                                    if "<___CODER_THOUGHTS___>" in output:
-                                        match = re.search(r"<___CODER_THOUGHTS___>(.*?)</___CODER_THOUGHTS___>", output, re.DOTALL)
-                                        if match: coder_thoughts = match.group(1).strip()
-                                        output = re.sub(r"<___CODER_THOUGHTS___>.*?</___CODER_THOUGHTS___>", "", output, flags=re.DOTALL).strip()
+                                    for agent_label, thought_pattern, content_pattern, content_label in subagent_specs:
+                                        agent_thoughts = ""
+                                        agent_content = ""
+                                        model_tag = ""
 
-                                    if "<___CODER_CODE___>" in output:
-                                        match = re.search(r"<___CODER_CODE___>(.*?)</___CODER_CODE___>", output, re.DOTALL)
-                                        if match: coder_code = match.group(1).strip()
-                                        output = re.sub(r"<___CODER_CODE___>.*?</___CODER_CODE___>", "", output, flags=re.DOTALL).strip()
+                                        if thought_pattern:
+                                            match_t = re.search(thought_pattern, output, re.DOTALL)
+                                            if match_t:
+                                                agent_thoughts = match_t.group(1).strip()
+                                                output = re.sub(thought_pattern, "", output, flags=re.DOTALL).strip()
 
+                                        if content_pattern:
+                                            match_c = re.search(content_pattern, output, re.DOTALL)
+                                            if match_c:
+                                                if len(match_c.groups()) == 2:
+                                                    model_tag = f" ({match_c.group(1)})" if match_c.group(1) else ""
+                                                    agent_content = match_c.group(2).strip()
+                                                else:
+                                                    agent_content = match_c.group(1).strip()
+                                                output = re.sub(content_pattern, "", output, flags=re.DOTALL).strip()
 
-                                    if coder_thoughts or coder_code:
-                                        time_str = datetime.now().strftime("%H:%M:%S")
-                                        log_text = f"\n[{time_str}] === CODER (HIDDEN) ===\n"
+                                        if agent_thoughts or agent_content:
+                                            time_str = datetime.now().strftime("%H:%M:%S")
+                                            display_label = f"{agent_label}{model_tag}"
+                                            log_text = f"\n[{time_str}] === {display_label} (HIDDEN) ===\n"
 
-                                        hide_coder = config.VERBOSITY_MODE in ["silent", "minimal", "standard"]
+                                            hide_subagent = config.VERBOSITY_MODE in ["silent", "minimal", "standard"]
 
-                                        if not hide_coder:
-                                            print(f"\n{COLOR_ORANGE}[{time_str}] === CODER (HIDDEN) ==={COLOR_RESET}")
+                                            if not hide_subagent:
+                                                print(f"\n{COLOR_ORANGE}[{time_str}] === {display_label} (HIDDEN) ==={COLOR_RESET}")
 
-                                        if coder_thoughts:
-                                            log_text += f"--- THOUGHTS ---\n{coder_thoughts}\n\n"
-                                            if not hide_coder:
-                                                print(f"{COLOR_DIM}--- THOUGHTS ---\n{coder_thoughts}\n{COLOR_RESET}")
+                                            if agent_thoughts:
+                                                log_text += f"<thinking>\n{agent_thoughts}\n</thinking>\n\n"
+                                                if not hide_subagent:
+                                                    print(f"{COLOR_DIM}<thinking>\n{agent_thoughts}\n</thinking>{COLOR_RESET}")
 
-                                        if coder_code:
-                                            log_text += f"--- GENERATED CODE ---\n{coder_code}\n\n"
-                                            if not hide_coder:
-                                                print(f"--- GENERATED CODE ---\n{coder_code}\n")
+                                            if agent_content:
+                                                log_text += f"--- {content_label} ---\n{agent_content}\n\n"
+                                                if not hide_subagent:
+                                                    print(f"--- {content_label} ---\n{agent_content}\n")
 
-                                        with open(LOG_FILE, "a", encoding="utf-8") as f:
-                                            f.write(log_text)
+                                            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                                                f.write(log_text)
 
                                     out_color = COLOR_ORANGE if name in ["forge_and_register_plugin", "compress_and_store_context", "commission_architect", "consult_adviser", "query_universal_llm", "analyze_files"] else COLOR_DARK_GREEN
                                     

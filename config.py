@@ -236,13 +236,14 @@ UNIVERSAL_LLM_CONFIG = {
 LLM_PROFILES = [
     # [0] Local Model - vLLM - from WSL2
     {
-        "name": "Qwen3.6 35B - vLLM", #"Ornith 1.0 35B - vLLM", #"Qwen3.6 35B - vLLM",
+        "name": "Qwen3.8 27B - vLLM", #"Ornith 1.0 35B - vLLM", #"Qwen3.6 35B - vLLM",
         "base_url": "http://localhost:4000/v1", 
         "api_key": "sk-sandbox-fake-key",
-        "model": "Qwen/Qwen3.6-35B-A3B-FP8", #"deepreinforce-ai/Ornith-1.0-35B-FP8", #"Qwen/Qwen3.6-35B-A3B-FP8", #"Qwen/Qwen3.6-27B-FP8"
+        "model": "Qwen/Qwen3.8-27B-FP8", #"deepreinforce-ai/Ornith-1.0-35B-FP8", #"Qwen/Qwen3.6-35B-A3B-FP8", #"Qwen/Qwen3.6-27B-FP8"
         "api_params": {
-            "temperature": 0.2,
-            "top_p": 0.2,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "reasoning_effort": "xhigh", # xhigh by default; supported levels are xhigh, medium, and low
             "presence_penalty": 0.0,
             "frequency_penalty": 0.0,
             "timeout": 180.0, # If the server doesn't reply in 180 seconds, kill it and retry!
@@ -250,7 +251,7 @@ LLM_PROFILES = [
             "extra_body": {
                 "top_k": 20,
                 "min_p": 0.0,
-                "repetition_penalty": 1.05,
+                "repetition_penalty": 1.0,
                 "mm_processor_kwargs": {"fps": 1, "max_frames": 1200, "do_sample_frames": True},
                 "chat_template_kwargs": {"enable_thinking": True}
                 },
@@ -259,13 +260,14 @@ LLM_PROFILES = [
     },
     # [1] Local Model - vLLM - from Podman
     {
-        "name": "Qwen3.6 35B - vLLM", #"Ornith 1.0 35B - vLLM", #"Qwen3.6 35B - vLLM",
+        "name": "Qwen3.8 27B - vLLM", #"Ornith 1.0 35B - vLLM", #"Qwen3.6 35B - vLLM",
         "base_url": "http://host.containers.internal:4000/v1", 
         "api_key": "sk-sandbox-fake-key",
-        "model": "Qwen/Qwen3.6-35B-A3B-FP8", #"deepreinforce-ai/Ornith-1.0-35B-FP8", #"Qwen/Qwen3.6-35B-A3B-FP8",
+        "model": "Qwen/Qwen3.8-27B-FP8", #"deepreinforce-ai/Ornith-1.0-35B-FP8", #"Qwen/Qwen3.6-35B-A3B-FP8",
         "api_params": {
-            "temperature": 0.2,
-            "top_p": 0.2,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "reasoning_effort": "xhigh", # xhigh by default; supported levels are xhigh, medium, and low
             "presence_penalty": 0.0,
             "frequency_penalty": 0.0,
             "timeout": 180.0, # If the server doesn't reply in 180 seconds, kill it and retry!
@@ -273,7 +275,7 @@ LLM_PROFILES = [
             "extra_body": {
                 "top_k": 20,
                 "min_p": 0.0,
-                "repetition_penalty": 1.05,
+                "repetition_penalty": 1.0,
                 "mm_processor_kwargs": {"fps": 1, "max_frames": 1200, "do_sample_frames": True},
                 "chat_template_kwargs": {"enable_thinking": True}
                 },
@@ -377,6 +379,35 @@ LLM_PROFILES = [
             "frequency_penalty": 0.0,
             "timeout": 180.0, # If the server doesn't reply in 180 seconds, kill it and retry!
             "max_tokens": 16384,
+        }
+    },
+
+    # [7] Local Model - vLLM - from WSL2
+    {
+        "name": "Laguna S 2.1 - vLLM",
+        "base_url": "http://localhost:4000/v1", 
+        "api_key": "sk-sandbox-fake-key",
+        "model": "poolside/Laguna-S-2.1-NVFP4",
+        "api_params": {
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "timeout": 600.0, # If the server doesn't reply in 600 seconds, kill it and retry!
+            "max_tokens": 65536,
+            "seed": None  # <--- Placeholder: Tells the worker this model accepts seeds!
+        }
+    },
+    # [8] Local Model - vLLM - from Podman
+    {
+        "name": "Laguna S 2.1 - vLLM",
+        "base_url": "http://host.containers.internal:4000/v1", 
+        "api_key": "sk-sandbox-fake-key",
+        "model": "poolside/Laguna-S-2.1-NVFP4",
+        "api_params": {
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "timeout": 600.0, # If the server doesn't reply in 600 seconds, kill it and retry!
+            "max_tokens": 65536,
+            "seed": None  # <--- Placeholder: Tells the worker this model accepts seeds!
         }
     },
 

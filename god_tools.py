@@ -123,6 +123,21 @@ embedding_client = AsyncOpenAI(
 )
 
 # --- HELPER FUNCTIONS ---
+def extract_thinking_and_content(message) -> tuple[str, str]:
+    """Extracts thinking/reasoning content and main text content from an OpenAI message object."""
+    thinking = getattr(message, 'reasoning_content', None)
+    if not thinking and hasattr(message, 'model_extra') and message.model_extra:
+        thinking = message.model_extra.get('reasoning_content') or message.model_extra.get('reasoning')
+    
+    content = message.content or ""
+    if not thinking and "<think>" in content:
+        think_match = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
+        if think_match:
+            thinking = think_match.group(1).strip()
+            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            
+    return (thinking or "").strip(), (content or "").strip()
+
 def load_json(filepath):
     if not os.path.exists(filepath): return {}
     with open(filepath, "r") as f: return json.load(f)
@@ -301,15 +316,14 @@ async def consult_adviser(current_plan: str, encountered_problems: str, context_
     try:
         # 4. Await the LLM response using the dedicated ADVISER client
         response = await adviser_client.chat.completions.create(**api_args)
-        advice_text = response.choices[0].message.content
+        adviser_thinking, advice_text = extract_thinking_and_content(response.choices[0].message)
         
         # Log token usage
         tokens_in = response.usage.prompt_tokens if response.usage else 0
         tokens_out = response.usage.completion_tokens if response.usage else 0
-        thinking_tokens = 0
-        if response.usage:
-            if hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details:
-                thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0)
+        thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
+        if thinking_tokens == 0 and adviser_thinking:
+            thinking_tokens = len(adviser_thinking) // 4
         config.log_token_usage(STATE_DIR, "adviser", tokens_in, tokens_out, thinking_tokens)
         
         # 5. Format the filename to start with the date (e.g., 20260503_204530_advice.md)
@@ -319,10 +333,16 @@ async def consult_adviser(current_plan: str, encountered_problems: str, context_
         
         # 6. Save the physical document to the state folder
         with open(filepath, "w", encoding="utf-8") as f:
+            if adviser_thinking:
+                f.write(f"<thinking>\n{adviser_thinking}\n</thinking>\n\n")
             f.write(advice_text)
             
-        # 7. Return the full text back to the Brain's context window
-        return f"Adviser report successfully saved to disk as '{filename}'.\n\n--- ADVISER FEEDBACK ---\n{advice_text}"
+        # 7. Return the full text back to the Brain's context window with hidden sentinel tags
+        result_msg = f"Adviser report successfully saved to disk as '{filename}'.\n\n--- ADVISER FEEDBACK ---\n{advice_text}"
+        if adviser_thinking:
+            result_msg += f"\n<___ADVISER_THOUGHTS___>\n{adviser_thinking}\n</___ADVISER_THOUGHTS___>"
+        result_msg += f"\n<___ADVISER_REPORT___>\n{advice_text}\n</___ADVISER_REPORT___>"
+        return result_msg
         
     except Exception as e:
         return f"Failed to consult the adviser. Error: {str(e)}"
@@ -392,27 +412,16 @@ async def query_universal_llm(
             
         try:
             response = await universal_client.chat.completions.create(**api_args)
+            thinking, content = extract_thinking_and_content(response.choices[0].message)
             
             tokens_in = response.usage.prompt_tokens if response.usage else 0
             tokens_out = response.usage.completion_tokens if response.usage else 0
-            thinking_tokens = 0
-            if response.usage:
-                if hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details:
-                    thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0)
+            thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
+            if thinking_tokens == 0 and thinking:
+                thinking_tokens = len(thinking) // 4
             config.log_token_usage(STATE_DIR, "universal", tokens_in, tokens_out, thinking_tokens)
             
-            content = response.choices[0].message.content or ""
             finish_reason = response.choices[0].finish_reason or "unknown"
-            
-            thinking = getattr(response.choices[0].message, 'reasoning_content', None)
-            if not thinking and hasattr(response.choices[0].message, 'model_extra') and response.choices[0].message.model_extra:
-                thinking = response.choices[0].message.model_extra.get('reasoning_content')
-            
-            if not thinking and "<think>" in content:
-                think_match = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
-                if think_match:
-                    thinking = think_match.group(1).strip()
-                    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
             
             result_str = f"--- RESPONSE FROM {model} ---\n"
             if thinking:
@@ -421,6 +430,11 @@ async def query_universal_llm(
             
             if not content.strip() and not thinking:
                 result_str += f"\n[SYSTEM WARNING: Empty response. Finish Reason: '{finish_reason}']"
+            
+            if thinking:
+                result_str += f"\n<___UNIVERSAL_THOUGHTS___>\n{thinking}\n</___UNIVERSAL_THOUGHTS___>"
+            if content:
+                result_str += f"\n<___UNIVERSAL_OUTPUT___ model=\"{model}\">\n{content}\n</___UNIVERSAL_OUTPUT___>"
             
             return result_str
             
@@ -679,11 +693,14 @@ async def compress_and_store_context() -> str:
             
             try:
                 chunk_resp = await summarizer_client.chat.completions.create(**chunk_args)
+                chunk_thinking, dense_summary = extract_thinking_and_content(chunk_resp.choices[0].message)
                 
                 # Log token usage
                 tokens_in = chunk_resp.usage.prompt_tokens if chunk_resp.usage else 0
                 tokens_out = chunk_resp.usage.completion_tokens if chunk_resp.usage else 0
                 thinking_tokens = getattr(chunk_resp.usage.completion_tokens_details, 'reasoning_tokens', 0) if chunk_resp.usage and hasattr(chunk_resp.usage, 'completion_tokens_details') and chunk_resp.usage.completion_tokens_details else 0
+                if thinking_tokens == 0 and chunk_thinking:
+                    thinking_tokens = len(chunk_thinking) // 4
                 config.log_token_usage(STATE_DIR, "summarizer", tokens_in, tokens_out, thinking_tokens)
                 
                 dense_summary = chunk_resp.choices[0].message.content
@@ -769,14 +786,17 @@ async def compress_and_store_context() -> str:
 
     try:
         mem_response = await summarizer_client.chat.completions.create(**api_args)
+        mem_thinking, mem_raw_content = extract_thinking_and_content(mem_response.choices[0].message)
         
         # Log token usage
         tokens_in = mem_response.usage.prompt_tokens if mem_response.usage else 0
         tokens_out = mem_response.usage.completion_tokens if mem_response.usage else 0
         thinking_tokens = getattr(mem_response.usage.completion_tokens_details, 'reasoning_tokens', 0) if mem_response.usage and hasattr(mem_response.usage, 'completion_tokens_details') and mem_response.usage.completion_tokens_details else 0
+        if thinking_tokens == 0 and mem_thinking:
+            thinking_tokens = len(mem_thinking) // 4
         config.log_token_usage(STATE_DIR, "summarizer", tokens_in, tokens_out, thinking_tokens)
         
-        mem_data = json.loads(mem_response.choices[0].message.content)
+        mem_data = json.loads(mem_raw_content)
         
         added_titles = []
         for memory in mem_data.get("extracted_memories", []):
@@ -866,14 +886,17 @@ async def compress_and_store_context() -> str:
 
     try:
         comp_response = await summarizer_client.chat.completions.create(**api_args)
+        comp_thinking, comp_raw_content = extract_thinking_and_content(comp_response.choices[0].message)
         
         # Log token usage
         tokens_in = comp_response.usage.prompt_tokens if comp_response.usage else 0
         tokens_out = comp_response.usage.completion_tokens if comp_response.usage else 0
         thinking_tokens = getattr(comp_response.usage.completion_tokens_details, 'reasoning_tokens', 0) if comp_response.usage and hasattr(comp_response.usage, 'completion_tokens_details') and comp_response.usage.completion_tokens_details else 0
+        if thinking_tokens == 0 and comp_thinking:
+            thinking_tokens = len(comp_thinking) // 4
         config.log_token_usage(STATE_DIR, "summarizer", tokens_in, tokens_out, thinking_tokens)
         
-        comp_data = json.loads(comp_response.choices[0].message.content)
+        comp_data = json.loads(comp_raw_content)
         
         # Backup the old bloated history before we overwrite it
         backup_file = os.path.join(HISTORIES_DIR, f"backup_history_{datetime.now().strftime('%Y%m%d%H%M%S')}.json")
@@ -884,7 +907,19 @@ async def compress_and_store_context() -> str:
         new_history.insert(0, {"role": "system", "content": config.PROMPTS["overseer_system"]})
         save_json(CURRENT_HISTORY_FILE, new_history)
         
-        return f"SUCCESS: Context compressed and old history moved to {os.path.basename(backup_file)}.{rolling_log}\nNew detailed memories extracted to disk: {added_titles}. \n[SYSTEM INSTRUCTION: Your context has been reset, and any requested memory extraction has been completed. Review your 'Active Plan'. If the user's last command was simply to compress/save memory, do NOT do it again—simply tell them it is complete.]"
+        summarizer_thoughts = []
+        if mem_thinking: summarizer_thoughts.append(f"--- MEMORY EXTRACTION THINKING ---\n{mem_thinking}")
+        if comp_thinking: summarizer_thoughts.append(f"--- HISTORY COMPRESSION THINKING ---\n{comp_thinking}")
+        
+        summarizer_output = f"Extracted Memories: {added_titles}\nCompressed History: {len(new_history)} messages"
+        
+        result_msg = f"SUCCESS: Context compressed and old history moved to {os.path.basename(backup_file)}.{rolling_log}\nNew detailed memories extracted to disk: {added_titles}. \n[SYSTEM INSTRUCTION: Your context has been reset, and any requested memory extraction has been completed. Review your 'Active Plan'. If the user's last command was simply to compress/save memory, do NOT do it again—simply tell them it is complete.]"
+        
+        if summarizer_thoughts:
+            result_msg += f"\n<___SUMMARIZER_THOUGHTS___>\n" + "\n\n".join(summarizer_thoughts) + "\n</___SUMMARIZER_THOUGHTS___>"
+        result_msg += f"\n<___SUMMARIZER_OUTPUT___>\n{summarizer_output}\n</___SUMMARIZER_OUTPUT___>"
+        
+        return result_msg
         
     except Exception as e:
         return f"FAILED during History Compression Phase. Error: {str(e)}"
@@ -951,16 +986,7 @@ async def forge_and_register_plugin(
                 sys.stderr.write(f"\n\033[93m[System: Coder ({target_lang}) payload is ~{get_payload_tokens(messages)} estimated tokens]\033[0m\n")
             
             response = await coder_client.chat.completions.create(**api_args)
-            coder_msg = response.choices[0].message
-            
-            coder_thinking = getattr(coder_msg, 'reasoning_content', None) or (coder_msg.model_extra.get('reasoning_content') if hasattr(coder_msg, 'model_extra') and coder_msg.model_extra else None)
-            raw_content = coder_msg.content or ""
-            
-            if not coder_thinking and "<think>" in raw_content:
-                think_match = re.search(r"<think>(.*?)</think>", raw_content, re.DOTALL)
-                if think_match:
-                    coder_thinking = think_match.group(1).strip()
-                    raw_content = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
+            coder_thinking, raw_content = extract_thinking_and_content(response.choices[0].message)
             
             match = re.search(rf"```{md_block}[ \t]*\r?\n(.*?)\r?\n```", raw_content, re.DOTALL)
             code = match.group(1).strip() if match else raw_content.replace(f"```{md_block}", "").replace("```", "").strip()
@@ -968,6 +994,8 @@ async def forge_and_register_plugin(
             tokens_in = response.usage.prompt_tokens if response.usage else 0
             tokens_out = response.usage.completion_tokens if response.usage else 0
             thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
+            if thinking_tokens == 0 and coder_thinking:
+                thinking_tokens = len(coder_thinking) // 4
             config.log_token_usage(STATE_DIR, "coder", tokens_in, tokens_out, thinking_tokens)
             
             if os.path.exists(file_path):
@@ -1132,12 +1160,15 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
 
 
         response = await coder_client.chat.completions.create(**api_args)
-        raw_json_str = response.choices[0].message.content or ""
+        coder_thinking, raw_json_str = extract_thinking_and_content(response.choices[0].message)
         
         # Log Coder token usage
         tokens_in = response.usage.prompt_tokens if response.usage else 0
         tokens_out = response.usage.completion_tokens if response.usage else 0
-        config.log_token_usage(STATE_DIR, "coder", tokens_in, tokens_out, 0)
+        thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
+        if thinking_tokens == 0 and coder_thinking:
+            thinking_tokens = len(coder_thinking) // 4
+        config.log_token_usage(STATE_DIR, "coder", tokens_in, tokens_out, thinking_tokens)
 
         if "```" in raw_json_str:
             match = re.search(r"```(?:json)?\s*(.*?)\s*```", raw_json_str, re.DOTALL)
@@ -1183,7 +1214,12 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                     elif lang == "cpp":
                         blueprint_hint = "\nREMINDER: This is a C++ asset. Ensure you re-compile the source file using g++ before executing the binary path."
 
-        return f"SUCCESS: Coder surgically patched '{filepath}' to achieve the objective. Backup generated: {os.path.basename(backup_path)}.{blueprint_hint}"
+        edit_summary_block = f"Search Block:\n{search_block}\n\nReplace Block:\n{replace_block}"
+        res = f"SUCCESS: Coder surgically patched '{filepath}' to achieve the objective. Backup generated: {os.path.basename(backup_path)}.{blueprint_hint}"
+        if coder_thinking:
+            res += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
+        res += f"\n<___CODER_CODE___>\n{edit_summary_block}\n</___CODER_CODE___>"
+        return res
 
     except Exception as e:
         return f"SYSTEM ERROR: Surgical Coder sequence aborted. Error: {str(e)}"
@@ -1628,22 +1664,25 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
 
         # Call the Analyst Model
         response = await analyst_client.chat.completions.create(**api_args)
+        analyst_thinking, raw_analyst_content = extract_thinking_and_content(response.choices[0].message)
         
         # Log token usage
         tokens_in = response.usage.prompt_tokens if response.usage else 0
         tokens_out = response.usage.completion_tokens if response.usage else 0
         thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
+        if thinking_tokens == 0 and analyst_thinking:
+            thinking_tokens = len(analyst_thinking) // 4
         config.log_token_usage(STATE_DIR, "analyst", tokens_in, tokens_out, thinking_tokens)
         
         # --- 2. PARSE THE JSON ---
         try:
-            report_data = json.loads(response.choices[0].message.content)
+            report_data = json.loads(raw_analyst_content)
             ex_summ = report_data.get("executive_summary", "")
             full_rep = report_data.get("full_report", "")
         except json.JSONDecodeError:
             # Fallback just in case the JSON breaks
             ex_summ = "Failed to parse JSON."
-            full_rep = response.choices[0].message.content
+            full_rep = raw_analyst_content
             
         file_list = ", ".join([os.path.basename(f) for f in filepaths])
         combined_text = f"--- EXECUTIVE SUMMARY ---\n{ex_summ}\n\n--- DETAILED REPORT ---\n{full_rep}"
@@ -1654,17 +1693,24 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
         filepath = os.path.join(STATE_DIR, filename)
         
         with open(filepath, "w", encoding="utf-8") as f:
+            if analyst_thinking:
+                f.write(f"<thinking>\n{analyst_thinking}\n</thinking>\n\n")
             f.write(combined_text)
             
         # --- 4. YOUR DYNAMIC ROUTING LOGIC ---
         if len(combined_text) > 20000:
             # Return ONLY the summary
-            return (f"--- ANALYST EXECUTIVE SUMMARY FOR [{file_list}] ---\n{ex_summ}\n\n"
+            result_msg = (f"--- ANALYST EXECUTIVE SUMMARY FOR [{file_list}] ---\n{ex_summ}\n\n"
                     f"... [SYSTEM ALERT: The detailed report was {len(combined_text)} chars long. To protect your context window, "
                     f"the full analysis was saved to '/app/workspace/state/{filename}'.]")
         else:
             # Return BOTH
-            return f"--- ANALYST REPORT FOR [{file_list}] ---\n{combined_text}\n\n[SYSTEM: A backup of this report was saved to '/app/workspace/state/{filename}']"
+            result_msg = f"--- ANALYST REPORT FOR [{file_list}] ---\n{combined_text}\n\n[SYSTEM: A backup of this report was saved to '/app/workspace/state/{filename}']"
+
+        if analyst_thinking:
+            result_msg += f"\n<___ANALYST_THOUGHTS___>\n{analyst_thinking}\n</___ANALYST_THOUGHTS___>"
+        result_msg += f"\n<___ANALYST_REPORT___>\n{combined_text}\n</___ANALYST_REPORT___>"
+        return result_msg
 
     except Exception as e:
         return f"Analyst failed to process files. Error: {str(e)}"
@@ -1718,14 +1764,16 @@ async def commission_architect(skill_name: str, objective: str, brain_notes: str
             messages=messages,
             **config.LLM_PROFILES[config.ACTIVE_ARCHITECT_PROFILE].get("api_params", {})
         )
+        architect_thinking, formatted_skill_md = extract_thinking_and_content(response.choices[0].message)
         
         # Log token usage
         tokens_in = response.usage.prompt_tokens if response.usage else 0
         tokens_out = response.usage.completion_tokens if response.usage else 0
         thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
+        if thinking_tokens == 0 and architect_thinking:
+            thinking_tokens = len(architect_thinking) // 4
         config.log_token_usage(STATE_DIR, "architect", tokens_in, tokens_out, thinking_tokens)
         
-        formatted_skill_md = response.choices[0].message.content.strip()
         if formatted_skill_md.startswith("```markdown"):
             formatted_skill_md = formatted_skill_md[11:]
         if formatted_skill_md.startswith("```"):
@@ -1741,7 +1789,11 @@ async def commission_architect(skill_name: str, objective: str, brain_notes: str
         with open(skill_path, "w", encoding="utf-8") as f:
             f.write(formatted_skill_md)
             
-        return f"[SUCCESS] The Architect has drafted and saved '{skill_name}' to {skill_path}. It will be injected into your menu on the next system boot."
+        result_msg = f"[SUCCESS] The Architect has drafted and saved '{skill_name}' to {skill_path}. It will be injected into your menu on the next system boot."
+        if architect_thinking:
+            result_msg += f"\n<___ARCHITECT_THOUGHTS___>\n{architect_thinking}\n</___ARCHITECT_THOUGHTS___>"
+        result_msg += f"\n<___ARCHITECT_SKILL___>\n{formatted_skill_md}\n</___ARCHITECT_SKILL___>"
+        return result_msg
     except Exception as e:
         return f"[ARCHITECT ERROR] Failed to generate skill: {str(e)}"
 
