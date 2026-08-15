@@ -331,10 +331,8 @@ async def consult_adviser(current_plan: str, encountered_problems: str, context_
         filename = f"{timestamp}_advice.md"
         filepath = os.path.join(STATE_DIR, filename)
         
-        # 6. Save the physical document to the state folder
+        # 6. Save the physical document to the state folder (pure report output)
         with open(filepath, "w", encoding="utf-8") as f:
-            if adviser_thinking:
-                f.write(f"<thinking>\n{adviser_thinking}\n</thinking>\n\n")
             f.write(advice_text)
             
         # 7. Return the full text back to the Brain's context window with hidden sentinel tags
@@ -1687,14 +1685,12 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
         file_list = ", ".join([os.path.basename(f) for f in filepaths])
         combined_text = f"--- EXECUTIVE SUMMARY ---\n{ex_summ}\n\n--- DETAILED REPORT ---\n{full_rep}"
         
-        # --- 3. AUTO-SAVE THE FULL COMBINED REPORT ---
+        # --- 3. AUTO-SAVE THE FULL COMBINED REPORT (pure report output) ---
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{timestamp}_analyst_report.md"
         filepath = os.path.join(STATE_DIR, filename)
         
         with open(filepath, "w", encoding="utf-8") as f:
-            if analyst_thinking:
-                f.write(f"<thinking>\n{analyst_thinking}\n</thinking>\n\n")
             f.write(combined_text)
             
         # --- 4. YOUR DYNAMIC ROUTING LOGIC ---
