@@ -160,28 +160,37 @@ The Overseer natively decouples **Format** (how it looks) from **Verbosity** (ho
 
 ## ⚡ Quick-Start: Automated WSL2 & Environment Setup (Recommended)
 
-To avoid manually running dozens of terminal commands and editing system files, use the included automated setup script [`setup_wsl2.sh`](file:///home/agent/ai_workspace/setup_wsl2.sh). It provisions a fresh WSL2 Ubuntu environment from start to finish in two automated phases:
+To avoid manually running dozens of terminal commands and editing system files, use the included automated setup script [`setup_wsl2.sh`](file:///home/agent/ai_workspace/setup_wsl2.sh). It provisions any Debian/Ubuntu-based WSL2 environment from start to finish:
 
-1. **System Provisioning (Phase 1 / Root):** Installs system dependencies (`podman`, `slirp4netns`, `uidmap`, `git`, `jq`, `build-essential`), probes for NVIDIA GPU and configures CDI device passthrough, creates the restricted non-sudo `agent` user, configures rootless `/etc/subuid` and `/etc/subgid`, and configures hardened `/etc/wsl.conf`.
-2. **User-Space Provisioning (Phase 2 / Agent):** Installs Pixi (`~/.pixi/bin`), installs workspace dependencies via `pixi install`, provisions the Zero-Trust LiteLLM proxy in `~/litellm_proxy` with starter configuration templates and `~/.bashrc` auto-start, builds the rootless `ai-forge` Podman container, and runs an automated sandbox verification self-test.
+1. **System Provisioning (Phase 1 / Root):** Installs system dependencies (`podman`, `slirp4netns`, `uidmap`, `git`, `jq`, `build-essential`), probes for NVIDIA GPU and configures CDI device passthrough, configures rootless `/etc/subuid` and `/etc/subgid` mappings, and configures user isolation.
+2. **User-Space Provisioning (Phase 2):** Installs Pixi (`~/.pixi/bin`), installs workspace dependencies via `pixi install`, provisions the Zero-Trust LiteLLM proxy in `~/litellm_proxy` with starter configuration templates and `~/.bashrc` auto-start, builds the rootless `ai-forge` Podman container, and runs an automated sandbox verification self-test.
+
+### Supported Setup Modes
+
+The installer automatically detects your environment and offers two installation paths:
+* **Option A: Dedicated Hardened Environment (Recommended):** Creates an isolated non-sudo `agent` user and hardens `/etc/wsl.conf` (disables Windows interop and automount) for maximum air-gapped sandboxing.
+* **Option B: Existing User Account (Daily Driver):** Installs for your current user account (`ubuntu`, your custom username, etc.), configuring rootless Podman for your account while **preserving your existing `/etc/wsl.conf`, user login, and Windows `/mnt/c/` drives intact**.
 
 ### Running the Automated Setup:
-Open your fresh WSL2 Ubuntu terminal and run:
+Open your WSL2 terminal and run:
 
 ```bash
 # Clone the repository and enter the directory
 git clone <repo-url> ai_workspace
 cd ai_workspace
 
-# Run the complete automated setup
+# Run the complete automated setup (prompts for setup mode)
 sudo ./setup_wsl2.sh
+
+# Or install explicitly for your existing user account without modifying wsl.conf:
+sudo ./setup_wsl2.sh --user $(whoami)
 ```
 
-### Script Commands & Options:
-* `./setup_wsl2.sh --check`: Non-destructive diagnostics health check (reports status of packages, GPU, subuids, Pixi, Podman image, and LiteLLM proxy port 4000).
-* `./setup_wsl2.sh --user-only`: Runs only user-space setup as `agent` (Pixi, LiteLLM, container build).
+### Script Commands & Diagnostics:
+* `./setup_wsl2.sh --check`: Non-destructive diagnostics health check (reports live status for OS, WSL version, GPU/CDI, subuids, Pixi, Podman image, and LiteLLM proxy port 4000).
+* `./setup_wsl2.sh --user-only`: Runs only user-space setup as current user (Pixi, dependencies, LiteLLM, container build).
 * `./setup_wsl2.sh --build-image`: Rebuilds the rootless Podman sandbox container (`ai-forge`).
-* `sudo ./setup_wsl2.sh -y`: Unattended installation accepting all defaults.
+* `sudo ./setup_wsl2.sh -y`: Unattended installation accepting default air-gapped settings.
 
 ---
 

@@ -33,9 +33,16 @@ log_err()   { echo -e "${RED}[ERROR]${RESET} $1" >&2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_USER="agent"
+CUSTOM_USER=""
 IMAGE_NAME="ai-forge"
-PROXY_DIR="/home/${TARGET_USER}/litellm_proxy"
 AUTO_CONFIRM=false
+
+# Detect calling user if run with sudo
+if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+    CALLING_USER="$SUDO_USER"
+else
+    CALLING_USER="$(whoami)"
+fi
 
 # --- Parse Arguments ---
 MODE="auto"
@@ -57,6 +64,10 @@ while [[ $# -gt 0 ]]; do
             MODE="build-image"
             shift
             ;;
+        --user)
+            CUSTOM_USER="$2"
+            shift 2
+            ;;
         -y|--yes)
             AUTO_CONFIRM=true
             shift
@@ -67,18 +78,20 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  (no args)           Auto-detect: runs system setup if root, user setup if agent"
+            echo "  (no args)           Auto-detect: runs system setup if root, user setup if normal user"
             echo "  --system-only       Run Phase 1 (system packages, agent user, subuids, wsl.conf)"
             echo "  --user-only         Run Phase 2 (Pixi, dependencies, LiteLLM proxy, Podman build)"
             echo "  --build-image       Rebuild the rootless Podman container image only"
             echo "  --check             Run non-destructive diagnostics and report status"
+            echo "  --user <username>   Set target non-root user (default: 'agent', or current user)"
             echo "  -y, --yes           Auto-confirm prompts with default answers"
             echo "  -h, --help          Show this help message"
             echo ""
             echo "Examples:"
-            echo "  sudo ./setup_wsl2.sh            # Run full provisioning from initial sudo user"
-            echo "  ./setup_wsl2.sh --user-only     # Run user-space setup as 'agent'"
-            echo "  ./setup_wsl2.sh --check         # Check if everything is configured correctly"
+            echo "  sudo ./setup_wsl2.sh                    # Full setup (offers isolated 'agent' user or current user)"
+            echo "  sudo ./setup_wsl2.sh --user ubuntu      # Install for existing 'ubuntu' account"
+            echo "  ./setup_wsl2.sh --user-only             # Run user-space setup as current user"
+            echo "  ./setup_wsl2.sh --check                 # Non-destructive environment health check"
             exit 0
             ;;
         *)
@@ -88,6 +101,21 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [ -n "$CUSTOM_USER" ]; then
+    TARGET_USER="$CUSTOM_USER"
+fi
+
+get_user_home() {
+    local u="$1"
+    if [ "$u" = "root" ]; then
+        echo "/root"
+    else
+        eval echo "~$u"
+    fi
+}
+
+PROXY_DIR="$(get_user_home "$TARGET_USER")/litellm_proxy"
 
 prompt_yn() {
     local prompt_msg="$1"
@@ -196,6 +224,42 @@ run_phase1_system() {
         exit 1
     fi
 
+    # Check package manager (Debian/Ubuntu)
+    if ! command -v apt-get &>/dev/null; then
+        log_err "Unsupported package manager. Automated installation currently targets Debian/Ubuntu-based WSL2 instances (apt-get)."
+        echo "For Fedora, Arch, or Alpine WSL2, please consult the manual installation guide in readme.md."
+        exit 1
+    fi
+
+    # Check for legacy WSL1
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+        if ! uname -r | grep -qi "WSL2" && [ ! -e /dev/dxg ]; then
+            log_err "Legacy WSL1 detected! Rootless Podman and GPU passthrough require WSL2."
+            echo "Please upgrade your WSL instance to version 2 from Windows PowerShell:"
+            echo "    wsl --set-version <distro-name> 2"
+            exit 1
+        fi
+    fi
+
+    # User isolation selection if not explicitly set via --user
+    if [ -z "$CUSTOM_USER" ] && [ -n "$CALLING_USER" ] && [ "$CALLING_USER" != "root" ] && [ "$CALLING_USER" != "agent" ]; then
+        echo ""
+        log_info "Detected calling user: '${CALLING_USER}'."
+        if [ "$AUTO_CONFIRM" != true ]; then
+            echo -e "You can choose your setup mode:"
+            echo -e "  [1] Create a dedicated restricted '${GREEN}agent${RESET}' user (Recommended for maximum sandbox security)"
+            echo -e "  [2] Install AI-Forge for your existing account ('${CYAN}${CALLING_USER}${RESET}')"
+            if prompt_yn "Create and use dedicated 'agent' user?" "Y"; then
+                TARGET_USER="agent"
+            else
+                TARGET_USER="$CALLING_USER"
+            fi
+        else
+            TARGET_USER="agent"
+        fi
+        PROXY_DIR="$(get_user_home "$TARGET_USER")/litellm_proxy"
+    fi
+
     # 1. Update and install core system utilities
     log_info "Updating apt package index..."
     apt-get update -y
@@ -287,19 +351,20 @@ run_phase1_system() {
 
     # 5. WSL2 Hardening (/etc/wsl.conf)
     if grep -qi microsoft /proc/version 2>/dev/null; then
-        log_step "WSL2 Configuration Hardening (/etc/wsl.conf)..."
-        local apply_wsl=true
-        if [ "$AUTO_CONFIRM" != true ]; then
-            if ! prompt_yn "Configure /etc/wsl.conf (default user: ${TARGET_USER}, disable automount/interop for security)?" "Y"; then
-                apply_wsl=false
+        if [ "$TARGET_USER" = "agent" ]; then
+            log_step "WSL2 Configuration Hardening (/etc/wsl.conf)..."
+            local apply_wsl=true
+            if [ "$AUTO_CONFIRM" != true ]; then
+                if ! prompt_yn "Configure /etc/wsl.conf (default user: ${TARGET_USER}, disable automount/interop for security)?" "Y"; then
+                    apply_wsl=false
+                fi
             fi
-        fi
 
-        if [ "$apply_wsl" = true ]; then
-            if [ -f /etc/wsl.conf ]; then
-                cp /etc/wsl.conf "/etc/wsl.conf.bak.$(date +%Y%m%d%H%M%S)"
-            fi
-            cat <<EOF > /etc/wsl.conf
+            if [ "$apply_wsl" = true ]; then
+                if [ -f /etc/wsl.conf ]; then
+                    cp /etc/wsl.conf "/etc/wsl.conf.bak.$(date +%Y%m%d%H%M%S)"
+                fi
+                cat <<EOF > /etc/wsl.conf
 [user]
 default=${TARGET_USER}
 
@@ -310,7 +375,10 @@ enabled = false
 enabled = false
 appendWindowsPath = false
 EOF
-            log_done "Wrote hardened /etc/wsl.conf (backup saved if previous file existed)."
+                log_done "Wrote hardened /etc/wsl.conf (backup saved if previous file existed)."
+            fi
+        else
+            log_info "Installing for standard account '${TARGET_USER}'. Skipping /etc/wsl.conf hardening to preserve your existing user login and Windows mounts."
         fi
     fi
 
@@ -527,7 +595,7 @@ case "$MODE" in
             run_phase1_system
             echo ""
             log_step "Handing off to user '${TARGET_USER}' for Phase 2..."
-            su - "${TARGET_USER}" -c "bash '$SCRIPT_DIR/setup_wsl2.sh' --user-only"
+            su - "${TARGET_USER}" -c "bash '$SCRIPT_DIR/setup_wsl2.sh' --user-only --user '${TARGET_USER}'"
         else
             log_info "Running as standard user ($(whoami)). Checking if system packages are installed..."
             if ! command -v podman &>/dev/null || ! command -v slirp4netns &>/dev/null; then
