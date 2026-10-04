@@ -133,7 +133,7 @@ else:
 timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
 
 if config.SESSION_ID:
-    active_session = f"Session_ID_{config.SESSION_ID}"
+    active_session = config.SESSION_ID if str(config.SESSION_ID).startswith("Session_ID_") else f"Session_ID_{config.SESSION_ID}"
 else:
     active_session = f"Session_ID_{timestamp}"
 

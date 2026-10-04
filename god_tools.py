@@ -477,10 +477,12 @@ async def execute_bash(command: str, timeout_seconds: int = 60) -> str:
     if re.search(r'\bgit\s+rm\s+--cached\b', command.lower()):
         pass  # Explicitly permit non-destructive git index untracking
     elif re.search(r'\brm\s+-[rRf]+\b', command.lower()) or re.search(r'\brm\s+', command.lower()):
+        logger.warning(f"[execute_bash] Security block: destructive rm command rejected: {command[:200]}")
         return "SYSTEM ERROR: Destructive commands (rm) are blocked. Use the archive folder instead."
 
     try:
         if not command.strip():
+            logger.warning("[execute_bash] Empty command payload rejected")
             return "SYSTEM ERROR: Empty command payload."
 
         current_env = os.environ.copy()
@@ -565,6 +567,7 @@ def write_file(filepath: str, content: str) -> str:
     # Enforces code containment by routing all source code modifications through the syntax checking pipeline
     forbidden_extensions = (".py", ".js", ".ts", ".rs", ".cpp", ".c", ".hpp", ".h", ".cc", ".cxx", ".mjs", ".cjs")
     if filepath.strip().lower().endswith(forbidden_extensions):
+        logger.warning(f"[write_file] Blocked direct write to forbidden source extension: '{filepath}'")
         return f"SYSTEM ERROR: You are strictly FORBIDDEN from using write_file to create source code scripts directly. You MUST use 'forge_and_register_plugin' with the appropriate 'language' parameter so the Coder agent can generate and validate it safely."
 
     # 1. Resolve the absolute path
@@ -580,6 +583,7 @@ def write_file(filepath: str, content: str) -> str:
     is_safe = any(os.path.commonpath([resolved_path, safe_dir]) == safe_dir for safe_dir in allowed_dirs)
     
     if not is_safe:
+        logger.warning(f"[write_file] Blocked path traversal attempt to '{filepath}' (resolved: '{resolved_path}')")
         return f"SYSTEM ERROR: Path Traversal Blocked. You are only allowed to write files to {allowed_dirs}."
 
     try:
@@ -1266,8 +1270,10 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
             s_block = edit_item.get("search_string", "")
             r_block = edit_item.get("replace_string", "")
             if not s_block:
+                logger.warning(f"[surgical_code_edit] Edit #{idx} in '{filepath}' provided empty search_string")
                 return f"SYSTEM ERROR: Edit #{idx} provided an empty search_string. Aborting modifications for safety."
             if s_block not in working_code:
+                logger.warning(f"[surgical_code_edit] Search string mismatch in '{filepath}' on edit #{idx}")
                 return f"SYSTEM ERROR: The Coder generated a 'search_string' in edit #{idx} that does not match the actual file lines exactly. Aborting all modifications for safety."
             working_code = working_code.replace(s_block, r_block, 1)
             applied_blocks.append(f"--- EDIT #{idx} ---\nSearch Block:\n{s_block}\n\nReplace Block:\n{r_block}")

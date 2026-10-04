@@ -123,7 +123,7 @@ Smaller or quantized models occasionally hallucinate malformed JSON when calling
 ### 12. On-Demand Observability & Container Logging
 Standard agents crash silently when background dependencies or subprocesses fail. This framework features unified, multi-layered observability:
 * **Host Interaction Logs:** Stored at `sessions/<Session_ID>/logs/chat_log_<timestamp>.txt`, capturing full conversation turns, streaming tokens, tool calls, execution latencies, and intercepted subagent thoughts.
-* **Structured Container Debug Log:** Handled by a dedicated `ForgeContainer` logger (`level=logging.INFO`) writing directly to `/app/workspace/logs/container_debug.log`. All tool executions, subprocess commands, compilation checks, syntax validation errors, and database transactions are structured and timestamped.
+* **Structured Container Debug Log:** Handled by a dedicated `ForgeContainer` logger (`level=logging.INFO`) writing directly to `/app/workspace/logs/container_debug.log`. All tool executions, subprocess commands, compilation checks, syntax validation errors, security enforcement events (destructive `rm` commands, path traversal, forbidden source file writes), search string mismatches, and database transactions are structured and timestamped.
 * **Synchronized Clock Across Boundaries:** The Podman container runs with `--tz=local`, locking container log timestamps to the host system time to the second, making cross-boundary debugging instant.
 * **Self-Debugging Pipeline:** If a tool fails unpredictably, the Brain delegates the log file to the Analyst sub-agent via `analyze_files(["/app/workspace/logs/container_debug.log"])`. The Analyst extracts the stack trace and pinpoint cause, enabling the Brain to patch the issue or install missing packages autonomously.
 
@@ -347,10 +347,10 @@ You can override configurations, pipe in files, and trigger headless background 
 * **Unix Pipeline (Pipe files directly into the AI):**
   `cat error_log.txt | pixi run python chat_overseer.py -f text -v minimal -x -p "Find the bug and write a python fix to outputs/fix.py"`
 
-### Session Management (Config Fallback)
+### Session Management (Config Fallback & Idempotent Resumption)
 If you don't use the `-s` flag, the framework falls back to your `config.py`. **Always use strings for Session IDs**.
-* `SESSION_ID = None` -> Starts a brand new, uniquely timestamped workspace.
-* `SESSION_ID = "20260429180500"` -> Restores that specific session, loading all plugins and state memory.
+* `SESSION_ID = None` -> Starts a brand new, uniquely timestamped workspace (`Session_ID_<timestamp>`).
+* `SESSION_ID = "my_project"` or `SESSION_ID = "Session_ID_my_project"` -> Idempotently loads or restores that specific session without duplicate prefixing, seamlessly recovering all plugins, plan checklists, and long-term state memory across separate process runs.
 
 ### Example Interaction Flow
 
