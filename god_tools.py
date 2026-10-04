@@ -107,6 +107,13 @@ if analyst_profile.get("base_url"):
     analyst_client = AsyncOpenAI(base_url=analyst_profile["base_url"], api_key=analyst_profile["api_key"], timeout=300.0)
 else:
     analyst_client = AsyncOpenAI(api_key=analyst_profile["api_key"], timeout=300.0)
+
+architect_profile = config.LLM_PROFILES[config.ACTIVE_ARCHITECT_PROFILE]
+
+if architect_profile.get("base_url"):
+    architect_client = AsyncOpenAI(base_url=architect_profile["base_url"], api_key=architect_profile["api_key"], timeout=180.0)
+else:
+    architect_client = AsyncOpenAI(api_key=architect_profile["api_key"], timeout=180.0)
     
 # --- Initialize Universal Client ---
 uni_config = config.UNIVERSAL_LLM_CONFIG
@@ -504,6 +511,7 @@ async def execute_bash(command: str, timeout_seconds: int = 60) -> str:
             # Generate a clean timestamped filename
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             temp_file_name = f"cmd_output_{timestamp}.txt"
+            os.makedirs(SANDBOX_DIR, exist_ok=True)
             temp_file_path = os.path.join(SANDBOX_DIR, temp_file_name)
             
             # Save the full massive output safely to the sandbox
@@ -533,7 +541,7 @@ def write_file(filepath: str, content: str) -> str:
     """
     
     # Enforces code containment by routing all source code modifications through the syntax checking pipeline
-    forbidden_extensions = (".py", ".js", ".ts", ".rs", ".cpp", ".c", ".hpp")
+    forbidden_extensions = (".py", ".js", ".ts", ".rs", ".cpp", ".c", ".hpp", ".h", ".cc", ".cxx", ".mjs", ".cjs")
     if filepath.strip().lower().endswith(forbidden_extensions):
         return f"SYSTEM ERROR: You are strictly FORBIDDEN from using write_file to create source code scripts directly. You MUST use 'forge_and_register_plugin' with the appropriate 'language' parameter so the Coder agent can generate and validate it safely."
 
@@ -553,12 +561,16 @@ def write_file(filepath: str, content: str) -> str:
         return f"SYSTEM ERROR: Path Traversal Blocked. You are only allowed to write files to {allowed_dirs}."
 
     try:
+        # Ensure parent directory exists for nested paths
+        os.makedirs(os.path.dirname(resolved_path), exist_ok=True)
+
         # Check if we are overwriting an existing file
         if os.path.exists(filepath):
             # Create a backup using your exact datetime idea!
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             filename = os.path.basename(filepath)
             backup_dir = "/app/workspace/archive"
+            os.makedirs(backup_dir, exist_ok=True)
             backup_path = os.path.join(backup_dir, f"{filename}.{timestamp}.bak")
             shutil.copy2(filepath, backup_path)
             backup_msg = f"(Old version backed up to archive/{os.path.basename(backup_path)})"
@@ -709,8 +721,6 @@ async def compress_and_store_context() -> str:
                 if thinking_tokens == 0 and chunk_thinking:
                     thinking_tokens = len(chunk_thinking) // 4
                 config.log_token_usage(STATE_DIR, "summarizer", tokens_in, tokens_out, thinking_tokens)
-                
-                dense_summary = chunk_resp.choices[0].message.content
                 
                 # Formatted clearly so the Brain can read it easily
                 summary_msg = {"role": "system", "content": f"[ARCHIVED HISTORY (Chronological Summary)]\n{dense_summary}"}
@@ -911,7 +921,7 @@ async def compress_and_store_context() -> str:
         
         # Overwrite the active working memory
         new_history = comp_data.get("compressed_history", [])
-        new_history.insert(0, {"role": "system", "content": config.PROMPTS["overseer_system"]})
+        new_history.insert(0, {"role": "system", "content": config.SYSTEM_PROMPTS["brain"]})
         save_json(CURRENT_HISTORY_FILE, new_history)
         _LOADED_SKILLS.clear()
         
@@ -1016,13 +1026,16 @@ async def forge_and_register_plugin(
             if target_lang == "python":
                 requires_match = re.search(r"# REQUIRES:\s*(.*)", code, re.IGNORECASE)
                 if requires_match:
-                    safe_deps_list = shlex.split(requires_match.group(1).replace("pip install", "").replace("pixi add", "").strip())
-                    proc_install = await asyncio.create_subprocess_exec(
-                        sys.executable, "-m", "pip", "install", "--target", "/app/workspace/custom_packages", *safe_deps_list,
-                        cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-                    )
-                    _, stderr_install = await proc_install.communicate()
-                    deps_report = f"\n[SYSTEM: Installed custom dependencies]" if proc_install.returncode == 0 else f"\n[SYSTEM WARNING: Dependency fault: {stderr_install.decode('utf-8', errors='replace')}]"
+                    raw_reqs = requires_match.group(1).replace("pip install", "").replace("pixi add", "").replace(",", " ").strip()
+                    safe_deps_list = shlex.split(raw_reqs)
+                    if safe_deps_list:
+                        os.makedirs("/app/workspace/custom_packages", exist_ok=True)
+                        proc_install = await asyncio.create_subprocess_exec(
+                            sys.executable, "-m", "pip", "install", "--target", "/app/workspace/custom_packages", *safe_deps_list,
+                            cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                        )
+                        _, stderr_install = await proc_install.communicate()
+                        deps_report = f"\n[SYSTEM: Installed custom dependencies]" if proc_install.returncode == 0 else f"\n[SYSTEM WARNING: Dependency fault: {stderr_install.decode('utf-8', errors='replace')}]"
 
             # Dynamic platform syntax compile evaluations across all supported execution architectures
             is_valid = True
@@ -1207,9 +1220,14 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
 
         # Dynamic Git Commit Tracking Checkpoint
         if os.path.exists("/app/workspace/.git"):
-            cmd = f"git add {shlex.quote(filepath)} && git commit -m 'feat(coder): surgical patch applied for {shlex.quote(edit_objective[:40])}'"
-            proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            await proc.communicate()
+            try:
+                proc_add = await asyncio.create_subprocess_exec("git", "add", filepath, cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                await proc_add.communicate()
+                clean_obj = re.sub(r'[\r\n\x00-\x1f]+', ' ', edit_objective).strip()[:40]
+                proc_commit = await asyncio.create_subprocess_exec("git", "commit", "-m", f"feat(coder): surgical patch applied for {clean_obj}", cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                await proc_commit.communicate()
+            except Exception:
+                pass
 
         registry = load_json(TOOL_REGISTRY_FILE)
         blueprint_hint = ""
@@ -1396,38 +1414,43 @@ async def batch_generate_embeddings(db_path: str, vec_table: str, source_query: 
         rows = cursor.fetchall()
         
         if not rows:
-            conn.close()
             return "SUCCESS: source_query returned 0 rows. Nothing to embed."
             
         rowids = []
         texts_to_embed = []
         for row in rows:
             if len(row) != 2:
-                conn.close()
                 return f"SYSTEM ERROR: source_query must return exactly 2 columns (id, text). Yours returned {len(row)}."
             rowids.append(row[0])
             texts_to_embed.append(str(row[1]))
             
-        # 2. Generate Embeddings via the API in one massive batch
-        response = await embedding_client.embeddings.create(
-            model=config.EMBEDDING_CONFIG["model"],
-            input=texts_to_embed
-        )
-        
-        # Log embedding token usage
-        tokens_in = response.usage.prompt_tokens if response.usage else 0
-        config.log_token_usage(STATE_DIR, "embedding", tokens_in, 0, 0)
-        
-        # 3. Insert the embeddings
+        # 2. Generate Embeddings via API in safe chunks of 128
+        BATCH_SIZE = 128
         inserted_count = 0
-        for i, rowid in enumerate(rowids):
-            embedding_vector = response.data[i].embedding
-            vector_blob = array.array('f', embedding_vector).tobytes()
-            cursor.execute(f"INSERT INTO {vec_table}(rowid, embedding) VALUES (?, ?)", (rowid, vector_blob))
-            inserted_count += 1
-            
+        total_tokens_in = 0
+
+        for chunk_start in range(0, len(texts_to_embed), BATCH_SIZE):
+            chunk_texts = texts_to_embed[chunk_start:chunk_start + BATCH_SIZE]
+            chunk_rowids = rowids[chunk_start:chunk_start + BATCH_SIZE]
+
+            response = await embedding_client.embeddings.create(
+                model=config.EMBEDDING_CONFIG["model"],
+                input=chunk_texts
+            )
+
+            if response.usage:
+                total_tokens_in += response.usage.prompt_tokens
+
+            # Insert batch into vec table
+            for i, rowid in enumerate(chunk_rowids):
+                embedding_vector = response.data[i].embedding
+                vector_blob = array.array('f', embedding_vector).tobytes()
+                cursor.execute(f"INSERT INTO {vec_table}(rowid, embedding) VALUES (?, ?)", (rowid, vector_blob))
+                inserted_count += 1
+
+        config.log_token_usage(STATE_DIR, "embedding", total_tokens_in, 0, 0)
         conn.commit()
-        return f"SUCCESS: Natively extracted {inserted_count} rows..."
+        return f"SUCCESS: Natively extracted and embedded {inserted_count} rows into '{vec_table}'."
         
     except Exception as e:
         return f"SYSTEM ERROR: Batch Embedding Failed. {str(e)}"
@@ -1493,10 +1516,23 @@ async def search_web(query: str, max_results: int = 5) -> str:
                 title = title_tag.text.strip()
                 snippet = snippet_tag.text.strip()
                 
-                # The visual URL text is usually cleaner than the href redirect link
-                actual_url = url_tag.text.strip()
-                if not actual_url.startswith("http"):
-                    actual_url = "https://" + actual_url
+                # Extract the real destination URL from the redirect link if available
+                actual_url = ""
+                raw_href = title_tag.get('href', '')
+                if "uddg=" in raw_href:
+                    try:
+                        qs = urllib.parse.parse_qs(urllib.parse.urlparse(raw_href).query)
+                        if "uddg" in qs and qs["uddg"]:
+                            actual_url = qs["uddg"][0]
+                    except Exception:
+                        pass
+                        
+                if not actual_url:
+                    actual_url = url_tag.text.strip()
+                    # Clean up breadcrumbs or extra spaces if present
+                    actual_url = actual_url.split()[0]
+                    if not actual_url.startswith("http"):
+                        actual_url = "https://" + actual_url
                     
                 formatted_results += f"{count+1}. {title}\nURL: {actual_url}\nSnippet: {snippet}\n\n"
                 count += 1
@@ -1605,6 +1641,7 @@ async def fetch_webpage(url: str) -> str:
                 safe_domain = re.sub(r'[^a-zA-Z0-9]', '_', parsed_url.hostname or "webpage")
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 temp_file_name = f"web_{safe_domain}_{timestamp}.txt"
+                os.makedirs(SANDBOX_DIR, exist_ok=True)
                 temp_file_path = os.path.join(SANDBOX_DIR, temp_file_name)
                 
                 # Save the full scraped text
@@ -1642,6 +1679,10 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
                 user_content.append({"type": "text", "text": f"\n[ERROR: File '{filepath}' does not exist.]"})
                 continue
 
+            if os.path.isdir(filepath):
+                user_content.append({"type": "text", "text": f"\n[ERROR: Path '{filepath}' is a directory, not a file. Use bash tools (ls, tree) to inspect directories.]"})
+                continue
+
             mime_type, _ = mimetypes.guess_type(filepath)
             is_image = mime_type and mime_type.startswith('image/')
             
@@ -1649,6 +1690,10 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
             
             if is_image:
                 # --- VISION PIPELINE ---
+                file_size = os.path.getsize(filepath)
+                if file_size > 10 * 1024 * 1024:
+                    user_content.append({"type": "text", "text": f"\n[ERROR: Image '{filename}' is too massive ({file_size / (1024*1024):.1f} MB) for the vision API. Max size is 10 MB.]"})
+                    continue
                 with open(filepath, "rb") as image_file:
                     base64_image = base64.b64encode(image_file.read()).decode('utf-8')
                 user_content.append({"type": "text", "text": f"\n--- IMAGE: {filename} ---"})
@@ -1771,17 +1816,25 @@ def load_skill(skill_name: str) -> str:
     """Loads the full instructional blueprint for a given skill.
     Use this immediately when your current task matches a skill in your system prompt."""
     global _LOADED_SKILLS
-    skill_path = f"/app/workspace/skills/{skill_name}/SKILL.md"
+    safe_name = os.path.basename(skill_name.strip())
+    skills_root = os.path.realpath("/app/workspace/skills")
+    skill_path = os.path.realpath(os.path.join(skills_root, safe_name, "SKILL.md"))
+    try:
+        if not os.path.commonpath([skill_path, skills_root]) == skills_root:
+            return f"[SYSTEM ERROR: Invalid skill name '{skill_name}'.]"
+    except Exception:
+        return f"[SYSTEM ERROR: Invalid skill name '{skill_name}'.]"
+
     if not os.path.exists(skill_path):
-        return f"[SYSTEM ERROR: Skill '{skill_name}' not found at {skill_path}.]"
+        return f"[SYSTEM ERROR: Skill '{safe_name}' not found at {skill_path}.]"
         
     with open(skill_path, "r", encoding="utf-8") as f:
         content = f.read()
         
-    is_reload = skill_name in _LOADED_SKILLS
-    _LOADED_SKILLS.add(skill_name)
+    is_reload = safe_name in _LOADED_SKILLS
+    _LOADED_SKILLS.add(safe_name)
     status_label = "RE-ACTIVATED" if is_reload else "ACTIVATED"
-    return f"--- SKILL {status_label}: {skill_name} ---\n{content}\n\n[SYSTEM: You must now strictly follow these instructions.]"
+    return f"--- SKILL {status_label}: {safe_name} ---\n{content}\n\n[SYSTEM: You must now strictly follow these instructions.]"
 
 
 @mcp.tool()
@@ -1790,14 +1843,14 @@ async def commission_architect(skill_name: str, objective: str, brain_notes: str
     Passes raw notes to the Architect agent, who formats and saves it as a new Skill.
     'context_filepaths' can take target code implementations or terminal output histories to extract instructions from.
     """
+    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', os.path.basename(skill_name.strip()))
+    if not safe_name:
+        return "[ARCHITECT ERROR] Invalid skill name provided."
+
     # ◄--- Gather background reference metrics ---
     file_environmental_context = gather_agent_context(context_filepaths)
 
-    architect_user = f"{file_environmental_context}Skill Name: {skill_name}\nObjective: {objective}\nBrain's Notes:\n{brain_notes}"
-    client = AsyncOpenAI(
-        base_url=config.LLM_PROFILES[config.ACTIVE_ARCHITECT_PROFILE]["base_url"],
-        api_key=config.LLM_PROFILES[config.ACTIVE_ARCHITECT_PROFILE]["api_key"]
-    )
+    architect_user = f"{file_environmental_context}Skill Name: {safe_name}\nObjective: {objective}\nBrain's Notes:\n{brain_notes}"
     
     try:
         messages = [
@@ -1809,11 +1862,11 @@ async def commission_architect(skill_name: str, objective: str, brain_notes: str
             payload_tokens = get_payload_tokens(messages)
             sys.stderr.write(f"\n\033[93m[System: Architect payload is ~{payload_tokens} estimated tokens]\033[0m\n")
 
-        response = await client.chat.completions.create(
-            model=config.LLM_PROFILES[config.ACTIVE_ARCHITECT_PROFILE]["model"],
-            messages=messages,
-            **config.LLM_PROFILES[config.ACTIVE_ARCHITECT_PROFILE].get("api_params", {})
-        )
+        api_args = architect_profile.get("api_params", {}).copy()
+        api_args["model"] = architect_profile["model"]
+        api_args["messages"] = messages
+
+        response = await architect_client.chat.completions.create(**api_args)
         architect_thinking, formatted_skill_md = extract_thinking_and_content(response.choices[0].message)
         
         # Log token usage
@@ -1824,25 +1877,26 @@ async def commission_architect(skill_name: str, objective: str, brain_notes: str
             thinking_tokens = len(architect_thinking) // 4
         config.log_token_usage(STATE_DIR, "architect", tokens_in, tokens_out, thinking_tokens)
         
-        if formatted_skill_md.startswith("```markdown"):
-            formatted_skill_md = formatted_skill_md[11:]
-        if formatted_skill_md.startswith("```"):
-            formatted_skill_md = formatted_skill_md[3:]
-        if formatted_skill_md.endswith("```"):
-            formatted_skill_md = formatted_skill_md[:-3]
-        formatted_skill_md = formatted_skill_md.strip()
+        clean_skill_md = formatted_skill_md.strip()
+        if "```" in clean_skill_md:
+            match = re.search(r"```(?:markdown)?\s*\n(.*?)\n```", clean_skill_md, re.DOTALL)
+            if match:
+                clean_skill_md = match.group(1).strip()
+            else:
+                clean_skill_md = re.sub(r"^```(?:markdown)?\s*\n?", "", clean_skill_md)
+                clean_skill_md = re.sub(r"\n?```\s*$", "", clean_skill_md).strip()
 
-        skill_dir = f"/app/workspace/skills/{skill_name}"
+        skill_dir = f"/app/workspace/skills/{safe_name}"
         os.makedirs(skill_dir, exist_ok=True)
         
         skill_path = os.path.join(skill_dir, "SKILL.md")
         with open(skill_path, "w", encoding="utf-8") as f:
-            f.write(formatted_skill_md)
+            f.write(clean_skill_md)
             
-        result_msg = f"[SUCCESS] The Architect has drafted and saved '{skill_name}' to {skill_path}. It will be injected into your menu on the next system boot."
+        result_msg = f"[SUCCESS] The Architect has drafted and saved '{safe_name}' to {skill_path}. It will be injected into your menu on the next system boot."
         if architect_thinking:
             result_msg += f"\n<___ARCHITECT_THOUGHTS___>\n{architect_thinking}\n</___ARCHITECT_THOUGHTS___>"
-        result_msg += f"\n<___ARCHITECT_SKILL___>\n{formatted_skill_md}\n</___ARCHITECT_SKILL___>"
+        result_msg += f"\n<___ARCHITECT_SKILL___>\n{clean_skill_md}\n</___ARCHITECT_SKILL___>"
         return result_msg
     except Exception as e:
         return f"[ARCHITECT ERROR] Failed to generate skill: {str(e)}"

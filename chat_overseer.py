@@ -595,10 +595,10 @@ async def run_chat():
                                 current_token_estimate = payload_tokens + tool_schemas_overhead + (len(messages) * 4)
                                 pct = current_token_estimate / config.MAX_CONTEXT_TOKENS
                                 
+                                # Prevent appending multiple warnings in a row or leaving stale warnings
+                                messages = [msg for msg in messages if not (msg.get("role") == "user" and "[SYSTEM WARNING: Your context window is at" in str(msg.get("content")))]
+
                                 if pct >= 0.85:
-                                    # Prevent appending multiple warnings in a row if the AI ignores it for a few turns
-                                    messages = [msg for msg in messages if not (msg.get("role") == "user" and "[SYSTEM WARNING: Your context window is at" in str(msg.get("content")))]
-                                    
                                     warn_msg = f"[SYSTEM WARNING: Your context window is at ~{pct*100:.0f}%. "
                                     if pct >= 0.95: warn_msg += "CRITICAL LIMIT REACHED. You MUST use the compress_and_store_context tool immediately.]"
                                     else: warn_msg += "Consider finishing your current task and using the compress_and_store_context tool soon.]"
@@ -635,6 +635,8 @@ async def run_chat():
                                 tool_calls_dict = {}
                                 final_usage = None
                                 loop_interrupted = False  # Track if a loop circuit breaker trips
+                                last_loop_check_think = 0
+                                last_loop_check_content = 0
                                 
                                 # --- MULTI-MODE CONTEXT ROUTING ---
                                 if config.FORMAT_MODE == "markdown" and config.VERBOSITY_MODE != "silent":
@@ -659,9 +661,9 @@ async def run_chat():
                                             
                                             if chunk_thinking: 
                                                 full_thinking += chunk_thinking
-                                                # Only check if we have enough content to warrant a loop check
-                                                if len(full_thinking) > 500:
-                                                    # Feed ONLY the last 10000 characters into the detector.
+                                                # Throttle loop check: only run every 100 characters to prevent event loop stutter
+                                                if len(full_thinking) > 500 and (len(full_thinking) - last_loop_check_think >= 100):
+                                                    last_loop_check_think = len(full_thinking)
                                                     tail_buffer = full_thinking[-10000:]
                                                     is_loop, loop_size = detect_text_loop(tail_buffer, required_repeats=3)
 
@@ -673,9 +675,9 @@ async def run_chat():
 
                                             if delta.content: 
                                                 full_content += delta.content
-                                                # Only check if we have enough content to warrant a loop check
-                                                if len(full_content) > 500:
-                                                    # Feed ONLY the last 10000 characters into the detector.
+                                                # Throttle loop check: only run every 100 characters to prevent event loop stutter
+                                                if len(full_content) > 500 and (len(full_content) - last_loop_check_content >= 100):
+                                                    last_loop_check_content = len(full_content)
                                                     tail_buffer = full_content[-10000:]
                                                     is_loop, loop_size = detect_text_loop(tail_buffer, required_repeats=3)
 
@@ -691,11 +693,16 @@ async def run_chat():
                                                 for tc in delta.tool_calls:
                                                     if tc.index not in tool_calls_dict:
                                                         tool_calls_dict[tc.index] = {
-                                                            "id": tc.id, 
+                                                            "id": tc.id or "", 
                                                             "type": "function", 
-                                                            "function": {"name": tc.function.name, "arguments": ""}
+                                                            "function": {"name": (tc.function.name if (tc.function and tc.function.name) else "") or "", "arguments": ""}
                                                         }
-                                                    if tc.function.arguments:
+                                                    else:
+                                                        if tc.id and not tool_calls_dict[tc.index]["id"]:
+                                                            tool_calls_dict[tc.index]["id"] = tc.id
+                                                        if tc.function and getattr(tc.function, "name", None):
+                                                            tool_calls_dict[tc.index]["function"]["name"] += tc.function.name
+                                                    if tc.function and getattr(tc.function, "arguments", None):
                                                         tool_calls_dict[tc.index]["function"]["arguments"] += tc.function.arguments
 
                                             # --- CONSOLE MODE DISPATCHER ---
@@ -804,9 +811,6 @@ async def run_chat():
                                 if not tool_calls_dict:
                                     break
 
-                                # --- Initialize the RAM cache for parallel tool outputs ---
-                                executed_tool_outputs = {}
-
                                 for tc_data in assistant_message["tool_calls"]:
                                     name = tc_data["function"]["name"]
                                     args_str = tc_data["function"]["arguments"]
@@ -820,9 +824,6 @@ async def run_chat():
                                         print(f"{COLOR_RED}Error decoding JSON. Intercepting and asking Brain to retry...{COLOR_RESET}")
                                         log_event("TOOL CALL", f"Requesting: {name}\nArgs: [MALFORMED JSON]\n{args_str}")
                                         log_event("TOOL RESULT (0.00s)", error_msg, text_color=COLOR_RED)
-                                        
-                                        # Cache the error so it survives compression!
-                                        executed_tool_outputs[tc_id] = error_msg 
                                         
                                         messages = load_history()
                                         messages.append({
@@ -861,7 +862,12 @@ async def run_chat():
                                     totals_before = config.get_token_totals(state_dir)
                                     
                                     result = await session.call_tool(name, args)
-                                    output = result.content[0].text
+                                    if result.content and len(result.content) > 0 and hasattr(result.content[0], "text"):
+                                        output = result.content[0].text
+                                    elif result.content and len(result.content) > 0:
+                                        output = str(result.content[0])
+                                    else:
+                                        output = "SUCCESS: Tool executed with no output."
                                     
                                     totals_after = config.get_token_totals(state_dir)
                                     token_diff = config.get_totals_diff(totals_before, totals_after)
@@ -874,9 +880,6 @@ async def run_chat():
                                             part += ")"
                                             diff_parts.append(part)
                                         print(f"{COLOR_YELLOW}[Tokens used: {', '.join(diff_parts)}]{COLOR_RESET}")
-                                    
-                                    # --- NEW: Save the real output to our RAM dictionary immediately ---
-                                    executed_tool_outputs[tc_id] = output
 
                                     # --- FAILURE STREAK TRACKER ---
                                     # Determine if the output looks like an error
