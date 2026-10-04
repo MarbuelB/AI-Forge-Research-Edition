@@ -464,9 +464,9 @@ async def query_universal_llm(
         return "Error: Invalid action. Must be 'list_models' or 'chat'."
 
 @mcp.tool()
-async def execute_bash(command: str, timeout_seconds: int = 60) -> str:
+async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
     """Executes a bash command STRICTLY inside the sandbox directory. 
-    'timeout_seconds' defaults to 60. Increase it up to 600 if you expect a long-running process like a massive download.
+    'timeout_seconds' defaults to 180. Increase it up to 600 if you expect a long-running process like a massive download or large database search.
     Do NOT use destructive commands! Move files to the archive folder instead."""
     
     # 1. Catch empty inputs or incorrect types immediately
@@ -1120,6 +1120,35 @@ edition = "2021"
                 check = await asyncio.to_thread(subprocess.run, ["g++", "-fsyntax-only", "-std=c++17", filename], cwd=PLUGINS_DIR, capture_output=True, text=True)
                 if check.returncode != 0: is_valid = False; err_msg = check.stderr
 
+            # --- Behavioral Pre-Registration Smoke Test ---
+            if is_valid and target_lang in ["python", "javascript", "typescript"]:
+                smoke_env = os.environ.copy()
+                smoke_env["PYTHONPATH"] = f"/app/workspace/custom_packages:{PLUGINS_DIR}:{smoke_env.get('PYTHONPATH', '')}"
+                smoke_cmd = None
+                if target_lang == "python":
+                    smoke_cmd = [sys.executable, filename, "--help"]
+                elif target_lang == "javascript":
+                    smoke_cmd = ["node", filename, "--help"]
+                elif target_lang == "typescript":
+                    smoke_cmd = ["tsx", filename, "--help"]
+
+                if smoke_cmd:
+                    try:
+                        smoke_res = await asyncio.to_thread(
+                            subprocess.run, smoke_cmd, cwd=PLUGINS_DIR, env=smoke_env,
+                            capture_output=True, text=True, timeout=4
+                        )
+                        # Check if running generated an unhandled traceback or runtime crash
+                        combined_err = (smoke_res.stderr + smoke_res.stdout).lower()
+                        if smoke_res.returncode != 0 and ("traceback (most recent call last)" in combined_err or "referenceerror:" in combined_err or "typeerror:" in combined_err or "syntaxerror:" in combined_err):
+                            is_valid = False
+                            err_msg = f"Behavioral smoke test crashed during startup:\n{smoke_res.stderr or smoke_res.stdout}"
+                            logger.warning(f"[forge_and_register_plugin] Smoke test failed for '{plugin_name}': {err_msg[:200]}")
+                    except subprocess.TimeoutExpired:
+                        pass
+                    except Exception:
+                        pass
+
             if is_valid:
                 registry = load_json(TOOL_REGISTRY_FILE)
                 if category not in registry: registry[category] = {"category_description": category_description, "tools": {}}
@@ -1274,7 +1303,25 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                 return f"SYSTEM ERROR: Edit #{idx} provided an empty search_string. Aborting modifications for safety."
             if s_block not in working_code:
                 logger.warning(f"[surgical_code_edit] Search string mismatch in '{filepath}' on edit #{idx}")
-                return f"SYSTEM ERROR: The Coder generated a 'search_string' in edit #{idx} that does not match the actual file lines exactly. Aborting all modifications for safety."
+                # Provide diagnostic near-match context so the Coder can self-correct indentation/spacing immediately
+                file_lines = working_code.splitlines()
+                search_lines = s_block.splitlines()
+                first_search_line = search_lines[0].strip() if search_lines else ""
+                near_lines = []
+                for l_idx, line in enumerate(file_lines):
+                    if first_search_line and first_search_line in line:
+                        start_ctx = max(0, l_idx - 1)
+                        end_ctx = min(len(file_lines), l_idx + len(search_lines) + 2)
+                        near_lines = file_lines[start_ctx:end_ctx]
+                        break
+                diff_hint = ""
+                if near_lines:
+                    diff_hint = f"\nClosest matching lines in file:\n```\n" + "\n".join(near_lines) + "\n```\n"
+                return (
+                    f"SYSTEM ERROR: The Coder generated a 'search_string' in edit #{idx} that does not match the actual file lines exactly. "
+                    f"Aborting all modifications for safety.{diff_hint}"
+                    f"Ensure exact match of leading whitespace, indentation, and newlines."
+                )
             working_code = working_code.replace(s_block, r_block, 1)
             applied_blocks.append(f"--- EDIT #{idx} ---\nSearch Block:\n{s_block}\n\nReplace Block:\n{r_block}")
 
@@ -1286,8 +1333,9 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
             try:
                 compile(updated_code, filepath, 'exec')
             except SyntaxError as e:
-                logger.error(f"[surgical_code_edit] Python syntax error in '{filepath}' on line {e.lineno}: {e.msg}")
-                return f"SYSTEM ERROR: Surgical edit aborted because it introduces a Python syntax error on line {e.lineno}: {e.msg}. File on disk was NOT modified."
+                bad_line = f" ({e.text.strip()})" if e.text else ""
+                logger.error(f"[surgical_code_edit] Python syntax error in '{filepath}' on line {e.lineno}: {e.msg}{bad_line}")
+                return f"SYSTEM ERROR: Surgical edit aborted because it introduces a Python syntax error on line {e.lineno}{bad_line}: {e.msg}. File on disk was NOT modified."
 
         # Archive backup snapshot
         filename = os.path.basename(filepath)

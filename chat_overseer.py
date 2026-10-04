@@ -16,6 +16,13 @@ import tiktoken
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+# Ensure stdout uses line-buffering so redirected logs remain sequentially ordered
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
 # --- MONKEY-PATCH MCP TO PREVENT CRASHES ON STDOUT POLLUTION ---
 from mcp.types import JSONRPCMessage
 
@@ -235,6 +242,39 @@ def save_history(messages):
         
     # 2. Atomically swap it
     os.replace(temp_path, CURRENT_HISTORY_FILE)
+
+def compact_historical_tool_outputs(messages, protect_recent: int = 20, max_head: int = 400, max_tail: int = 400):
+    """Ages older tool outputs in history (> protect_recent messages ago) to prevent quadratic context blowup.
+    Preserves recent active turns at 100% full fidelity.
+    Retains the head and tail of older outputs so command context and exit status remain legible."""
+    if len(messages) <= protect_recent:
+        return messages
+    
+    threshold_idx = len(messages) - protect_recent
+    modified = False
+    new_messages = []
+    
+    for idx, msg in enumerate(messages):
+        if idx < threshold_idx and msg.get("role") == "tool":
+            content = str(msg.get("content", ""))
+            min_compress_len = max_head + max_tail + 200
+            if len(content) > min_compress_len:
+                head = content[:max_head]
+                tail = content[-max_tail:]
+                compacted_body = (
+                    f"{head}\n\n"
+                    f"[... {len(content) - max_head - max_tail:,} characters of historical tool output compacted for context efficiency. "
+                    f"Full log preserved on disk ...]\n\n"
+                    f"{tail}"
+                )
+                msg_copy = copy.copy(msg)
+                msg_copy["content"] = compacted_body
+                new_messages.append(msg_copy)
+                modified = True
+                continue
+        new_messages.append(msg)
+        
+    return new_messages
     
 def estimate_tokens(messages):
     """Uses tiktoken for highly accurate estimation when the API receipt is voided."""
@@ -362,6 +402,10 @@ async def run_chat():
     prompt_session = None
     quit_app = False
     last_known_tokens = 0 # State tracker for accurate token checking
+    last_actual_prompt_tokens = 0
+    last_estimated_payload_tokens = 0
+    token_calibration_ratio = 1.0 # Calibrated ratio: serving model tokenizer vs cl100k_base
+    last_history_len = 0
     tool_schemas_overhead = 0 # Estimate of token cost for registered tool schemas
     
     help_text = "Commands: '/exit' or '/quit' to quit | UI: '/text', '/markdown' | Verbosity: '/silent', '/minimal', '/standard', '/detailed'"
@@ -510,6 +554,7 @@ async def run_chat():
                     # Initialize tracker outside the loop
                     cli_prompt_consumed = False
                     tool_failure_streaks = {}
+                    tool_last_failed_args = {}
                     
                     while True:
                         try:
@@ -592,25 +637,33 @@ async def run_chat():
                                     "content": f"[SYSTEM CLOCK: It is currently {live_time}]"
                                 })
 
-                                # --- 2. TOKEN WARNING INJECTION ---
+                                # --- 2. HISTORICAL TOOL OUTPUT AGING (H3) ---
+                                messages = compact_historical_tool_outputs(messages, protect_recent=20)
+
+                                # --- 3. TOKEN WARNING INJECTION (H1 Calibrated) ---
                                 payload_tokens = estimate_tokens(messages)
-                                # Estimate total official context window (messages payload + tool schemas + formatting overhead (4 tokens per message))
-                                current_token_estimate = payload_tokens + tool_schemas_overhead + (len(messages) * 4)
+                                last_estimated_payload_tokens = payload_tokens
+                                # Calibrated estimate accounts for real serving tokenizer overhead
+                                calibrated_payload = int(payload_tokens * token_calibration_ratio)
+                                current_token_estimate = calibrated_payload + tool_schemas_overhead + (len(messages) * 4)
+                                if last_actual_prompt_tokens > 0 and len(messages) >= last_history_len:
+                                    current_token_estimate = max(current_token_estimate, last_actual_prompt_tokens)
+                                last_history_len = len(messages)
                                 pct = current_token_estimate / config.MAX_CONTEXT_TOKENS
                                 
                                 # Prevent appending multiple warnings in a row or leaving stale warnings
                                 messages = [msg for msg in messages if not (msg.get("role") == "user" and "[SYSTEM WARNING: Your context window is at" in str(msg.get("content")))]
 
-                                if pct >= 0.85:
+                                if pct >= 0.80:
                                     warn_msg = f"[SYSTEM WARNING: Your context window is at ~{pct*100:.0f}%. "
-                                    if pct >= 0.95: warn_msg += "CRITICAL LIMIT REACHED. You MUST use the compress_and_store_context tool immediately.]"
+                                    if pct >= 0.90: warn_msg += "CRITICAL LIMIT REACHED. You MUST use the compress_and_store_context tool immediately.]"
                                     else: warn_msg += "Consider finishing your current task and using the compress_and_store_context tool soon.]"
                                     
                                     messages.append({"role": "user", "content": warn_msg})
-                                    print(f"\n{COLOR_YELLOW}{warn_msg}{COLOR_RESET}")
+                                    print(f"\n{COLOR_YELLOW}{warn_msg}{COLOR_RESET}", flush=True)
                                     log_event("SYSTEM", warn_msg)
 
-                                # --- 3. SAVE THE PURIST HISTORY BEFORE API CALL ---
+                                # --- 4. SAVE THE PURIST HISTORY BEFORE API CALL ---
                                 save_history(messages)
 
                                 # Setup API args using the true, saved messages
@@ -625,7 +678,8 @@ async def run_chat():
                                     api_args["seed"] = api_args.get("seed") or 42
 
                                 if config.VERBOSITY_MODE != "silent":
-                                    sys.stderr.write(f"\n{COLOR_YELLOW}[System: Brain payload is ~{payload_tokens} estimated tokens (Estimated total context window: ~{current_token_estimate})]{COLOR_RESET}\n")
+                                    calib_note = f" (calibrated x{token_calibration_ratio:.2f})" if abs(token_calibration_ratio - 1.0) > 0.04 else ""
+                                    print(f"\n{COLOR_YELLOW}[System: Brain payload is ~{payload_tokens} estimated tokens{calib_note} (Estimated total context window: ~{current_token_estimate})]{COLOR_RESET}", flush=True)
 
                                 response_stream = await brain_client.chat.completions.create(**api_args)
                                 
@@ -787,9 +841,15 @@ async def run_chat():
                                     save_history(messages)
                                     log_event("BRAIN", full_content, final_usage, full_thinking)
 
-                                # Update exact token count state for the next loop!
+                                # Update exact token count state and calibrate tokenizer for the next loop!
                                 if final_usage:
                                     last_known_tokens = final_usage.prompt_tokens + final_usage.completion_tokens
+                                    if final_usage.prompt_tokens and last_estimated_payload_tokens > 0:
+                                        # Calibrate ratio between serving model's tokenizer and local cl100k estimate
+                                        observed_ratio = final_usage.prompt_tokens / last_estimated_payload_tokens
+                                        if 0.5 <= observed_ratio <= 3.0:
+                                            token_calibration_ratio = (0.7 * token_calibration_ratio) + (0.3 * observed_ratio)
+                                    last_actual_prompt_tokens = final_usage.prompt_tokens
                                     reasoning_tokens = 0
                                     if hasattr(final_usage, 'completion_tokens_details') and final_usage.completion_tokens_details:
                                         reasoning_tokens = getattr(final_usage.completion_tokens_details, 'reasoning_tokens', 0)
@@ -884,20 +944,34 @@ async def run_chat():
                                             diff_parts.append(part)
                                         print(f"{COLOR_YELLOW}[Tokens used: {', '.join(diff_parts)}]{COLOR_RESET}")
 
-                                    # --- FAILURE STREAK TRACKER ---
-                                    # Determine if the output looks like an error
+                                    # --- FAILURE STREAK TRACKER (REFINED) ---
+                                    # Determine if the output looks like a true execution failure
                                     is_error = False
                                     output_lower = output.lower()
                                     if "system error:" in output_lower or "traceback (most recent" in output_lower or "error executing" in output_lower:
                                         is_error = True
                                     elif "exit code:" in output_lower and "exit code: 0" not in output_lower:
-                                        is_error = True
+                                        # Distinguish benign inspection status codes from true execution errors
+                                        cmd_str = str(args.get("command", "")).strip() if isinstance(args, dict) else ""
+                                        first_word = cmd_str.split()[0] if cmd_str.split() else ""
+                                        # grep, diff, test return 1 for negative match or difference, not execution failure
+                                        if first_word in ["grep", "egrep", "fgrep", "rg", "diff", "cmp", "test", "[", "pgrep"] and "exit code: 1" in output_lower:
+                                            is_error = False
+                                        else:
+                                            is_error = True
 
-                                    # Update the streak
+                                    # Update the streak, tracking command variance so pivoting does not trigger false loops
+                                    cmd_fingerprint = str(args) if isinstance(args, dict) else ""
                                     if is_error:
-                                        tool_failure_streaks[name] = tool_failure_streaks.get(name, 0) + 1
+                                        prev_cmd = tool_last_failed_args.get(name, "")
+                                        if prev_cmd and prev_cmd == cmd_fingerprint:
+                                            tool_failure_streaks[name] = tool_failure_streaks.get(name, 0) + 1
+                                        else:
+                                            tool_failure_streaks[name] = 1
+                                            tool_last_failed_args[name] = cmd_fingerprint
                                     else:
                                         tool_failure_streaks[name] = 0 # Reset on success!
+                                        tool_last_failed_args[name] = ""
 
                                     # Trigger the intervention if stuck
                                     if tool_failure_streaks.get(name, 0) >= 5:
@@ -1005,21 +1079,22 @@ async def run_chat():
                                     # Hard Stop: Protect the API limits
                                     halt_msg = f"[SYSTEM METRIC: You have executed {consecutive_tool_chains} consecutive tool chains. For safety and observability, you MUST STOP using tools now. Summarize your progress and ask the user for permission to continue.]"
                                     messages = load_history()
+                                    messages = [msg for msg in messages if not (msg.get("role") == "user" and "[SYSTEM METRIC: You have executed" in str(msg.get("content")))]
                                     messages.append({"role": "user", "content": halt_msg})
                                     save_history(messages)
-                                    print(f"\n{COLOR_YELLOW}[SYSTEM: Hard pause triggered ({consecutive_tool_chains} chains). Forcing Brain to wait for user.]{COLOR_RESET}")
+                                    print(f"\n{COLOR_YELLOW}[SYSTEM: Hard pause triggered ({consecutive_tool_chains} chains). Forcing Brain to wait for user.]{COLOR_RESET}", flush=True)
                                     log_event("SYSTEM", halt_msg)
                                     consecutive_tool_chains = 0
                                 
                                 elif consecutive_tool_chains > 0 and consecutive_tool_chains % 300 == 0:
-                                    # Sweep old soft-pauses
+                                    messages = load_history()
+                                    # Sweep old soft-pauses before saving so they never accumulate
                                     messages = [msg for msg in messages if not (msg.get("role") == "user" and "[SYSTEM METRIC: You have executed" in str(msg.get("content")))]
                                     # Soft Reflection: Ask the AI to evaluate itself
                                     eval_msg = f"[SYSTEM METRIC: You have executed {consecutive_tool_chains} consecutive tool chains. Please review your recent actions. Are you making steady progress, or are you stuck in an error loop? If you are stuck or repeatedly failing, STOP using tools and ask the user for input. If you are making legitimate progress, continue.]"
-                                    messages = load_history()
                                     messages.append({"role": "user", "content": eval_msg})
                                     save_history(messages)
-                                    print(f"\n{COLOR_YELLOW}[SYSTEM: Soft pause triggered ({consecutive_tool_chains} chains). Prompting Brain to self-evaluate.]{COLOR_RESET}")
+                                    print(f"\n{COLOR_YELLOW}[SYSTEM: Soft pause triggered ({consecutive_tool_chains} chains). Prompting Brain to self-evaluate.]{COLOR_RESET}", flush=True)
                                     log_event("SYSTEM", eval_msg)
                               
                                     
