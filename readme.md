@@ -158,9 +158,36 @@ The Overseer natively decouples **Format** (how it looks) from **Verbosity** (ho
 
 ---
 
-## ⚙️ Prerequisites & Setup
+## ⚡ Quick-Start: Automated WSL2 & Environment Setup (Recommended)
 
-This project uses `pixi` for environment management and `podman` for containerized execution.
+To avoid manually running dozens of terminal commands and editing system files, use the included automated setup script [`setup_wsl2.sh`](file:///home/agent/ai_workspace/setup_wsl2.sh). It provisions a fresh WSL2 Ubuntu environment from start to finish in two automated phases:
+
+1. **System Provisioning (Phase 1 / Root):** Installs system dependencies (`podman`, `slirp4netns`, `uidmap`, `git`, `jq`, `build-essential`), probes for NVIDIA GPU and configures CDI device passthrough, creates the restricted non-sudo `agent` user, configures rootless `/etc/subuid` and `/etc/subgid`, and configures hardened `/etc/wsl.conf`.
+2. **User-Space Provisioning (Phase 2 / Agent):** Installs Pixi (`~/.pixi/bin`), installs workspace dependencies via `pixi install`, provisions the Zero-Trust LiteLLM proxy in `~/litellm_proxy` with starter configuration templates and `~/.bashrc` auto-start, builds the rootless `ai-forge` Podman container, and runs an automated sandbox verification self-test.
+
+### Running the Automated Setup:
+Open your fresh WSL2 Ubuntu terminal and run:
+
+```bash
+# Clone the repository and enter the directory
+git clone <repo-url> ai_workspace
+cd ai_workspace
+
+# Run the complete automated setup
+sudo ./setup_wsl2.sh
+```
+
+### Script Commands & Options:
+* `./setup_wsl2.sh --check`: Non-destructive diagnostics health check (reports status of packages, GPU, subuids, Pixi, Podman image, and LiteLLM proxy port 4000).
+* `./setup_wsl2.sh --user-only`: Runs only user-space setup as `agent` (Pixi, LiteLLM, container build).
+* `./setup_wsl2.sh --build-image`: Rebuilds the rootless Podman sandbox container (`ai-forge`).
+* `sudo ./setup_wsl2.sh -y`: Unattended installation accepting all defaults.
+
+---
+
+## 🛠️ Manual Step-by-Step Setup (Reference)
+
+If you prefer to configure your environment manually rather than using the automated installer, follow the steps below:
 
 ### Step 1: Install System Dependencies & GPU Drivers
 Your freshly installed Ubuntu instance needs a few core tools before we can begin. Log into your hardened WSL terminal and run the following commands to install Podman, Pixi, and the NVIDIA toolkit for GPU passthrough:
