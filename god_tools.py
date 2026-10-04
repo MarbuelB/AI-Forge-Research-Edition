@@ -462,7 +462,9 @@ async def execute_bash(command: str, timeout_seconds: int = 60) -> str:
         return 'SYSTEM ERROR: The "command" parameter must be a non-empty string. Example: command="ls -la"'
 
     # 2. Block Destructive Commands (Using strict word boundaries to avoid false positives)
-    if re.search(r'\brm\s+-[rRf]+\b', command.lower()) or re.search(r'\brm\s+', command.lower()):
+    if re.search(r'\bgit\s+rm\s+--cached\b', command.lower()):
+        pass  # Explicitly permit non-destructive git index untracking
+    elif re.search(r'\brm\s+-[rRf]+\b', command.lower()) or re.search(r'\brm\s+', command.lower()):
         return "SYSTEM ERROR: Destructive commands (rm) are blocked. Use the archive folder instead."
 
     try:
@@ -477,6 +479,7 @@ async def execute_bash(command: str, timeout_seconds: int = 60) -> str:
             command,
             cwd=SANDBOX_DIR,
             env=current_env,
+            executable="/bin/bash",
             stdout=asyncio.subprocess.PIPE,     
             stderr=asyncio.subprocess.STDOUT,   
             stdin=asyncio.subprocess.DEVNULL,   
@@ -1136,13 +1139,16 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
     with open(filepath, "r", encoding="utf-8") as f:
         current_code = f.read()
 
-    # 2. Spawn a specialized system prompt forcing the Coder to emit a structured search/replace format
+    # 2. Spawn a specialized system prompt forcing the Coder to emit structured search/replace format
     coder_sys = (
         "You are an expert full-stack developer operating as a surgical script-patching agent.\n"
         "Your objective is to modify an existing script without changing unneeded blocks.\n"
-        "Analyze the provided source code, identify the precise snippet needing correction, "
-        "and return a clean JSON object structure containing two keys: 'search_string' and 'replace_string'.\n"
-        "CRITICAL: The 'search_string' MUST exist inside the source code word-for-word, down to the exact spacing and newlines.\n"
+        "Analyze the provided source code, identify the precise snippet(s) needing correction, "
+        "and return a clean JSON object structure containing an 'edits' array of search/replace objects.\n"
+        "Each item in 'edits' must have 'search_string' and 'replace_string'.\n"
+        "CRITICAL:\n"
+        "1. Each 'search_string' MUST exist inside the source code word-for-word, down to the exact spacing and newlines.\n"
+        "2. If multiple separate locations need changes (e.g. imports at top, flags in main), provide multiple discrete edit items in 'edits' in the order they appear in the file. Do NOT lump unrelated sections into one giant search block.\n"
         "Output ONLY a valid, single JSON block wrapped inside a standard markdown json code block token. No conversational filler text."
     )
 
@@ -1170,15 +1176,25 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                 "schema": {
                     "type": "object",
                     "properties": {
-                        "search_string": {"type": "string", "description": "The exact block of code to search for."},
-                        "replace_string": {"type": "string", "description": "The new block of code to swap in."}
+                        "edits": {
+                            "type": "array",
+                            "description": "Sequential search/replace blocks applied in file order",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "search_string": {"type": "string", "description": "The exact block of code to search for."},
+                                    "replace_string": {"type": "string", "description": "The new block of code to swap in."}
+                                },
+                                "required": ["search_string", "replace_string"],
+                                "additionalProperties": False
+                            }
+                        }
                     },
-                    "required": ["search_string", "replace_string"],
+                    "required": ["edits"],
                     "additionalProperties": False
                 }
             }
         }
-
 
         response = await coder_client.chat.completions.create(**api_args)
         coder_thinking, raw_json_str = extract_thinking_and_content(response.choices[0].message)
@@ -1198,14 +1214,27 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
 
         # Parse structural change instructions safely
         edit_data = json.loads(raw_json_str)
-        search_block = edit_data["search_string"]
-        replace_block = edit_data["replace_string"]
+        edits_list = edit_data.get("edits", [])
+        if not edits_list and "search_string" in edit_data:
+            edits_list = [{"search_string": edit_data["search_string"], "replace_string": edit_data.get("replace_string", "")}]
 
-        if search_block not in current_code:
-            return "SYSTEM ERROR: The Coder generated a 'search_string' that does not match the actual file lines exactly. Aborting modifications for safety."
+        if not edits_list:
+            return "SYSTEM ERROR: The Coder returned an empty edits list. No modifications applied."
 
-        # Apply surgical transformation
-        updated_code = current_code.replace(search_block, replace_block, 1)
+        # Validate that all search blocks exist before applying any modification
+        working_code = current_code
+        applied_blocks = []
+        for idx, edit_item in enumerate(edits_list, 1):
+            s_block = edit_item.get("search_string", "")
+            r_block = edit_item.get("replace_string", "")
+            if not s_block:
+                return f"SYSTEM ERROR: Edit #{idx} provided an empty search_string. Aborting modifications for safety."
+            if s_block not in working_code:
+                return f"SYSTEM ERROR: The Coder generated a 'search_string' in edit #{idx} that does not match the actual file lines exactly. Aborting all modifications for safety."
+            working_code = working_code.replace(s_block, r_block, 1)
+            applied_blocks.append(f"--- EDIT #{idx} ---\nSearch Block:\n{s_block}\n\nReplace Block:\n{r_block}")
+
+        updated_code = working_code
 
         # Archive backup snapshot
         filename = os.path.basename(filepath)
@@ -1224,7 +1253,7 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                 proc_add = await asyncio.create_subprocess_exec("git", "add", filepath, cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 await proc_add.communicate()
                 clean_obj = re.sub(r'[\r\n\x00-\x1f]+', ' ', edit_objective).strip()[:40]
-                proc_commit = await asyncio.create_subprocess_exec("git", "commit", "-m", f"feat(coder): surgical patch applied for {clean_obj}", cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                proc_commit = await asyncio.create_subprocess_exec("git", "commit", "-m", f"feat(coder): surgical patch applied ({len(edits_list)} edits) for {clean_obj}", cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 await proc_commit.communicate()
             except Exception:
                 pass
@@ -1240,8 +1269,8 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                     elif lang == "cpp":
                         blueprint_hint = "\nREMINDER: This is a C++ asset. Ensure you re-compile the source file using g++ before executing the binary path."
 
-        edit_summary_block = f"Search Block:\n{search_block}\n\nReplace Block:\n{replace_block}"
-        res = f"SUCCESS: Coder surgically patched '{filepath}' to achieve the objective. Backup generated: {os.path.basename(backup_path)}.{blueprint_hint}"
+        edit_summary_block = "\n\n".join(applied_blocks)
+        res = f"SUCCESS: Coder surgically applied {len(edits_list)} edit(s) to '{filepath}' to achieve the objective. Backup generated: {os.path.basename(backup_path)}.{blueprint_hint}"
         if coder_thinking:
             res += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
         res += f"\n<___CODER_CODE___>\n{edit_summary_block}\n</___CODER_CODE___>"
@@ -1674,6 +1703,12 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
     user_content = [{"type": "text", "text": f"Instruction: {instruction}\n\n"}]
     
     try:
+        # Pre-flight check: if all requested existing files are empty (0 bytes), return immediately
+        existing_files = [f for f in filepaths if os.path.exists(f) and not os.path.isdir(f)]
+        if existing_files and all(os.path.getsize(f) == 0 for f in existing_files):
+            file_names = ", ".join([os.path.basename(f) for f in existing_files])
+            return f"SYSTEM NOTICE: Target file(s) [{file_names}] are currently 0 bytes (empty). No content or tracebacks exist to analyze."
+
         for filepath in filepaths:
             if not os.path.exists(filepath):
                 user_content.append({"type": "text", "text": f"\n[ERROR: File '{filepath}' does not exist.]"})
@@ -1700,6 +1735,11 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
                 user_content.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}})
             else:
                 # --- TEXT PIPELINE ---
+                file_size = os.path.getsize(filepath)
+                if file_size == 0:
+                    user_content.append({"type": "text", "text": f"\n--- TEXT FILE: {filename} (EMPTY - 0 bytes) ---\n[This file is currently 0 bytes / empty. No data has been written to it.]\n"})
+                    continue
+
                 with open(filepath, "r", encoding="utf-8", errors="replace") as text_file:
                     file_content = text_file.read(50000) # Only reads the first 50k characters
                     

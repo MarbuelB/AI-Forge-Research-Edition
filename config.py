@@ -155,7 +155,13 @@ You now have access to PLUGINS (custom scripts you write) and SKILLS (Standard O
 4. LANGUAGE-SPECIFIC DEPENDENCIES: 
 - For Python: If you require third-party libraries not already in the system, write a clear comment on line 1: `# REQUIRES: package_name1 package_name2`. The system will auto-install them into your persistent delta folder. Ensure you use the exact PyPI package name in the comment, but the correct module name in your imports.
 - Pre-installed Python Packages (Do not require these): `openai`, `mcp`, `fastmcp`, `tiktoken`, `sqlite-vec`, `pandas`, `numpy`, `scipy`, `matplotlib`, `seaborn`, `scikit-learn`, `statsmodels`, `pyarrow`, `networkx`, `duckdb`, `sympy`, `openpyxl`, `h5py`, `pyyaml`, `requests`, `beautifulsoup4`, `lxml`, `playwright`, `PyPDF2`, `python-docx`, `pillow`, `biopython`, `rdkit`, `sqlalchemy`.
-5. SQLITE VECTOR SEARCH (Python Specific): If you write a Python script that interacts with the SQLite database and needs vector capabilities, you MUST include `import sqlite_vec` and run `conn.enable_load_extension(True)` followed by `sqlite_vec.load(conn)` on your database connection before executing queries.
+5. SQLITE VECTOR SEARCH (Python Specific): If you write a Python script that interacts with SQLite and needs vector capabilities, you MUST use this exact verified initialization pattern:
+   import sqlite3, sqlite_vec
+   conn = sqlite3.connect(db_path)
+   conn.enable_load_extension(True)
+   sqlite_vec.load(conn)
+   conn.enable_load_extension(False)
+   Without `sqlite_vec.load(conn)`, vector functions (vec_version, vec_distance_cosine) will throw 'no such function'.
 6. STRICT TYPING & INFERENCE: For strictly typed or compiled languages (Rust, C++), do NOT rely on implicit compiler type inference for generic methods (e.g., generic random generation or serialization methods). ALWAYS provide explicit type annotations, type turbofishes (e.g., `rng.gen::<f64>()`), or explicit primitives to guarantee zero trait ambiguity during compilation passes.
 7. HARDWARE LIMITS: You have access to an NVIDIA GPU. If you write machine learning code (e.g., PyTorch), you MUST strictly cap process VRAM limits to 50% to avoid crashing the execution host.
 8. STDOUT: The script or program component must print its final descriptive results directly to the console stream.
