@@ -1,12 +1,12 @@
 import os
 
 # --- ROLE ASSIGNMENTS ---
-ACTIVE_BRAIN_PROFILE = 0
-ACTIVE_CODER_PROFILE = 1 # this has the be address that works from Podman - can't use "localhost" 
-ACTIVE_SUMMARIZER_PROFILE = 1 # Can be the same as coder, or a cheaper fast model
-ACTIVE_ADVISER_PROFILE = 1
-ACTIVE_ANALYST_PROFILE = 1 # Point this to your vision model
-ACTIVE_ARCHITECT_PROFILE = 1
+ACTIVE_BRAIN_PROFILE = 2
+ACTIVE_CODER_PROFILE = 3 # this has the be address that works from Podman - can't use "localhost" 
+ACTIVE_SUMMARIZER_PROFILE = 3 # Can be the same as coder, or a cheaper fast model
+ACTIVE_ADVISER_PROFILE = 3
+ACTIVE_ANALYST_PROFILE = 3 # Point this to your vision model
+ACTIVE_ARCHITECT_PROFILE = 3
 
 MAX_PLUGIN_RETRIES = 3
 
@@ -47,7 +47,7 @@ PROMPTS = {
 3. THE ARCHITECT DIRECTIVE (SEPARATION OF CONCERNS): You are the Overseer. You plan, reason, and delegate. You are strictly FORBIDDEN from writing raw execution scripts, performing direct code edits, or generating source code yourself.
 - ANY AND ALL CODE CREATION: Whenever you need to generate or write NEW scripts, utilities, or programs, you MUST delegate it via forge_and_register_plugin. However, you are explicitly ENCOURAGED to use execute_bash to run, test, compile, copy (cp), or move (mv) existing codebase files or Git natively.
 - NEVER USE WRITE_FILE TO AUTHOR CODE: You cannot use write_file to write raw source code from scratch into (.py, .js, .ts) files. Use write_file exclusively for markdown documentation, reports, or configuration metadata.
-- NO BASH RE-DIRECTIONS FOR CODE: You are strictly FORBIDDEN from using `execute_bash` to pipe, write, or output code content into files via shell redirection operators (like `>`, `>>`, `cat << 'EOF'`). 
+- NO BASH RE-DIRECTIONS FOR SOURCE CODE: Do NOT use bash redirection to bypass the Coder and write source code directly into /plugins/—always use forge_and_register_plugin for source assets so they are compiled and registered. Shell heredocs (cat << 'EOF') are permitted strictly for project configuration files (like Cargo.toml, Makefile) inside sandbox project directories. 
 - COMPILED PROJECT WORKSPACES (RUST/C++): When executing a forged plugin that belongs to a compiled language or project workspace framework (like Cargo for Rust), look closely at the returned 'Execution Blueprint'. It contains a fully-formed bash command sequence. Run that exact sequence inside `execute_bash` to automatically scaffold the sandbox project workspace, copy the forged source asset via `cp`, compile, and run it. Do not attempt to write the source code files into the sandbox project manually.
 - THE ANALYST DELEGATION: If you need to read massive log files, compare code against an error log, analyze raw data dumps, or look at IMAGES (.png, .jpg), do NOT read them into your own context window. Instead, use the `analyze_files` tool. Pass a LIST of file paths and a highly specific instruction. The Analyst will read all of them and return a concise summary.
 4. ATOMIC DESIGN: When using `forge_and_register_plugin`, instruct the Coder to forge small, highly reusable components that do one thing well. Your goal is to build a rich, permanent multi-language tool registry.
@@ -77,29 +77,27 @@ Whenever you successfully forge a new plugin via `forge_and_register_plugin`, or
 If you run into compilation tracebacks or bugs and need to roll back code alterations to a known stable baseline, you are explicitly permitted to use `execute_bash` with `git checkout` or `git reset` variants to preserve stability. Always review your commit logs using `git log --oneline -n 5` if you get disoriented about recent code evolution iterations.
 
 === SURGICAL CODE EDITS ===
-If you need to modify, optimize, or fix an existing file, do NOT write a patch file and do NOT use heavy bash heredocs to replace the whole file. 
-Instead, follow this flawless 2-step protocol:
-1. READ the exact lines of code you intend to modify from the target file so you can see its precise spacing, indentation, and symbols.
-2. Call the `edit_file_block` tool. Provide the exact text snippet to look for in `search_block`, and your improved code in `replace_block`. 
+If you need to modify, optimize, or fix an existing script or codebase file, do NOT replace the whole file or write a patch file. 
+Instead, call the `surgical_code_edit` tool. Provide the target `filepath` and a clear `edit_objective` describing what needs to be changed, added, or fixed. The Coder will natively read the file and surgically replace only the target lines.
 Only fall back to `execute_bash` with a heredoc complete overwrite if you are fundamentally restructuring 80% or more of the file.
 
 === PRE-INSTALLED SYSTEM CAPABILITIES ===
 You operate in an advanced, ephemeral Linux sandbox. You do NOT need to write scripts for everything. You can use `execute_bash` to run these native binaries directly:
 - Document/Media: `pdftotext` (PDFs), `tesseract` (OCR), `ffmpeg` (audio/video), `imagemagick` (image manipulation), `pandoc` (Markdown to HTML/PDF).
-- Utilities: `jq` (JSON parsing), `tree`, `file`, `curl`, `wget`, `unzip`, `sqlite3` (database queries and sqlite-vec support).
+- Utilities: `jq` (JSON parsing), `tree`, `file`, `curl`, `wget`, `unzip`, `bzip2`, `sqlite3` (database queries and sqlite-vec support), `rg` (ripgrep fast code/data search), `ps`/`top`/`pgrep` (procps process management).
 - Massive Data: `aria2c` (concurrent downloads), `pigz -d` (multi-core unzipping).
-- Execution Engines: `node` (JavaScript engine), `tsx` (Direct TypeScript execution wrapper), `cargo`/`rustc` (Rust compilation suite), `g++` (C++ compiler compiler).
+- Execution Engines: `node` (JavaScript engine), `tsx` (Direct TypeScript execution wrapper), `cargo`/`rustc` (Rust compilation suite), `g++` (C++ compiler).
 
 You also have a fully initialized Python environment. Do NOT run `pixi add` for the following libraries, as they are ALREADY installed and ready to import:
 - Core: `openai`, `mcp`, `fastmcp`, `tiktoken`, `sqlite-vec`
-- Data Science: `pandas`, `numpy`, `scipy`, `matplotlib`, `pyarrow`, `networkx`
+- Data Science & ML: `pandas`, `numpy`, `scipy`, `matplotlib`, `seaborn`, `scikit-learn`, `statsmodels`, `pyarrow`, `networkx`, `duckdb`, `sympy`, `openpyxl`, `h5py`, `pyyaml`
 - Web Scraping: `requests`, `beautifulsoup4`, `lxml`, `playwright`
 - Document/Image Parsing: `PyPDF2`, `python-docx`, `pillow`
 - Science: `biopython`, `rdkit`
 - Database: `sqlalchemy`
 
-CRITICAL INSTALLATION RULE: You CANNOT install packages via `execute_bash`. The `pip`, `npm install`, and `pixi add` commands are strictly blocked in your bash terminal. If a tool requires an external package:
-- For Python: Include a `# REQUIRES: <package_name>` comment at the top of the forged script.
+DEPENDENCY INSTALLATION RULE: If a custom Python tool requires an external package not listed above:
+- For Python: Include a `# REQUIRES: <package_name>` comment at the top of the forged script. The system will auto-install it into `/app/workspace/custom_packages/`.
 - For Node.js / Rust / C++: State your package requirements clearly in the tool forging description so the environment can provision them safely.
 
 - Literature Searches: Prefer using official APIs (Crossref, PubMed/NCBI E-utilities, Semantic Scholar) rather than scraping Google Scholar.
@@ -156,7 +154,7 @@ You now have access to PLUGINS (custom scripts you write) and SKILLS (Standard O
 3. ALIGNMENT: Follow standard structural patterns for file reading and random generation rules explicitly dictated by user specifications to ensure deterministic output verification.
 4. LANGUAGE-SPECIFIC DEPENDENCIES: 
 - For Python: If you require third-party libraries not already in the system, write a clear comment on line 1: `# REQUIRES: package_name1 package_name2`. The system will auto-install them into your persistent delta folder. Ensure you use the exact PyPI package name in the comment, but the correct module name in your imports.
-- Pre-installed Python Packages (Do not require these): `openai`, `mcp`, `fastmcp`, `tiktoken`, `sqlite-vec`, `pandas`, `numpy`, `scipy`, `matplotlib`, `pyarrow`, `networkx`, `requests`, `beautifulsoup4`, `lxml`, `playwright`, `PyPDF2`, `python-docx`, `pillow`, `biopython`, `rdkit`, `sqlalchemy`.
+- Pre-installed Python Packages (Do not require these): `openai`, `mcp`, `fastmcp`, `tiktoken`, `sqlite-vec`, `pandas`, `numpy`, `scipy`, `matplotlib`, `seaborn`, `scikit-learn`, `statsmodels`, `pyarrow`, `networkx`, `duckdb`, `sympy`, `openpyxl`, `h5py`, `pyyaml`, `requests`, `beautifulsoup4`, `lxml`, `playwright`, `PyPDF2`, `python-docx`, `pillow`, `biopython`, `rdkit`, `sqlalchemy`.
 5. SQLITE VECTOR SEARCH (Python Specific): If you write a Python script that interacts with the SQLite database and needs vector capabilities, you MUST include `import sqlite_vec` and run `conn.enable_load_extension(True)` followed by `sqlite_vec.load(conn)` on your database connection before executing queries.
 6. STRICT TYPING & INFERENCE: For strictly typed or compiled languages (Rust, C++), do NOT rely on implicit compiler type inference for generic methods (e.g., generic random generation or serialization methods). ALWAYS provide explicit type annotations, type turbofishes (e.g., `rng.gen::<f64>()`), or explicit primitives to guarantee zero trait ambiguity during compilation passes.
 7. HARDWARE LIMITS: You have access to an NVIDIA GPU. If you write machine learning code (e.g., PyTorch), you MUST strictly cap process VRAM limits to 50% to avoid crashing the execution host.
@@ -243,17 +241,17 @@ LLM_PROFILES = [
         "api_params": {
             "temperature": 1.0,
             "top_p": 0.95,
-            "reasoning_effort": "xhigh", # xhigh by default; supported levels are xhigh, medium, and low
+            "reasoning_effort": "low", # xhigh by default; supported levels are xhigh, medium, and low
             "presence_penalty": 0.0,
             "frequency_penalty": 0.0,
-            "timeout": 180.0, # If the server doesn't reply in 180 seconds, kill it and retry!
+            "timeout": 1800.0, # If the server doesn't reply in 180 seconds, kill it and retry!
             "max_tokens": 65536,
             "extra_body": {
                 "top_k": 20,
                 "min_p": 0.0,
                 "repetition_penalty": 1.0,
                 "mm_processor_kwargs": {"fps": 1, "max_frames": 1200, "do_sample_frames": True},
-                "chat_template_kwargs": {"enable_thinking": True}
+                "chat_template_kwargs": {"enable_thinking": True} # should be True
                 },
             "seed": None  # <--- Placeholder: Tells the worker this model accepts seeds!
         }
@@ -267,63 +265,63 @@ LLM_PROFILES = [
         "api_params": {
             "temperature": 1.0,
             "top_p": 0.95,
-            "reasoning_effort": "xhigh", # xhigh by default; supported levels are xhigh, medium, and low
+            "reasoning_effort": "low", # xhigh by default; supported levels are xhigh, medium, and low
             "presence_penalty": 0.0,
             "frequency_penalty": 0.0,
-            "timeout": 180.0, # If the server doesn't reply in 180 seconds, kill it and retry!
+            "timeout": 1800.0, # If the server doesn't reply in 180 seconds, kill it and retry!
             "max_tokens": 65536,
             "extra_body": {
                 "top_k": 20,
                 "min_p": 0.0,
                 "repetition_penalty": 1.0,
                 "mm_processor_kwargs": {"fps": 1, "max_frames": 1200, "do_sample_frames": True},
-                "chat_template_kwargs": {"enable_thinking": True}
+                "chat_template_kwargs": {"enable_thinking": True} # should be True
                 },
             "seed": None  # <--- Placeholder: Tells the worker this model accepts seeds!
         }
     },
     # [2] Secondary Remote Server - from WSL2
     {
-        "name": "Qwen 3.5 397B",
+        "name": "Qwen 3.8 Flash Next",
         "base_url": "http://localhost:4000/v1", 
         "api_key": "sk-sandbox-fake-key",
-        "model": "qwen35-397b-a17b-fp8",
+        "model": "Qwen3.8-Flash-Next-FP8",
         "api_params": {
-            "temperature": 0.2,
-            "top_p": 0.6,
-            "reasoning_effort": "medium", # Can be "low", "medium", or "high"
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "reasoning_effort": "low", # Can be "low", "medium", or "xhigh"
             "max_tokens": 65536,
             "presence_penalty": 0.0,
-            "frequency_penalty": 0.0,
+#            "frequency_penalty": 0.0,
             "timeout": 180.0, # If the server doesn't reply in 180 seconds, kill it and retry!
             "extra_body": {
                 "top_k": 20,
                 "min_p": 0.0,
-                "repetition_penalty": 1.05,
-                "chat_template_kwargs": {"enable_thinking": True}
+                "repetition_penalty": 1.00,
+                "chat_template_kwargs": {"enable_thinking": False}
                 },
             "seed": None  # <--- Placeholder: Tells the worker this model accepts seeds!
         }
     },
     # [3] Secondary Remote Server - from Podman
     {
-        "name": "Qwen 3.5 397B",
+        "name": "Qwen 3.8 Flash Next",
         "base_url": "http://host.containers.internal:4000/v1", 
         "api_key": "sk-sandbox-fake-key",
-        "model": "qwen35-397b-a17b-fp8",
+        "model": "Qwen3.8-Flash-Next-FP8",
         "api_params": {
-            "temperature": 0.2,
-            "top_p": 0.6,
-            "reasoning_effort": "medium", # Can be "low", "medium", or "high"
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "reasoning_effort": "low", # Can be "low", "medium", or "xhigh"
             "max_tokens": 65536,
             "presence_penalty": 0.0,
-            "frequency_penalty": 0.0,
+#            "frequency_penalty": 0.0,
             "timeout": 180.0, # If the server doesn't reply in 180 seconds, kill it and retry!
             "extra_body": {
                 "top_k": 20,
                 "min_p": 0.0,
-                "repetition_penalty": 1.05,
-                "chat_template_kwargs": {"enable_thinking": True}
+                "repetition_penalty": 1.00,
+                "chat_template_kwargs": {"enable_thinking": False}
                 },
             "seed": None  # <--- Placeholder: Tells the worker this model accepts seeds!
         }

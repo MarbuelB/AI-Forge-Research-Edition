@@ -168,12 +168,20 @@ def build_skills_menu():
     menu_lines = ["AVAILABLE SKILLS MENU (Use `load_skill` to read full instructions):"]
     for item in sorted(os.listdir(skills_dir)):
         skill_path = os.path.join(skills_dir, item, "SKILL.md")
+        # HOST PROTECTION: Reject symlinks pointing outside SESSION_DIR
+        try:
+            if not os.path.commonpath([os.path.realpath(skill_path), SESSION_DIR]) == SESSION_DIR:
+                continue
+        except Exception:
+            continue
         if os.path.exists(skill_path):
             try:
                 with open(skill_path, "r", encoding="utf-8") as f:
                     content = f.read()
                 desc_match = re.search(r'description:\s*(.+)', content)
                 description = desc_match.group(1).strip() if desc_match else "No description provided."
+                # Strip excessive whitespace or control characters
+                description = re.sub(r'[\r\n\x00-\x1f]+', ' ', description)[:200]
                 menu_lines.append(f"- {item}: {description}")
             except Exception:
                 pass
@@ -189,6 +197,15 @@ def load_history():
     skills_menu = build_skills_menu()
     system_prompt = f"{config.SYSTEM_PROMPTS['brain']}\n\n{skills_menu}"
     
+    # HOST PROTECTION: Reject if CURRENT_HISTORY_FILE points outside SESSION_DIR
+    try:
+        if not os.path.commonpath([os.path.realpath(CURRENT_HISTORY_FILE), SESSION_DIR]) == SESSION_DIR:
+            init_state = [{"role": "system", "content": system_prompt}]
+            save_history(init_state)
+            return init_state
+    except Exception:
+        pass
+
     if not os.path.exists(CURRENT_HISTORY_FILE):
         init_state = [{"role": "system", "content": system_prompt}]
         save_history(init_state)
@@ -389,7 +406,7 @@ async def run_chat():
                     "run", "-i", "--rm",
                     "--init",
                     f"--name={active_container_name}", # True unique identifier
-                    "--network=slirp4netns", # networking mode built specifically for rootless Podman
+                    "--network=slirp4netns:allow_host_loopback=false", # networking mode built specifically for rootless Podman
                     "--add-host=host.containers.internal:host-gateway",
                     # Core Security Protections
                     "--security-opt", "no-new-privileges=true",
@@ -399,6 +416,7 @@ async def run_chat():
                     "--cap-drop=ALL",         # Drop all Linux capabilities
                     "--cpus=4.0",            # Limit to 4 CPU cores
                     "--memory=16g",           # Limit to 16 GB of RAM
+                    "--shm-size=2g",          # Provides ample shared memory for Chromium & heavy compilers
                     "--pids-limit=1000",      # Neutralizes bash fork bombs
                     "--userns=keep-id",
                     "--device=nvidia.com/gpu=all", # GPU Passthrough!
@@ -411,11 +429,11 @@ async def run_chat():
                     "-v", "/dev/null:/usr/bin/passwd:ro",
                     "-v", "/dev/null:/usr/bin/gpasswd:ro",
                     
-                    "-v", f"{SESSION_DIR}:/app/workspace:Z",
+                    "-v", f"{SESSION_DIR}:/app/workspace:Z,nosuid,nodev",
                     "-v", f"{os.path.abspath('./config.py')}:/app/config.py:ro,Z",
                     "-v", f"{os.path.abspath('./god_tools.py')}:/app/god_tools.py:ro,Z",
                     "-v", f"{os.path.abspath('./chat_overseer.py')}:/app/chat_overseer.py:ro,Z", # it can read own code
-                    "-v", f"{config.HOST_INPUT_DIR}:/app/host_input:ro,Z", # same for all sessions, read only
+                    "-v", f"{config.HOST_INPUT_DIR}:/app/host_input:ro,Z,nosuid,nodev", # same for all sessions, read only
                     
                     "ai-forge",
                     "bash", "-c", f"""

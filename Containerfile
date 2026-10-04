@@ -5,6 +5,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     xvfb git git-lfs curl wget unzip aria2 file jq pigz zstd \
     poppler-utils tesseract-ocr ffmpeg imagemagick graphviz pandoc sqlite3 \
     build-essential cmake gfortran libgl1 libglib2.0-0 libxml2-dev libxslt-dev \
+    procps ripgrep tree bzip2 \
     && rm -rf /var/lib/apt/lists/*
 	
 # USER SETUP
@@ -37,6 +38,8 @@ RUN pixi init && \
     requests beautifulsoup4 lxml \
     pypdf2 python-docx pillow tiktoken \
     biopython rdkit sqlalchemy networkx \
+    scikit-learn seaborn statsmodels openpyxl \
+    duckdb sympy pyyaml h5py \
     nodejs && \
     pixi run npm install -g tsx && \
     pixi add --pypi sqlite-vec playwright playwright-stealth && \

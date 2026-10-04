@@ -16,6 +16,8 @@ import array
 import base64
 import urllib.parse
 import mimetypes
+import socket
+import ipaddress
 from typing import Any
 from datetime import datetime
 from openai import AsyncOpenAI
@@ -478,12 +480,19 @@ async def execute_bash(command: str, timeout_seconds: int = 60) -> str:
             # Await the completion with an async timeout
             stdout_data, _ = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
             
-        except asyncio.TimeoutError:
-            # If it times out, we must aggressively kill the entire process group
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            # If it times out or is cancelled, aggressively kill the entire process group
             try:
                 os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass # Process already died natively
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+            try:
+                await process.wait()
+            except Exception:
+                pass
                 
             return f"SYSTEM ERROR: Command timed out after {timeout_seconds} seconds and was forcefully terminated."
 
@@ -904,6 +913,7 @@ async def compress_and_store_context() -> str:
         new_history = comp_data.get("compressed_history", [])
         new_history.insert(0, {"role": "system", "content": config.PROMPTS["overseer_system"]})
         save_json(CURRENT_HISTORY_FILE, new_history)
+        _LOADED_SKILLS.clear()
         
         summarizer_thoughts = []
         if mem_thinking: summarizer_thoughts.append(f"--- MEMORY EXTRACTION THINKING ---\n{mem_thinking}")
@@ -1500,12 +1510,52 @@ async def search_web(query: str, max_results: int = 5) -> str:
         return f"SYSTEM ERROR: Stealth search failed. {str(e)}"
 
 
+def is_safe_web_url(url: str) -> tuple[bool, str]:
+    """Validates that a URL is safe to fetch and does not probe local/host networks."""
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+        if parsed.scheme.lower() not in ("http", "https"):
+            return False, f"Scheme '{parsed.scheme}' is blocked. Only http and https are permitted."
+        
+        hostname = parsed.hostname
+        if not hostname:
+            return False, "Missing hostname in URL."
+            
+        lower_host = hostname.lower()
+        if lower_host in ("localhost", "host.containers.internal", "host.docker.internal"):
+            return False, f"Host alias '{hostname}' is restricted."
+
+        try:
+            addr_info = socket.getaddrinfo(hostname, None)
+        except socket.gaierror as e:
+            return False, f"DNS resolution failed for '{hostname}': {str(e)}"
+
+        for _, _, _, _, sockaddr in addr_info:
+            ip = ipaddress.ip_address(sockaddr[0])
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_multicast
+            ):
+                return False, f"Target resolves to restricted private/internal IP ({sockaddr[0]})."
+
+        return True, ""
+    except Exception as e:
+        return False, f"Invalid URL: {str(e)}"
+
+
 @mcp.tool()
 async def fetch_webpage(url: str) -> str:
     """Fetches a webpage using a headless Chromium browser to render JavaScript, 
     and returns ONLY the clean, readable text. 
     Use this to read documentation, articles, or search results without writing a custom scraper.
     """
+    safe, reason = is_safe_web_url(url)
+    if not safe:
+        return f"SYSTEM ERROR: URL blocked by security policy. {reason}"
+
     try:
         async with Stealth().use_async(async_playwright()) as p:
             # Launch chromium natively in headless mode with container-safe flags
@@ -1674,7 +1724,12 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
         
         # --- 2. PARSE THE JSON ---
         try:
-            report_data = json.loads(raw_analyst_content)
+            clean_json = raw_analyst_content.strip()
+            if "```" in clean_json:
+                match = re.search(r"```(?:json)?\s*(.*?)\s*```", clean_json, re.DOTALL)
+                if match:
+                    clean_json = match.group(1).strip()
+            report_data = json.loads(clean_json)
             ex_summ = report_data.get("executive_summary", "")
             full_rep = report_data.get("full_report", "")
         except json.JSONDecodeError:
@@ -1716,9 +1771,6 @@ def load_skill(skill_name: str) -> str:
     """Loads the full instructional blueprint for a given skill.
     Use this immediately when your current task matches a skill in your system prompt."""
     global _LOADED_SKILLS
-    if skill_name in _LOADED_SKILLS:
-        return f"[SYSTEM ERROR: You already loaded the '{skill_name}' skill earlier in this session. Read your previous messages to find the instructions.]"
-        
     skill_path = f"/app/workspace/skills/{skill_name}/SKILL.md"
     if not os.path.exists(skill_path):
         return f"[SYSTEM ERROR: Skill '{skill_name}' not found at {skill_path}.]"
@@ -1726,8 +1778,10 @@ def load_skill(skill_name: str) -> str:
     with open(skill_path, "r", encoding="utf-8") as f:
         content = f.read()
         
+    is_reload = skill_name in _LOADED_SKILLS
     _LOADED_SKILLS.add(skill_name)
-    return f"--- SKILL ACTIVATED: {skill_name} ---\n{content}\n\n[SYSTEM: You must now strictly follow these instructions.]"
+    status_label = "RE-ACTIVATED" if is_reload else "ACTIVATED"
+    return f"--- SKILL {status_label}: {skill_name} ---\n{content}\n\n[SYSTEM: You must now strictly follow these instructions.]"
 
 
 @mcp.tool()
