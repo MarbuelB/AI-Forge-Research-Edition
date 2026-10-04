@@ -149,6 +149,7 @@ os.makedirs(f"{SESSION_DIR}/state", exist_ok=True)
 os.makedirs(f"{SESSION_DIR}/sandbox", exist_ok=True)
 os.makedirs(f"{SESSION_DIR}/outputs", exist_ok=True)
 os.makedirs(f"{SESSION_DIR}/archive", exist_ok=True)
+os.makedirs(f"{SESSION_DIR}/skills", exist_ok=True)
 
 # Build the isolated folder structure for input/output folders
 os.makedirs(config.HOST_INPUT_DIR, exist_ok=True)

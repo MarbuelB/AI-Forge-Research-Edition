@@ -1936,12 +1936,38 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
         return f"Analyst failed to process files. Error: {str(e)}"
         
 @mcp.tool()
-def load_skill(skill_name: str) -> str:
+def load_skill(skill_name: str = "") -> str:
     """Loads the full instructional blueprint for a given skill.
+    If called without a skill_name (or empty string), it lists all available skills and their descriptions.
     Use this immediately when your current task matches a skill in your system prompt."""
     global _LOADED_SKILLS
-    safe_name = os.path.basename(skill_name.strip())
     skills_root = os.path.realpath("/app/workspace/skills")
+    
+    # Helper to gather all available skills
+    available_skills = {}
+    if os.path.exists(skills_root):
+        for item in sorted(os.listdir(skills_root)):
+            s_path = os.path.join(skills_root, item, "SKILL.md")
+            if os.path.exists(s_path):
+                try:
+                    with open(s_path, "r", encoding="utf-8") as f:
+                        c = f.read()
+                    d_match = re.search(r'description:\s*(.+)', c)
+                    desc = d_match.group(1).strip() if d_match else "No description provided."
+                    available_skills[item] = re.sub(r'[\r\n\x00-\x1f]+', ' ', desc)[:200]
+                except Exception:
+                    available_skills[item] = "Available (failed to parse description)."
+
+    # If no skill name provided, return the catalog
+    if not skill_name or not skill_name.strip():
+        if not available_skills:
+            return "AVAILABLE SKILLS: None currently installed in /app/workspace/skills. Use commission_architect to build some."
+        summary_lines = ["AVAILABLE SKILLS REGISTRY (Call load_skill(skill_name) to activate):"]
+        for s_name, s_desc in available_skills.items():
+            summary_lines.append(f"- {s_name}: {s_desc}")
+        return "\n".join(summary_lines)
+
+    safe_name = os.path.basename(skill_name.strip())
     skill_path = os.path.realpath(os.path.join(skills_root, safe_name, "SKILL.md"))
     try:
         if not os.path.commonpath([skill_path, skills_root]) == skills_root:
@@ -1950,7 +1976,8 @@ def load_skill(skill_name: str) -> str:
         return f"[SYSTEM ERROR: Invalid skill name '{skill_name}'.]"
 
     if not os.path.exists(skill_path):
-        return f"[SYSTEM ERROR: Skill '{safe_name}' not found at {skill_path}.]"
+        avail_list = ", ".join(available_skills.keys()) if available_skills else "None"
+        return f"[SYSTEM ERROR: Skill '{safe_name}' not found. Available skills: {avail_list}]"
         
     with open(skill_path, "r", encoding="utf-8") as f:
         content = f.read()
@@ -2014,7 +2041,7 @@ async def commission_architect(skill_name: str, objective: str, brain_notes: str
         with open(skill_path, "w", encoding="utf-8") as f:
             f.write(clean_skill_md)
             
-        result_msg = f"[SUCCESS] The Architect has drafted and saved '{safe_name}' to {skill_path}. It will be injected into your menu on the next system boot."
+        result_msg = f"[SUCCESS] The Architect has drafted and saved '{safe_name}' to {skill_path}. It is now immediately available in your Available Skills Menu and can be loaded via load_skill('{safe_name}')."
         if architect_thinking:
             result_msg += f"\n<___ARCHITECT_THOUGHTS___>\n{architect_thinking}\n</___ARCHITECT_THOUGHTS___>"
         result_msg += f"\n<___ARCHITECT_SKILL___>\n{clean_skill_md}\n</___ARCHITECT_SKILL___>"
