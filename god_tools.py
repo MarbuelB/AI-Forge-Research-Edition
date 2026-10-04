@@ -1261,6 +1261,14 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
 
         updated_code = working_code
 
+        # Pre-flight syntax validation before modifying disk
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext == ".py":
+            try:
+                compile(updated_code, filepath, 'exec')
+            except SyntaxError as e:
+                return f"SYSTEM ERROR: Surgical edit aborted because it introduces a Python syntax error on line {e.lineno}: {e.msg}. File on disk was NOT modified."
+
         # Archive backup snapshot
         filename = os.path.basename(filepath)
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
