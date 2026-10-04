@@ -457,8 +457,8 @@ async def run_chat():
                         # FIX 2: Mute git init output by redirecting it entirely to /dev/null
                         git init > /dev/null
                         
-                        # Create a base ignore pattern so the agent doesn't track massive logs or databases
-                        echo -e "logs/\nstate/\nsandbox/\ncustom_packages/\n*.db\n*.tmp\n*.bak" > .gitignore
+                        # Create a base ignore pattern so the agent doesn't track massive logs, databases, or compiled binaries
+                        echo -e "logs/\nstate/\nsandbox/\ncustom_packages/\n__pycache__/\n*.pyc\n*.bin\n*.cpp_bin\n*.o\ntarget/\n*.db\n*.tmp\n*.bak" > .gitignore
                         
                         # FIX 3: Mute the initial commit tracking messages
                         git add .gitignore > /dev/null 2>&1
@@ -475,6 +475,7 @@ async def run_chat():
                     
                     # 6. CORRECT ENVIRONMENT ALIGNMENT: Prepend framework paths while preserving Pixi site-packages
                     export PYTHONPATH=/app:/app/workspace/custom_packages:$PYTHONPATH
+                    export PATH=/app/workspace/plugins:/app/workspace/plugins/bin:$PATH
                     
                     # 7. Start the MCP server safely
                     cd /app/workspace

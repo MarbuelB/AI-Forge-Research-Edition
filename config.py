@@ -155,6 +155,7 @@ You now have access to PLUGINS (custom scripts you write) and SKILLS (Standard O
 4. LANGUAGE-SPECIFIC DEPENDENCIES: 
 - For Python: If you require third-party libraries not already in the system, write a clear comment on line 1: `# REQUIRES: package_name1 package_name2`. The system will auto-install them into your persistent delta folder. Ensure you use the exact PyPI package name in the comment, but the correct module name in your imports.
 - Pre-installed Python Packages (Do not require these): `openai`, `mcp`, `fastmcp`, `tiktoken`, `sqlite-vec`, `pandas`, `numpy`, `scipy`, `matplotlib`, `seaborn`, `scikit-learn`, `statsmodels`, `pyarrow`, `networkx`, `duckdb`, `sympy`, `openpyxl`, `h5py`, `pyyaml`, `requests`, `beautifulsoup4`, `lxml`, `playwright`, `PyPDF2`, `python-docx`, `pillow`, `biopython`, `rdkit`, `sqlalchemy`.
+- For Rust: You can write standalone code using the Rust standard library (`std::*`), which compiles fastest with zero network overhead. If external crates are needed, declare them at the top of the file as: `// REQUIRES: crate_name = "version"` (e.g., `// REQUIRES: serde = "1.0", serde_json = "1.0"`). Note that `rand = "0.8"` is always pre-configured.
 5. SQLITE VECTOR SEARCH (Python Specific): If you write a Python script that interacts with SQLite and needs vector capabilities, you MUST use this exact verified initialization pattern:
    import sqlite3, sqlite_vec
    conn = sqlite3.connect(db_path)

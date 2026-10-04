@@ -344,8 +344,18 @@ async def consult_adviser(current_plan: str, encountered_problems: str, context_
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(advice_text)
             
-        # 7. Return the full text back to the Brain's context window with hidden sentinel tags
-        result_msg = f"Adviser report successfully saved to disk as '{filename}'.\n\n--- ADVISER FEEDBACK ---\n{advice_text}"
+        # Context guardrail: truncate preview for context window if advice exceeds 12,000 characters
+        if len(advice_text) > 12000:
+            preview = advice_text[:4000]
+            display_feedback = (
+                f"{preview}\n\n... [SYSTEM: The full Adviser report ({len(advice_text)} chars) was saved to '{filepath}'. "
+                f"A truncated preview is shown above to protect your context window. Refer to the saved file or specific sections if needed.]"
+            )
+        else:
+            display_feedback = advice_text
+
+        # 7. Return the text back to the Brain's context window with hidden sentinel tags
+        result_msg = f"Adviser report successfully saved to disk as '{filename}'.\n\n--- ADVISER FEEDBACK ---\n{display_feedback}"
         if adviser_thinking:
             result_msg += f"\n<___ADVISER_THOUGHTS___>\n{adviser_thinking}\n</___ADVISER_THOUGHTS___>"
         result_msg += f"\n<___ADVISER_REPORT___>\n{advice_text}\n</___ADVISER_REPORT___>"
@@ -995,6 +1005,7 @@ async def forge_and_register_plugin(
         {"role": "user", "content": f"Language Selection: {target_lang}\n{file_environmental_context}\n\n" + config.PROMPTS["coder_user"].format(objective=objective)}
     ]
     
+    last_validation_error = "Unknown error (validation failed without output)"
     for attempt in range(config.MAX_PLUGIN_RETRIES):
         try:
             api_args = coder_profile["api_params"].copy()
@@ -1058,15 +1069,27 @@ async def forge_and_register_plugin(
                 scratch_dir = "/app/workspace/sandbox/.check_rust"
                 os.makedirs(os.path.join(scratch_dir, "src"), exist_ok=True)
                 
-                # Pre-configures Cargo structure to support baseline mathematics and randomness utilities natively
-                cargo_toml_content = """[package]
+                # Parse optional crate dependencies from comments (e.g., // REQUIRES: serde_json = "1.0")
+                extra_deps = []
+                for line in code.splitlines()[:15]:
+                    stripped = line.strip()
+                    if stripped.startswith(("// REQUIRES:", "// CRATES:", "// DEPENDENCIES:")):
+                        raw_crates = stripped.split(":", 1)[1].strip()
+                        for c in raw_crates.split(","):
+                            c = c.strip()
+                            if c:
+                                extra_deps.append(c if "=" in c else f'{c} = "*"')
+                                
+                deps_lines = ['rand = "0.8"'] + extra_deps
+                deps_block = "\n".join(deps_lines) + "\n"
+                
+                cargo_toml_content = f"""[package]
 name = "check_rust"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rand = "0.8"
-"""
+{deps_block}"""
                 with open(os.path.join(scratch_dir, "Cargo.toml"), "w", encoding="utf-8") as f:
                     f.write(cargo_toml_content)
                     
@@ -1099,9 +1122,10 @@ rand = "0.8"
                 elif target_lang == "cpp":
                     run_hint = f"execute_bash('g++ -std=c++17 {file_path} -o {file_path}_bin && {file_path}_bin')"
                 elif target_lang == "rust":
+                    cargo_deps_escaped = deps_block.replace('"', '\\"').replace('\n', '\\n')
                     run_hint = (
                         f"execute_bash('mkdir -p /app/workspace/sandbox/{safe_name}_project/src && "
-                        f"printf \"[package]\\nname = \\\"{safe_name}\\\"\\nversion = \\\"0.1.0\\\"\\nedition = \\\"2021\\\"\\n\\n[dependencies]\\nrand = \\\"0.8\\\"\\n\" > /app/workspace/sandbox/{safe_name}_project/Cargo.toml && "
+                        f"printf \"[package]\\nname = \\\"{safe_name}\\\"\\nversion = \\\"0.1.0\\\"\\nedition = \\\"2021\\\"\\n\\n[dependencies]\\n{cargo_deps_escaped}\" > /app/workspace/sandbox/{safe_name}_project/Cargo.toml && "
                         f"cp {file_path} /app/workspace/sandbox/{safe_name}_project/src/main.rs && "
                         f"cd /app/workspace/sandbox/{safe_name}_project && cargo run')"
                     )
@@ -1111,6 +1135,7 @@ rand = "0.8"
                 if coder_thinking: report += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
                 return report
             else:
+                last_validation_error = err_msg.strip() if err_msg else "Syntax validation failed"
                 if os.path.exists(file_path): os.remove(file_path)
                 messages.append({"role": "assistant", "content": code})
                 messages.append({"role": "user", "content": f"Code validation failed. Error:\n{err_msg}\nPlease patch the syntax rules and return the raw block."})
@@ -1118,7 +1143,7 @@ rand = "0.8"
         except Exception as e:
             return f"Fatal Forging Exception on attempt {attempt+1}: {str(e)}"
             
-    return f"FAILED: Coder could not validate artifact constraints after {config.MAX_PLUGIN_RETRIES} runs."
+    return f"FAILED: Coder could not validate artifact constraints after {config.MAX_PLUGIN_RETRIES} runs.\nLast Validation Error:\n{last_validation_error}"
 
 
 @mcp.tool()
@@ -1654,12 +1679,28 @@ async def fetch_webpage(url: str) -> str:
             
             # Use BeautifulSoup to aggressively strip out layout garbage
             soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Extract scholarly and document metadata before decomposing tags
+            scholarly_meta = []
+            for meta_tag in soup.find_all('meta'):
+                name = meta_tag.get('name', '').lower()
+                prop = meta_tag.get('property', '').lower()
+                content = meta_tag.get('content', '').strip()
+                if content and (name.startswith('citation_') or name.startswith('dc.') or prop.startswith('og:') or name == 'description'):
+                    meta_key = name if name else prop
+                    scholarly_meta.append(f"{meta_key}: {content}")
+
             for tag in soup(['script', 'style', 'nav', 'footer', 'aside', 'header', 'meta', 'noscript', 'svg']):
                 tag.decompose()
                 
             # Extract just the readable text
             text = soup.get_text(separator='\n\n')
             
+            # Prepend extracted metadata if present
+            if scholarly_meta:
+                meta_block = "--- SCHOLARLY / PAGE METADATA ---\n" + "\n".join(scholarly_meta[:25]) + "\n\n"
+                text = meta_block + text
+
             # Clean up excessive newlines to protect the context window
             clean_text = re.sub(r'\n\s*\n', '\n\n', text).strip()
             
@@ -1798,6 +1839,7 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
         # Call the Analyst Model
         response = await analyst_client.chat.completions.create(**api_args)
         analyst_thinking, raw_analyst_content = extract_thinking_and_content(response.choices[0].message)
+        finish_reason = getattr(response.choices[0], 'finish_reason', None) if response.choices else None
         
         # Log token usage
         tokens_in = response.usage.prompt_tokens if response.usage else 0
@@ -1824,6 +1866,8 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
             
         file_list = ", ".join([os.path.basename(f) for f in filepaths])
         combined_text = f"--- EXECUTIVE SUMMARY ---\n{ex_summ}\n\n--- DETAILED REPORT ---\n{full_rep}"
+        if finish_reason == "length":
+            combined_text += "\n\n[SYSTEM NOTICE: Analyst generation was cut short because it reached the max_tokens limit. Consider requesting a more concise format or auditing specific sections.]"
         
         # --- 3. AUTO-SAVE THE FULL COMBINED REPORT (pure report output) ---
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1918,13 +1962,10 @@ async def commission_architect(skill_name: str, objective: str, brain_notes: str
         config.log_token_usage(STATE_DIR, "architect", tokens_in, tokens_out, thinking_tokens)
         
         clean_skill_md = formatted_skill_md.strip()
-        if "```" in clean_skill_md:
-            match = re.search(r"```(?:markdown)?\s*\n(.*?)\n```", clean_skill_md, re.DOTALL)
-            if match:
-                clean_skill_md = match.group(1).strip()
-            else:
-                clean_skill_md = re.sub(r"^```(?:markdown)?\s*\n?", "", clean_skill_md)
-                clean_skill_md = re.sub(r"\n?```\s*$", "", clean_skill_md).strip()
+        # Only unwrap if the entire output was enclosed in top-level markdown fences
+        if clean_skill_md.startswith("```"):
+            clean_skill_md = re.sub(r"^```(?:markdown|md)?\s*\r?\n", "", clean_skill_md)
+            clean_skill_md = re.sub(r"\r?\n```\s*$", "", clean_skill_md).strip()
 
         skill_dir = f"/app/workspace/skills/{safe_name}"
         os.makedirs(skill_dir, exist_ok=True)
