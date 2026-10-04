@@ -419,6 +419,7 @@ async def run_chat():
                     "--shm-size=2g",          # Provides ample shared memory for Chromium & heavy compilers
                     "--pids-limit=1000",      # Neutralizes bash fork bombs
                     "--userns=keep-id",
+                    "--tz=local",             # Synchronizes container logs and file timestamps with host clock
                     "--device=nvidia.com/gpu=all", # GPU Passthrough!
 #                    "--storage-opt", "size=10G", # Limits the container's scratch space, does not work on WSL2
                     "--env", "PYTHONSAFEPATH=1",

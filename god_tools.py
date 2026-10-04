@@ -61,14 +61,16 @@ mcp = FastMCP("TheForge")
 # --- MCP STREAM PROTECTION & LOGGING ---
 # Suppress stdout logging to protect FastMCP, but route logs to a file for debugging
 log_file_path = "/app/workspace/logs/container_debug.log"
+os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
 
 logging.basicConfig(
     filename=log_file_path,
-    level=logging.WARNING, # Change to logging.INFO if you want maximum detail
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 # Forcefully clear any existing console handlers that might corrupt the JSON-RPC stream
 logging.getLogger().handlers = [h for h in logging.getLogger().handlers if isinstance(h, logging.FileHandler)]
+logger = logging.getLogger("ForgeContainer")
 
 
 WORKSPACE_DIR = "/app/workspace"
@@ -514,10 +516,16 @@ async def execute_bash(command: str, timeout_seconds: int = 60) -> str:
             except Exception:
                 pass
                 
+            logger.error(f"[execute_bash] Command timed out after {timeout_seconds}s: {command[:200]}")
             return f"SYSTEM ERROR: Command timed out after {timeout_seconds} seconds and was forcefully terminated."
 
         # Decode the byte stream safely
         output = stdout_data.decode('utf-8', errors='replace') if stdout_data else ""
+
+        if process.returncode != 0:
+            logger.warning(f"[execute_bash] Non-zero exit ({process.returncode}) for: {command[:200]} | output: {output[:300]}")
+        else:
+            logger.info(f"[execute_bash] Success (exit 0): {command[:200]}")
 
         # --- THE POINTER APPROACH (Context Protection) ---
         if len(output) > 10000:
@@ -541,6 +549,7 @@ async def execute_bash(command: str, timeout_seconds: int = 60) -> str:
         return f"Exit Code: {process.returncode}\nOutput:\n{output}"
         
     except Exception as e:
+        logger.error(f"[execute_bash] Exception on '{command[:200]}': {str(e)}")
         return f"Error executing command: {str(e)}"
         
 
@@ -1130,19 +1139,23 @@ edition = "2021"
                         f"cd /app/workspace/sandbox/{safe_name}_project && cargo run')"
                     )
 
+                logger.info(f"[forge_and_register_plugin] Successfully registered '{plugin_name}' ({target_lang}) on attempt {attempt+1}")
                 report = f"SUCCESS (Attempt {attempt+1}): {language.upper()} Asset '{plugin_name}' saved to registry.\n"
                 report += f"[Tokens: {tokens_in} in | {tokens_out} out]\n{deps_report}Execution Blueprint: {run_hint}\n\n<___CODER_CODE___>\n{code}\n</___CODER_CODE___>"
                 if coder_thinking: report += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
                 return report
             else:
                 last_validation_error = err_msg.strip() if err_msg else "Syntax validation failed"
+                logger.warning(f"[forge_and_register_plugin] Attempt {attempt+1} validation failed for '{plugin_name}': {last_validation_error[:200]}")
                 if os.path.exists(file_path): os.remove(file_path)
                 messages.append({"role": "assistant", "content": code})
                 messages.append({"role": "user", "content": f"Code validation failed. Error:\n{err_msg}\nPlease patch the syntax rules and return the raw block."})
                 
         except Exception as e:
+            logger.error(f"[forge_and_register_plugin] Exception on attempt {attempt+1} for '{plugin_name}': {str(e)}")
             return f"Fatal Forging Exception on attempt {attempt+1}: {str(e)}"
             
+    logger.error(f"[forge_and_register_plugin] Forging failed after {config.MAX_PLUGIN_RETRIES} attempts for '{plugin_name}': {last_validation_error[:200]}")
     return f"FAILED: Coder could not validate artifact constraints after {config.MAX_PLUGIN_RETRIES} runs.\nLast Validation Error:\n{last_validation_error}"
 
 
@@ -1267,6 +1280,7 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
             try:
                 compile(updated_code, filepath, 'exec')
             except SyntaxError as e:
+                logger.error(f"[surgical_code_edit] Python syntax error in '{filepath}' on line {e.lineno}: {e.msg}")
                 return f"SYSTEM ERROR: Surgical edit aborted because it introduces a Python syntax error on line {e.lineno}: {e.msg}. File on disk was NOT modified."
 
         # Archive backup snapshot
@@ -1280,14 +1294,19 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(updated_code)
 
+        logger.info(f"[surgical_code_edit] Successfully applied {len(edits_list)} edit(s) to '{filepath}'")
+
         # Dynamic Git Commit Tracking Checkpoint
         if os.path.exists("/app/workspace/.git"):
             try:
                 proc_add = await asyncio.create_subprocess_exec("git", "add", filepath, cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 await proc_add.communicate()
-                clean_obj = re.sub(r'[\r\n\x00-\x1f]+', ' ', edit_objective).strip()[:40]
-                proc_commit = await asyncio.create_subprocess_exec("git", "commit", "-m", f"feat(coder): surgical patch applied ({len(edits_list)} edits) for {clean_obj}", cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                await proc_commit.communicate()
+                proc_diff = await asyncio.create_subprocess_exec("git", "diff", "--cached", "--quiet", cwd=WORKSPACE_DIR)
+                diff_rc = await proc_diff.wait()
+                if diff_rc != 0:
+                    clean_obj = re.sub(r'[\r\n\x00-\x1f]+', ' ', edit_objective).strip()[:40]
+                    proc_commit = await asyncio.create_subprocess_exec("git", "commit", "-m", f"feat(coder): surgical patch applied ({len(edits_list)} edits) for {clean_obj}", cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                    await proc_commit.communicate()
             except Exception:
                 pass
 
@@ -1310,6 +1329,7 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
         return res
 
     except Exception as e:
+        logger.error(f"[surgical_code_edit] Exception on '{filepath}': {str(e)}")
         return f"SYSTEM ERROR: Surgical Coder sequence aborted. Error: {str(e)}"
 
 db_tool_desc = f"""Executes a SQL query against a specified SQLite database.
@@ -1429,9 +1449,11 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, sea
                     result_str += warning_msg
                     
         conn.commit()
+        logger.info(f"[query_sqlite_db] Success on '{os.path.basename(db_path)}' ({query[:80].strip()})")
         return result_str
 
     except Exception as e:
+        logger.error(f"[query_sqlite_db] Error on '{os.path.basename(db_path)}': {str(e)}")
         return f"SYSTEM ERROR: Database Exception: {str(e)}"
     finally:
         if conn:
@@ -1845,9 +1867,12 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
             sys.stderr.write(f"\n\033[93m[System: Analyst payload is ~{payload_tokens} estimated tokens]\033[0m\n")
 
         # Call the Analyst Model
+        logger.info(f"[analyze_files] Delegating analysis of {[os.path.basename(f) for f in filepaths]}")
         response = await analyst_client.chat.completions.create(**api_args)
         analyst_thinking, raw_analyst_content = extract_thinking_and_content(response.choices[0].message)
         finish_reason = getattr(response.choices[0], 'finish_reason', None) if response.choices else None
+        if finish_reason == "length":
+            logger.warning(f"[analyze_files] Analyst generation was truncated by max_tokens limit")
         
         # Log token usage
         tokens_in = response.usage.prompt_tokens if response.usage else 0
@@ -1901,6 +1926,7 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
         return result_msg
 
     except Exception as e:
+        logger.error(f"[analyze_files] Failed to process files: {str(e)}")
         return f"Analyst failed to process files. Error: {str(e)}"
         
 @mcp.tool()
