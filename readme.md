@@ -267,6 +267,9 @@ Open a terminal on your host machine (outside the sandbox) and initialize a dedi
 Create a `config.yaml` file in that folder to map your models to their actual endpoints (Ollama, vLLM, a remote HPC cluster) and pull your real API keys from the host's environment variables. 
 Example (includes option to remove unsupported flags):
 
+    general_settings:
+      master_key: sk-sandbox-fake-key  # Zero-Trust sandbox key matching llm_config.py
+
     litellm_settings:
       drop_params: true  # Strips unsupported model parameters dynamically
     model_list:

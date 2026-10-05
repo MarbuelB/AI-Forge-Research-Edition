@@ -596,6 +596,9 @@ EOF
         fi
 
         cat <<EOF > config.yaml
+general_settings:
+  master_key: sk-sandbox-fake-key  # Zero-Trust sandbox key matching llm_config.py
+
 litellm_settings:
   drop_params: true  # Strips unsupported model parameters dynamically
 
