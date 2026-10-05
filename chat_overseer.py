@@ -10,6 +10,7 @@ import logging
 import argparse
 import sys
 import atexit
+import shutil
 from datetime import datetime
 from openai import AsyncOpenAI
 import tiktoken
@@ -444,13 +445,26 @@ async def run_chat():
             if cli_args.analyst is not None: god_tools_cmd += f" --analyst {cli_args.analyst}"
             if cli_args.architect is not None: god_tools_cmd += f" --architect {cli_args.architect}"
                     
-            server_params = StdioServerParameters(
-                command="podman",
-                args=[
-                    "--log-level=error",
-                    "run", "-i", "--rm",
-                    "--init",
-                    f"--name={active_container_name}", # True unique identifier
+            # Check if an init binary (catatonit / tini) is present on the host
+            has_init = (
+                shutil.which("catatonit") is not None
+                or shutil.which("tini") is not None
+                or any(os.path.exists(p) for p in [
+                    "/usr/bin/catatonit", "/usr/libexec/podman/catatonit",
+                    "/usr/lib/podman/catatonit", "/usr/local/bin/catatonit"
+                ])
+            )
+            podman_args = [
+                "--log-level=error",
+                "run", "-i", "--rm",
+            ]
+            if has_init:
+                podman_args.append("--init")
+            elif config.VERBOSITY_MODE != "silent":
+                sys.stderr.write("\033[93m[SYSTEM NOTICE: 'catatonit' init binary not found on host; running container without --init. Install with: sudo apt install -y catatonit]\033[0m\n")
+
+            podman_args.extend([
+                f"--name={active_container_name}", # True unique identifier
                     "--network=slirp4netns:allow_host_loopback=false", # networking mode built specifically for rootless Podman
                     "--add-host=host.containers.internal:host-gateway",
                     # Core Security Protections
@@ -527,8 +541,12 @@ async def run_chat():
                     # 7. Start the MCP server safely
                     cd /app/workspace
                     {god_tools_cmd}
-                    """                   
-                ]
+                    """
+            ])
+
+            server_params = StdioServerParameters(
+                command="podman",
+                args=podman_args
             )
             
             async with stdio_client(server_params) as (read, write):

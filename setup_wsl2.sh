@@ -190,7 +190,7 @@ run_diagnostics() {
     echo -e "SubGID [${TARGET_USER}]:     $($u_subgid && echo -e "${GREEN}Configured in /etc/subgid${RESET}" || echo -e "${RED}Missing in /etc/subgid${RESET}")"
 
     # 4. Core System Packages
-    for pkg in podman passt slirp4netns newuidmap curl git jq; do
+    for pkg in podman catatonit passt slirp4netns newuidmap curl git jq; do
         if command -v "$pkg" &>/dev/null; then
             echo -e "Package [${pkg}]:       ${GREEN}Installed${RESET} ($(command -v "$pkg"))"
         else
@@ -277,10 +277,12 @@ run_phase1_system() {
             echo -e "You can choose your setup mode:"
             echo -e "  [1] Create a dedicated restricted '${GREEN}agent${RESET}' user (Recommended for maximum sandbox security)"
             echo -e "  [2] Install AI-Forge for your existing account ('${CYAN}${CALLING_USER}${RESET}')"
-            if prompt_yn "Create and use dedicated 'agent' user?" "Y"; then
-                TARGET_USER="agent"
-            else
+            local setup_mode="1"
+            prompt_input "Select setup mode [1 or 2]" "1" setup_mode
+            if [ "$setup_mode" = "2" ]; then
                 TARGET_USER="$CALLING_USER"
+            else
+                TARGET_USER="agent"
             fi
         else
             TARGET_USER="agent"
@@ -292,11 +294,12 @@ run_phase1_system() {
     log_info "Updating apt package index..."
     apt-get update -y
 
-    log_info "Installing core dependencies (podman, passt, slirp4netns, uidmap, git, curl, jq, build-essential)..."
+    log_info "Installing core dependencies (podman, catatonit, passt, slirp4netns, uidmap, git, curl, jq, build-essential)..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         curl \
         wget \
         podman \
+        catatonit \
         passt \
         slirp4netns \
         uidmap \
@@ -873,27 +876,20 @@ echo -e "${BOLD}${GREEN}========================================================
 echo ""
 echo -e "${BOLD}Next Steps:${RESET}"
 echo ""
-echo -e "  ${BOLD}1. Configure your LLM endpoints & API Keys:${RESET}"
-echo -e "     Edit the proxy configuration:"
-echo -e "       ${CYAN}nano ~/litellm_proxy/config.yaml${RESET}"
-echo -e "     Add your API keys to your environment (if using external providers):"
-echo -e "       ${CYAN}echo 'export OPENAI_API_KEY=\"your-key\"' >> ~/.bashrc${RESET}"
-echo ""
-echo -e "  ${BOLD}2. Start or verify the LiteLLM Proxy:${RESET}"
-echo -e "     (The proxy will automatically start when you open a new bash terminal)"
-echo -e "     To start it manually in the background right now:"
-echo -e "       ${CYAN}cd ~/litellm_proxy && nohup pixi run litellm --config config.yaml --port 4000 > proxy.log 2>&1 &${RESET}"
-echo ""
-echo -e "  ${BOLD}3. Launch the AI Overseer:${RESET}"
+echo -e "  ${BOLD}1. Launch the AI Overseer:${RESET}"
+echo -e "     (Your default LLM is already configured in ~/.bashrc and LiteLLM is running on port 4000)"
 echo -e "     Interactive Rich UI:"
 echo -e "       ${CYAN}cd $SCRIPT_DIR && pixi run python chat_overseer.py${RESET}"
 echo ""
 echo -e "     Run a single headless task and auto-exit:"
 echo -e "       ${CYAN}cd $SCRIPT_DIR && pixi run python chat_overseer.py -x -p \"Check environment and view tool registry\"${RESET}"
 echo ""
-echo -e "  ${BOLD}4. Swarm Dashboard (Multi-Agent Tmux Grid):${RESET}"
+echo -e "  ${BOLD}2. Swarm Dashboard (Multi-Agent Tmux Grid):${RESET}"
 echo -e "       ${CYAN}./start_tests_analysis_tmux_1${RESET}"
 echo ""
-echo -e "${BOLD}Diagnostics command anytime:${RESET}"
-echo -e "  ${CYAN}./setup_wsl2.sh --check${RESET}"
+echo -e "  ${BOLD}3. Managing Models & Diagnostics (Optional):${RESET}"
+echo -e "     Add additional LLM endpoints anytime:"
+echo -e "       ${CYAN}nano ~/litellm_proxy/config.yaml${RESET}"
+echo -e "     Run environment health check anytime:"
+echo -e "       ${CYAN}./setup_wsl2.sh --check${RESET}"
 echo -e "${BOLD}${GREEN}======================================================================${RESET}"

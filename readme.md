@@ -166,7 +166,7 @@ The Overseer natively decouples **Format** (how it looks) from **Verbosity** (ho
 
 To avoid manually running dozens of terminal commands and editing system files, use the included automated setup script [`setup_wsl2.sh`](file:///home/agent/ai_workspace/setup_wsl2.sh). It provisions any Debian/Ubuntu-based WSL2 environment from start to finish:
 
-1. **System Provisioning (Phase 1 / Root):** Installs system dependencies (`podman`, `passt`, `slirp4netns`, `uidmap`, `git`, `jq`, `build-essential`), probes for NVIDIA GPU and configures CDI device passthrough, automates rootless `/etc/subuid` and `/etc/subgid` allocations for the execution user (creating dedicated `agent` user only if Option A is selected), enables `loginctl` user lingering, and configures user isolation.
+1. **System Provisioning (Phase 1 / Root):** Installs system dependencies (`podman`, `catatonit`, `passt`, `slirp4netns`, `uidmap`, `git`, `jq`, `build-essential`), probes for NVIDIA GPU and configures CDI device passthrough, automates rootless `/etc/subuid` and `/etc/subgid` allocations for the execution user (creating dedicated `agent` user only if Option A is selected), enables `loginctl` user lingering, and configures user isolation.
 2. **User-Space Provisioning (Phase 2):** Installs Pixi (`~/.pixi/bin`), installs workspace dependencies via `pixi install`, interactively prompts for your primary LLM endpoint (Name/Alias, Base URL, API Key, Model Name), generates LiteLLM proxy configuration (`~/litellm_proxy/config.yaml`), exports environment variables to `~/.bashrc`, updates [`llm_config.py`](file:///home/agent/ai_workspace/llm_config.py), auto-starts the LiteLLM proxy on port 4000, builds the rootless `ai-forge` Podman container, and runs an automated sandbox verification self-test.
 
 ### WSL2 Prerequisites
@@ -222,8 +222,8 @@ If you prefer to configure your environment manually rather than using the autom
 ### Step 1: Install System Dependencies & GPU Drivers
 Your freshly installed Ubuntu instance needs a few core tools before we can begin. Log into your hardened WSL terminal and run the following commands to install Podman, Pixi, and the NVIDIA toolkit for GPU passthrough:
 
-    # Update the system and install Podman with rootless networking tools
-    sudo apt update && sudo apt install -y curl podman passt slirp4netns uidmap
+    # Update the system and install Podman with init and rootless networking tools
+    sudo apt update && sudo apt install -y curl podman catatonit passt slirp4netns uidmap
     
     # Add NVIDIA Container Toolkit repository and install (For GPU Passthrough)
     curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
