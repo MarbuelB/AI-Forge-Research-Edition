@@ -149,15 +149,8 @@ SESSION_DIR = os.path.abspath(f"./sessions/{active_session}")
 is_resuming = os.path.exists(SESSION_DIR)
 
 # Build the isolated folder structure
-os.makedirs(f"{SESSION_DIR}/logs", exist_ok=True)
-os.makedirs(f"{SESSION_DIR}/plugins", exist_ok=True)
-os.makedirs(f"{SESSION_DIR}/histories", exist_ok=True) 
-os.makedirs(f"{SESSION_DIR}/memories", exist_ok=True)
-os.makedirs(f"{SESSION_DIR}/state", exist_ok=True)
-os.makedirs(f"{SESSION_DIR}/sandbox", exist_ok=True)
-os.makedirs(f"{SESSION_DIR}/outputs", exist_ok=True)
-os.makedirs(f"{SESSION_DIR}/archive", exist_ok=True)
-os.makedirs(f"{SESSION_DIR}/skills", exist_ok=True)
+for folder in ["logs", "plugins", "histories", "memories", "state", "sandbox", "outputs", "archive", "skills"]:
+    os.makedirs(f"{SESSION_DIR}/{folder}", exist_ok=True)
 
 # Build the isolated folder structure for input/output folders
 os.makedirs(config.HOST_INPUT_DIR, exist_ok=True)

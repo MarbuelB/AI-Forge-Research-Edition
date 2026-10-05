@@ -8,8 +8,10 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     procps ripgrep tree bzip2 \
     && rm -rf /var/lib/apt/lists/*
 	
-# USER SETUP
-RUN useradd -m -s /bin/bash agent
+# USER SETUP: Remove default base image user (UID 1000) and establish agent with UID 1000
+RUN touch /var/mail/ubuntu /var/spool/mail/ubuntu 2>/dev/null || true \
+    && userdel -r ubuntu 2>/dev/null || true \
+    && useradd -u 1000 -m -s /bin/bash agent
 WORKDIR /app
 
 # Disable the FastMCP ASCII Banner ---
