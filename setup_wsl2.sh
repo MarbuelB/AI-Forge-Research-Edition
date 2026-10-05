@@ -543,11 +543,26 @@ EOF
     if [ "$prompt_user_for_llm" = true ]; then
         echo ""
         echo -e "${BOLD}Please enter your default LLM details:${RESET}"
-        prompt_input "  [1/4] Model Name / Alias (used in Overseer)" "default-llm" llm_name
-        prompt_input "  [2/4] Base URL (e.g. http://localhost:11434/v1, http://localhost:8000/v1, https://api.openai.com/v1)" "http://localhost:11434/v1" llm_base_url
+        prompt_input "  [1/4] Model Name (for Overseer / config, e.g. qwen3.8, default-llm)" "default-llm" llm_name
+        prompt_input "  [2/4] Base URL (e.g. http://localhost:11434/v1, https://your-platform/v1, https://api.openai.com/v1)" "http://localhost:11434/v1" llm_base_url
         prompt_input "  [3/4] API Key (enter dummy value like 'local-key' for local Ollama/vLLM)" "local-key" llm_api_key
-        prompt_input "  [4/4] Upstream Model Identifier (e.g. ollama/qwen2.5:latest, openai/gpt-4o, openai/Qwen/Qwen2.5-72B-Instruct)" "ollama/qwen2.5:latest" llm_model
+        prompt_input "  [4/4] Upstream Model for LiteLLM (with provider prefix, e.g. openai/qwen3.8, ollama/qwen2.5:latest)" "openai/qwen3.8" llm_model
         echo ""
+    fi
+
+    # Strip provider prefix for Overseer / llm_config.py if user typed one (e.g. 'openai/qwen3.8' -> 'qwen3.8')
+    local clean_model_name="${llm_name}"
+    clean_model_name="${clean_model_name#openai/}"
+    clean_model_name="${clean_model_name#openrouter/}"
+    clean_model_name="${clean_model_name#ollama/}"
+    clean_model_name="${clean_model_name#anthropic/}"
+    clean_model_name="${clean_model_name#gemini/}"
+
+    # Ensure LiteLLM upstream model identifier has a provider prefix
+    local litellm_upstream_model="${llm_model}"
+    if [[ "$litellm_upstream_model" != *"/"* ]]; then
+        # Default to 'openai/' prefix for OpenAI-compatible endpoints
+        litellm_upstream_model="openai/${litellm_upstream_model}"
     fi
 
     # Create/update LiteLLM config.yaml
@@ -564,23 +579,51 @@ EOF
     fi
 
     if [ "$write_yaml" = true ]; then
+        local default_alias_block=""
+        if [ "$clean_model_name" != "default-llm" ]; then
+            default_alias_block=$(cat <<EOF
+
+  - model_name: default-llm
+    litellm_params:
+      model: ${litellm_upstream_model}
+      api_base: os.environ/DEFAULT_LLM_BASE_URL
+      api_key: os.environ/DEFAULT_LLM_API_KEY
+EOF
+)
+        fi
+
         cat <<EOF > config.yaml
 litellm_settings:
   drop_params: true  # Strips unsupported model parameters dynamically
 
 model_list:
   # ============================================================================
-  # [1] Active Default Model (Configured during setup)
+  # [1] Active Default Model (Credentials safely stored in ~/.bashrc environment)
   # ============================================================================
-  - model_name: ${llm_name}
+  - model_name: ${clean_model_name}
     litellm_params:
-      model: ${llm_model}
-      api_base: ${llm_base_url}
-      api_key: ${llm_api_key}
+      model: ${litellm_upstream_model}
+      # LiteLLM automatically pulls these from your ~/.bashrc exports!
+      api_base: os.environ/DEFAULT_LLM_BASE_URL
+      api_key: os.environ/DEFAULT_LLM_API_KEY${default_alias_block}
 
   # ============================================================================
-  # [2] Examples: Add additional local or cloud models below as needed
+  # [2] Examples: Add additional local, remote cluster, or cloud models
   # ============================================================================
+  # - model_name: Qwen3.8-Flash-Next-FP8
+  #   litellm_params:
+  #     model: openai/Qwen3.8-Flash-Next-FP8
+  #     # LiteLLM automatically pulls these from your ~/.bashrc exports!
+  #     api_base: os.environ/LLM_PLATFORM_API_BASE
+  #     api_key: os.environ/LLM_PLATFORM_API_KEY
+  #
+  # - model_name: google/gemini-3.5-flash
+  #   litellm_params:
+  #     model: openai/google/gemini-3.5-flash
+  #     # LiteLLM automatically pulls these from your ~/.bashrc exports!
+  #     api_base: os.environ/OPENROUTER_API_BASE
+  #     api_key: os.environ/OPENROUTER_API_KEY
+  #
   # - model_name: gpt-4o
   #   litellm_params:
   #     model: openai/gpt-4o
@@ -590,18 +633,8 @@ model_list:
   #   litellm_params:
   #     model: anthropic/claude-3-7-sonnet-20250219
   #     api_key: os.environ/ANTHROPIC_API_KEY
-  #
-  # - model_name: gemini-2.5-pro
-  #   litellm_params:
-  #     model: gemini/gemini-2.5-pro
-  #     api_key: os.environ/GEMINI_API_KEY
-  #
-  # - model_name: openrouter/deepseek-r1
-  #   litellm_params:
-  #     model: openrouter/deepseek/deepseek-r1
-  #     api_key: os.environ/OPENROUTER_API_KEY
 EOF
-        log_done "Generated $PROXY_DIR/config.yaml with default model '${llm_name}'."
+        log_done "Generated $PROXY_DIR/config.yaml with default model '${clean_model_name}' (upstream: '${litellm_upstream_model}')."
     fi
 
     # Export LLM environment variables in ~/.bashrc
@@ -612,21 +645,21 @@ EOF
 # ==========================================
 # AI-FORGE DEFAULT LLM CONFIGURATION
 # ==========================================
-export DEFAULT_LLM_NAME="${llm_name}"
+export DEFAULT_LLM_NAME="${clean_model_name}"
 export DEFAULT_LLM_BASE_URL="${llm_base_url}"
 export DEFAULT_LLM_API_KEY="${llm_api_key}"
-export DEFAULT_LLM_MODEL="${llm_model}"
+export DEFAULT_LLM_MODEL="${litellm_upstream_model}"
 EOF
-        export DEFAULT_LLM_NAME="${llm_name}"
+        export DEFAULT_LLM_NAME="${clean_model_name}"
         export DEFAULT_LLM_BASE_URL="${llm_base_url}"
         export DEFAULT_LLM_API_KEY="${llm_api_key}"
-        export DEFAULT_LLM_MODEL="${llm_model}"
+        export DEFAULT_LLM_MODEL="${litellm_upstream_model}"
         log_done "Exported default LLM environment variables in ~/.bashrc."
     fi
 
-    # Update llm_config.py with this default LLM profile
+    # Update llm_config.py with this default LLM profile (clean name without provider prefix)
     log_step "Updating framework LLM configuration ($SCRIPT_DIR/llm_config.py)..."
-    python3 - "$SCRIPT_DIR/llm_config.py" "$llm_name" <<'PYEOF'
+    python3 - "$SCRIPT_DIR/llm_config.py" "$clean_model_name" <<'PYEOF'
 import sys, re
 
 config_path = sys.argv[1]

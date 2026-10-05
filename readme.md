@@ -268,22 +268,35 @@ Create a `config.yaml` file in that folder to map your models to their actual en
 Example (includes option to remove unsupported flags):
 
     litellm_settings:
-      drop_params: true
+      drop_params: true  # Strips unsupported model parameters dynamically
     model_list:
-      # [1] Local Model (Fast Brain / Coder)
-      - model_name: Qwen/Qwen3.6-35B-A3B-FP8
+      # [1] Active Default Model (Configured by setup_wsl2.sh)
+      - model_name: default-llm
         litellm_params:
-          model: openai/Qwen/Qwen3.6-35B-A3B-FP8
-          api_base: http://localhost:64100/v1
-          api_key: local-vllm-key # vLLM just needs a dummy string
-
-      # [2] Remote Model (Heavy Adviser / Strategist)
-      - model_name: qwen35-397b-a17b-fp8
-        litellm_params:
-          model: openai/qwen35-397b-a17b-fp8
+          model: ollama/qwen2.5:latest
           # LiteLLM automatically pulls these from your ~/.bashrc exports!
-          api_base: os.environ/LITELLM_API_BASE
-          api_key: os.environ/LITELLM_API_KEY
+          api_base: os.environ/DEFAULT_LLM_BASE_URL
+          api_key: os.environ/DEFAULT_LLM_API_KEY
+
+      # [2] Remote Model - SciCORE / Custom HPC Cluster
+      - model_name: Qwen3.8-Flash-Next-FP8
+        litellm_params:
+          model: openai/Qwen3.8-Flash-Next-FP8
+          # LiteLLM automatically pulls these from your ~/.bashrc exports!
+          api_base: os.environ/LLM_PLATFORM_API_BASE
+          api_key: os.environ/LLM_PLATFORM_API_KEY
+
+      # [3] OpenRouter - Gemini Flash 3.5
+      - model_name: google/gemini-3.5-flash
+        litellm_params:
+          model: openai/google/gemini-3.5-flash
+          # LiteLLM automatically pulls these from your ~/.bashrc exports!
+          api_base: os.environ/OPENROUTER_API_BASE
+          api_key: os.environ/OPENROUTER_API_KEY
+
+> **Note on Model Naming & Provider Prefixes:**
+> * In `config.yaml`, LiteLLM requires a provider routing prefix in `litellm_params.model` (e.g. `openai/qwen3.8`, `openai/Qwen3.8-Flash-Next-FP8`, `ollama/qwen2.5:latest`) so the proxy knows which API adapter to invoke.
+> * In `llm_config.py` (and framework CLI overrides), use only the clean model identifier matching LiteLLM's `model_name` (e.g. `"model": "qwen3.8"`), **without** the `openai/` prefix. The setup script handles this separation automatically.
 
 Run this in your standard WSL2 terminal:
 
@@ -291,8 +304,12 @@ Run this in your standard WSL2 terminal:
 
 Add your secret variables like this:
 
-    export LITELLM_API_KEY="<your-key>"
-    export LITELLM_API_BASE="<your-address>"
+    export DEFAULT_LLM_BASE_URL="http://localhost:11434/v1"
+    export DEFAULT_LLM_API_KEY="local-key"
+    export LLM_PLATFORM_API_BASE="https://your-hpc-endpoint/v1"
+    export LLM_PLATFORM_API_KEY="sk-platform-secret-key"
+    export OPENROUTER_API_BASE="https://openrouter.ai/api/v1"
+    export OPENROUTER_API_KEY="sk-or-v1-secret-key"
 
 Add this auto-start script to the bottom of the `.bashrc` file:
 
