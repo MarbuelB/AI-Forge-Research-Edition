@@ -477,6 +477,7 @@ async def run_chat():
                     
                     "-v", f"{SESSION_DIR}:/app/workspace:Z,nosuid,nodev",
                     "-v", f"{os.path.abspath('./config.py')}:/app/config.py:ro,Z",
+                    "-v", f"{os.path.abspath('./llm_config.py')}:/app/llm_config.py:ro,Z",
                     "-v", f"{os.path.abspath('./god_tools.py')}:/app/god_tools.py:ro,Z",
                     "-v", f"{os.path.abspath('./chat_overseer.py')}:/app/chat_overseer.py:ro,Z", # it can read own code
                     "-v", f"{config.HOST_INPUT_DIR}:/app/host_input:ro,Z,nosuid,nodev", # same for all sessions, read only

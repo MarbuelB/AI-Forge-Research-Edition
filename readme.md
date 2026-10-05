@@ -162,8 +162,20 @@ The Overseer natively decouples **Format** (how it looks) from **Verbosity** (ho
 
 To avoid manually running dozens of terminal commands and editing system files, use the included automated setup script [`setup_wsl2.sh`](file:///home/agent/ai_workspace/setup_wsl2.sh). It provisions any Debian/Ubuntu-based WSL2 environment from start to finish:
 
-1. **System Provisioning (Phase 1 / Root):** Installs system dependencies (`podman`, `slirp4netns`, `uidmap`, `git`, `jq`, `build-essential`), probes for NVIDIA GPU and configures CDI device passthrough, configures rootless `/etc/subuid` and `/etc/subgid` mappings, and configures user isolation.
-2. **User-Space Provisioning (Phase 2):** Installs Pixi (`~/.pixi/bin`), installs workspace dependencies via `pixi install`, provisions the Zero-Trust LiteLLM proxy in `~/litellm_proxy` with starter configuration templates and `~/.bashrc` auto-start, builds the rootless `ai-forge` Podman container, and runs an automated sandbox verification self-test.
+1. **System Provisioning (Phase 1 / Root):** Installs system dependencies (`podman`, `passt`, `slirp4netns`, `uidmap`, `git`, `jq`, `build-essential`), probes for NVIDIA GPU and configures CDI device passthrough, automates rootless `/etc/subuid` and `/etc/subgid` allocations for the execution user (creating dedicated `agent` user only if Option A is selected), enables `loginctl` user lingering, and configures user isolation.
+2. **User-Space Provisioning (Phase 2):** Installs Pixi (`~/.pixi/bin`), installs workspace dependencies via `pixi install`, interactively prompts for your primary LLM endpoint (Name/Alias, Base URL, API Key, Model Name), generates LiteLLM proxy configuration (`~/litellm_proxy/config.yaml`), exports environment variables to `~/.bashrc`, updates [`llm_config.py`](file:///home/agent/ai_workspace/llm_config.py), auto-starts the LiteLLM proxy on port 4000, builds the rootless `ai-forge` Podman container, and runs an automated sandbox verification self-test.
+
+### WSL2 Prerequisites
+* **WSL2 with systemd enabled (Required):** Rootless Podman, D-Bus session bus, and user cgroups require systemd. Verify or add to `/etc/wsl.conf`:
+  ```ini
+  [boot]
+  systemd=true
+  ```
+  > **Note:** If you modify `/etc/wsl.conf`, you must execute `wsl --shutdown` from Windows PowerShell or Command Prompt, then reopen your WSL2 distribution to activate systemd as PID 1.
+* **Script Execution Permissions:** Ensure the setup script is marked executable before running:
+  ```bash
+  chmod +x setup_wsl2.sh
+  ```
 
 ### Supported Setup Modes
 
@@ -179,15 +191,19 @@ Open your WSL2 terminal and run:
 git clone <repo-url> ai_workspace
 cd ai_workspace
 
+# Ensure script is executable
+chmod +x setup_wsl2.sh
+
 # Run the complete automated setup (prompts for setup mode)
-sudo ./setup_wsl2.sh
+sudo bash setup_wsl2.sh
+# (or: sudo ./setup_wsl2.sh)
 
 # Or install explicitly for your existing user account without modifying wsl.conf:
-sudo ./setup_wsl2.sh --user $(whoami)
+sudo bash setup_wsl2.sh --user $(whoami)
 ```
 
 ### Script Commands & Diagnostics:
-* `./setup_wsl2.sh --check`: Non-destructive diagnostics health check (reports live status for OS, WSL version, GPU/CDI, subuids, Pixi, Podman image, and LiteLLM proxy port 4000).
+* `./setup_wsl2.sh --check`: Non-destructive diagnostics health check (reports live status for OS, WSL version, systemd PID 1, GPU/CDI, subuids, packages, Pixi, Podman image, and LiteLLM proxy port 4000).
 * `./setup_wsl2.sh --user-only`: Runs only user-space setup as current user (Pixi, dependencies, LiteLLM, container build).
 * `./setup_wsl2.sh --build-image`: Rebuilds the rootless Podman sandbox container (`ai-forge`).
 * `sudo ./setup_wsl2.sh -y`: Unattended installation accepting default air-gapped settings.
@@ -202,7 +218,7 @@ If you prefer to configure your environment manually rather than using the autom
 Your freshly installed Ubuntu instance needs a few core tools before we can begin. Log into your hardened WSL terminal and run the following commands to install Podman, Pixi, and the NVIDIA toolkit for GPU passthrough:
 
     # Update the system and install Podman with rootless networking tools
-    sudo apt update && sudo apt install -y curl podman slirp4netns uidmap
+    sudo apt update && sudo apt install -y curl podman passt slirp4netns uidmap
     
     # Add NVIDIA Container Toolkit repository and install (For GPU Passthrough)
     curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
@@ -295,9 +311,10 @@ Then, reload your profile by running this in your standard WSL2 terminal:
 
 ### Step 5: Add the Project Files
 Save the core scripts into the root of your `ai_workspace` folder:
-1. `config.py` (Your settings, system prompts, folder paths, and Session ID).
-2. `god_tools.py` (The FastMCP server handling tool forging and execution).
-3. `chat_overseer.py` (The main interactive async loop).
+1. `llm_config.py` (LLM endpoints, model parameters, and role assignments).
+2. `config.py` (Core system prompts, memory limits, and runtime settings).
+3. `god_tools.py` (The FastMCP server handling tool forging and execution).
+4. `chat_overseer.py` (The main interactive async loop).
 
 ### Step 6: Build the Hardened Podman Container
 Create a file named `Containerfile` in your workspace root. Notice that it contains no secrets, environment variables, or python files. 

@@ -117,14 +117,36 @@ get_user_home() {
 
 PROXY_DIR="$(get_user_home "$TARGET_USER")/litellm_proxy"
 
+prompt_input() {
+    local prompt_msg="$1"
+    local default_ans="$2"
+    local var_name="$3"
+    if [ "$AUTO_CONFIRM" = true ]; then
+        eval "$var_name=\"\$default_ans\""
+        return 0
+    fi
+    local answer=""
+    if [ -t 0 ]; then
+        read -r -p "$prompt_msg [$default_ans]: " answer
+    elif [ -r /dev/tty ]; then
+        read -r -p "$prompt_msg [$default_ans]: " answer < /dev/tty
+    fi
+    answer="${answer:-$default_ans}"
+    eval "$var_name=\"\$answer\""
+}
+
 prompt_yn() {
     local prompt_msg="$1"
     local default_ans="$2"
     if [ "$AUTO_CONFIRM" = true ]; then
         return 0
     fi
-    local answer
-    read -r -p "$prompt_msg [$default_ans]: " answer
+    local answer=""
+    if [ -t 0 ]; then
+        read -r -p "$prompt_msg [$default_ans]: " answer
+    elif [ -r /dev/tty ]; then
+        read -r -p "$prompt_msg [$default_ans]: " answer < /dev/tty
+    fi
     answer="${answer:-$default_ans}"
     [[ "$answer" =~ ^[Yy]$ ]]
 }
@@ -143,26 +165,32 @@ run_diagnostics() {
     else
         echo -e "OS Distribution:     ${RED}Unknown${RESET}"
     fi
-    echo -e "WSL2 Detection:      $(grep -qi microsoft /proc/version 2>/dev/null && echo -e "${GREEN}Detected${RESET}" || echo -e "${YELLOW}Standard Linux (Not WSL2)${RESET}")"
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+        local is_systemd=false
+        [ "$(ps -p 1 -o comm= 2>/dev/null)" = "systemd" ] && is_systemd=true
+        echo -e "WSL2 Detection:      ${GREEN}Detected${RESET} (systemd: $($is_systemd && echo -e "${GREEN}Active (PID 1)${RESET}" || echo -e "${YELLOW}Inactive - add [boot] systemd=true in /etc/wsl.conf and run 'wsl --shutdown'${RESET}"))"
+    else
+        echo -e "WSL2 Detection:      ${YELLOW}Standard Linux (Not WSL2)${RESET}"
+    fi
 
-    # 2. User & Sudo
+    # 2. Target Execution User
     echo -e "Current User:        ${CYAN}$(whoami)${RESET} (UID: $(id -u))"
     if id "$TARGET_USER" &>/dev/null; then
-        echo -e "Agent User:          ${GREEN}Configured${RESET} ($(id -u "$TARGET_USER"))"
+        echo -e "Execution User:      ${GREEN}Configured ('$TARGET_USER' UID: $(id -u "$TARGET_USER"))${RESET}"
     else
-        echo -e "Agent User:          ${RED}Missing ('$TARGET_USER' does not exist)${RESET}"
+        echo -e "Execution User:      ${RED}Missing ('$TARGET_USER' does not exist)${RESET}"
     fi
 
     # 3. Subuid / Subgid
-    local has_subuid=false
-    local has_subgid=false
-    grep -q "^${TARGET_USER}:" /etc/subuid 2>/dev/null && has_subuid=true || true
-    grep -q "^${TARGET_USER}:" /etc/subgid 2>/dev/null && has_subgid=true || true
-    echo -e "Rootless SubUID:     $($has_subuid && echo -e "${GREEN}Configured${RESET}" || echo -e "${RED}Missing in /etc/subuid${RESET}")"
-    echo -e "Rootless SubGID:     $($has_subgid && echo -e "${GREEN}Configured${RESET}" || echo -e "${RED}Missing in /etc/subgid${RESET}")"
+    local u_subuid=false
+    local u_subgid=false
+    grep -q "^${TARGET_USER}:" /etc/subuid 2>/dev/null && u_subuid=true || true
+    grep -q "^${TARGET_USER}:" /etc/subgid 2>/dev/null && u_subgid=true || true
+    echo -e "SubUID [${TARGET_USER}]:     $($u_subuid && echo -e "${GREEN}Configured in /etc/subuid${RESET}" || echo -e "${RED}Missing in /etc/subuid${RESET}")"
+    echo -e "SubGID [${TARGET_USER}]:     $($u_subgid && echo -e "${GREEN}Configured in /etc/subgid${RESET}" || echo -e "${RED}Missing in /etc/subgid${RESET}")"
 
     # 4. Core System Packages
-    for pkg in podman slirp4netns newuidmap curl git jq; do
+    for pkg in podman passt slirp4netns newuidmap curl git jq; do
         if command -v "$pkg" &>/dev/null; then
             echo -e "Package [${pkg}]:       ${GREEN}Installed${RESET} ($(command -v "$pkg"))"
         else
@@ -264,11 +292,12 @@ run_phase1_system() {
     log_info "Updating apt package index..."
     apt-get update -y
 
-    log_info "Installing core dependencies (podman, slirp4netns, uidmap, git, curl, jq, build-essential)..."
+    log_info "Installing core dependencies (podman, passt, slirp4netns, uidmap, git, curl, jq, build-essential)..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         curl \
         wget \
         podman \
+        passt \
         slirp4netns \
         uidmap \
         git \
@@ -306,65 +335,84 @@ run_phase1_system() {
         log_info "No NVIDIA GPU detected; skipping NVIDIA Container Toolkit (CPU mode ready)."
     fi
 
-    # 3. Create non-privileged agent user
-    log_step "Configuring restricted non-root '${TARGET_USER}' user..."
-    if ! id "$TARGET_USER" &>/dev/null; then
+    # 3. Configure target execution user
+    log_step "Configuring execution user '${TARGET_USER}'..."
+    if ! id -u "$TARGET_USER" &>/dev/null; then
         useradd -m -s /bin/bash "$TARGET_USER"
-        log_done "Created user '${TARGET_USER}'."
+        log_done "Created execution user '${TARGET_USER}'."
     else
-        log_info "User '${TARGET_USER}' already exists."
+        log_info "Execution user '${TARGET_USER}' already exists."
     fi
 
     # 4. Configure subuid and subgid for rootless Podman
-    log_info "Verifying rootless Podman subuid/subgid mapping..."
+    log_info "Configuring rootless Podman subuid and subgid mappings for ${TARGET_USER}..."
+    local subuid_start=100000
+    [ "$TARGET_USER" = "agent" ] && subuid_start=200000
+    local subuid_end=$((subuid_start + 65535))
+
     if ! grep -q "^${TARGET_USER}:" /etc/subuid 2>/dev/null; then
-        # Find next available UID range
-        local next_subuid=165536
-        if [ -s /etc/subuid ]; then
-            local max_subuid
-            max_subuid=$(awk -F: '{print $2+$3}' /etc/subuid | sort -nr | head -n1)
-            [ -n "$max_subuid" ] && next_subuid="$max_subuid"
-        fi
-        echo "${TARGET_USER}:${next_subuid}:65536" >> /etc/subuid
-        log_done "Added ${TARGET_USER} to /etc/subuid (${next_subuid}:65536)."
+        usermod --add-subuids "${subuid_start}-${subuid_end}" "$TARGET_USER" 2>/dev/null || echo "${TARGET_USER}:${subuid_start}:65536" >> /etc/subuid
+        log_done "Provisioned subuids for ${TARGET_USER} (${subuid_start}-${subuid_end})."
     else
-        log_info "/etc/subuid already configured for ${TARGET_USER}."
+        log_info "Subuids already configured for ${TARGET_USER}."
     fi
 
     if ! grep -q "^${TARGET_USER}:" /etc/subgid 2>/dev/null; then
-        local next_subgid=165536
-        if [ -s /etc/subgid ]; then
-            local max_subgid
-            max_subgid=$(awk -F: '{print $2+$3}' /etc/subgid | sort -nr | head -n1)
-            [ -n "$max_subgid" ] && next_subgid="$max_subgid"
-        fi
-        echo "${TARGET_USER}:${next_subgid}:65536" >> /etc/subgid
-        log_done "Added ${TARGET_USER} to /etc/subgid (${next_subgid}:65536)."
+        usermod --add-subgids "${subuid_start}-${subuid_end}" "$TARGET_USER" 2>/dev/null || echo "${TARGET_USER}:${subuid_start}:65536" >> /etc/subgid
+        log_done "Provisioned subgids for ${TARGET_USER} (${subuid_start}-${subuid_end})."
     else
-        log_info "/etc/subgid already configured for ${TARGET_USER}."
+        log_info "Subgids already configured for ${TARGET_USER}."
     fi
 
-    # Enable lingering so user processes / Podman rootless daemons persist
+    # Enable lingering so user cgroups, D-Bus session, and rootless Podman daemons persist
     if command -v loginctl &>/dev/null; then
         loginctl enable-linger "$TARGET_USER" 2>/dev/null || true
+        log_done "Enabled user lingering for ${TARGET_USER} via loginctl."
     fi
 
-    # 5. WSL2 Hardening (/etc/wsl.conf)
+    # Register rootless system mappings
+    if command -v podman &>/dev/null; then
+        su - "${TARGET_USER}" -c "podman system migrate" 2>/dev/null || true
+    fi
+
+    # 5. WSL2 Systemd Configuration & Hardening (/etc/wsl.conf)
     if grep -qi microsoft /proc/version 2>/dev/null; then
+        log_step "Configuring WSL2 systemd and /etc/wsl.conf..."
+        local wsl_needs_shutdown=false
+
+        # Ensure [boot] section with systemd=true exists
+        if [ ! -f /etc/wsl.conf ] || ! grep -q "systemd\s*=\s*true" /etc/wsl.conf 2>/dev/null; then
+            mkdir -p /etc
+            if [ -f /etc/wsl.conf ]; then
+                cp /etc/wsl.conf "/etc/wsl.conf.bak.$(date +%Y%m%d%H%M%S)"
+            fi
+            if grep -q "^\[boot\]" /etc/wsl.conf 2>/dev/null; then
+                sed -i '/^\[boot\]/a systemd=true' /etc/wsl.conf
+            else
+                cat <<'EOF' >> /etc/wsl.conf
+
+[boot]
+systemd=true
+EOF
+            fi
+            wsl_needs_shutdown=true
+            log_done "Configured systemd=true in /etc/wsl.conf."
+        else
+            log_info "WSL2 systemd=true is already present in /etc/wsl.conf."
+        fi
+
+        # Optional hardening for dedicated agent user
         if [ "$TARGET_USER" = "agent" ]; then
-            log_step "WSL2 Configuration Hardening (/etc/wsl.conf)..."
             local apply_wsl=true
             if [ "$AUTO_CONFIRM" != true ]; then
-                if ! prompt_yn "Configure /etc/wsl.conf (default user: ${TARGET_USER}, disable automount/interop for security)?" "Y"; then
+                if ! prompt_yn "Configure /etc/wsl.conf for 'agent' (set default user: agent, disable automount/interop)?" "Y"; then
                     apply_wsl=false
                 fi
             fi
 
             if [ "$apply_wsl" = true ]; then
-                if [ -f /etc/wsl.conf ]; then
-                    cp /etc/wsl.conf "/etc/wsl.conf.bak.$(date +%Y%m%d%H%M%S)"
-                fi
-                cat <<EOF > /etc/wsl.conf
+                cat <<EOF >> /etc/wsl.conf
+
 [user]
 default=${TARGET_USER}
 
@@ -375,10 +423,24 @@ enabled = false
 enabled = false
 appendWindowsPath = false
 EOF
-                log_done "Wrote hardened /etc/wsl.conf (backup saved if previous file existed)."
+                wsl_needs_shutdown=true
+                log_done "Wrote security hardening to /etc/wsl.conf."
             fi
         else
-            log_info "Installing for standard account '${TARGET_USER}'. Skipping /etc/wsl.conf hardening to preserve your existing user login and Windows mounts."
+            log_info "Installing for standard account '${TARGET_USER}'. Skipping automount/interop hardening to preserve existing user login and Windows mounts."
+        fi
+
+        # Warn if systemd is not yet running as PID 1
+        if [ "$(ps -p 1 -o comm= 2>/dev/null)" != "systemd" ] || [ "$wsl_needs_shutdown" = true ]; then
+            echo ""
+            log_warn "*******************************************************************************"
+            log_warn "WSL2 systemd is configured in /etc/wsl.conf but is not currently active (PID 1)."
+            log_warn "Rootless Podman, D-Bus session buses, and user cgroups require systemd."
+            log_warn "Once this script finishes, you MUST execute in Windows PowerShell/CMD:"
+            log_warn "    wsl --shutdown"
+            log_warn "Then reopen your WSL2 terminal to activate systemd."
+            log_warn "*******************************************************************************"
+            echo ""
         fi
     fi
 
@@ -462,31 +524,68 @@ EOF
     "$PIXI_BIN" install
     "$PIXI_BIN" run pip install 'litellm[proxy]' 2>/dev/null || true
 
-    # Create template config.yaml if missing
-    if [ ! -f "config.yaml" ]; then
-        cat <<'EOF' > config.yaml
+    # 3b. Interactive Primary Default LLM Configuration
+    log_step "Configuring Default LLM Endpoint (Out-of-the-Box Setup)..."
+    echo -e "Configure your primary LLM endpoint so the framework is fully functional out of the box."
+
+    local llm_name="default-llm"
+    local llm_base_url="http://localhost:11434/v1"
+    local llm_api_key="local-key"
+    local llm_model="ollama/qwen2.5:latest"
+    local prompt_user_for_llm=true
+
+    if [ "$AUTO_CONFIRM" = true ]; then
+        prompt_user_for_llm=false
+    elif ! prompt_yn "Configure default LLM endpoint now?" "Y"; then
+        prompt_user_for_llm=false
+    fi
+
+    if [ "$prompt_user_for_llm" = true ]; then
+        echo ""
+        echo -e "${BOLD}Please enter your default LLM details:${RESET}"
+        prompt_input "  [1/4] Model Name / Alias (used in Overseer)" "default-llm" llm_name
+        prompt_input "  [2/4] Base URL (e.g. http://localhost:11434/v1, http://localhost:8000/v1, https://api.openai.com/v1)" "http://localhost:11434/v1" llm_base_url
+        prompt_input "  [3/4] API Key (enter dummy value like 'local-key' for local Ollama/vLLM)" "local-key" llm_api_key
+        prompt_input "  [4/4] Upstream Model Identifier (e.g. ollama/qwen2.5:latest, openai/gpt-4o, openai/Qwen/Qwen2.5-72B-Instruct)" "ollama/qwen2.5:latest" llm_model
+        echo ""
+    fi
+
+    # Create/update LiteLLM config.yaml
+    local write_yaml=true
+    if [ -f "config.yaml" ]; then
+        if [ "$prompt_user_for_llm" = true ]; then
+            if ! prompt_yn "config.yaml already exists. Overwrite with newly configured default model?" "Y"; then
+                write_yaml=false
+            fi
+        else
+            write_yaml=false
+            log_info "$PROXY_DIR/config.yaml already exists; keeping existing configuration."
+        fi
+    fi
+
+    if [ "$write_yaml" = true ]; then
+        cat <<EOF > config.yaml
 litellm_settings:
   drop_params: true  # Strips unsupported model parameters dynamically
 
 model_list:
   # ============================================================================
-  # [1] Local Model Examples (Ollama or vLLM running on host or remote machine)
+  # [1] Active Default Model (Configured during setup)
   # ============================================================================
-  - model_name: Qwen3.8-Flash-Next-FP8
+  - model_name: ${llm_name}
     litellm_params:
-      model: openai/Qwen3.8-Flash-Next-FP8
-      api_base: http://localhost:64100/v1/
-      api_key: local-vllm-key
-
-  - model_name: Qwen/Qwen3.8-27B-FP8
-    litellm_params:
-      model: openai/Qwen/Qwen3.8-27B-FP8
-      api_base: http://localhost:64100/v1/
-      api_key: local-vllm-key
+      model: ${llm_model}
+      api_base: ${llm_base_url}
+      api_key: ${llm_api_key}
 
   # ============================================================================
-  # [2] Cloud Model Examples (Requires setting your API keys in ~/.bashrc)
+  # [2] Examples: Add additional local or cloud models below as needed
   # ============================================================================
+  # - model_name: gpt-4o
+  #   litellm_params:
+  #     model: openai/gpt-4o
+  #     api_key: os.environ/OPENAI_API_KEY
+  #
   # - model_name: claude-3-7-sonnet
   #   litellm_params:
   #     model: anthropic/claude-3-7-sonnet-20250219
@@ -502,10 +601,96 @@ model_list:
   #     model: openrouter/deepseek/deepseek-r1
   #     api_key: os.environ/OPENROUTER_API_KEY
 EOF
-        log_done "Generated template $PROXY_DIR/config.yaml."
-    else
-        log_info "$PROXY_DIR/config.yaml already exists; keeping existing configuration."
+        log_done "Generated $PROXY_DIR/config.yaml with default model '${llm_name}'."
     fi
+
+    # Export LLM environment variables in ~/.bashrc
+    if [ -f "$USER_HOME/.bashrc" ]; then
+        sed -i '/# AI-FORGE DEFAULT LLM CONFIGURATION/,/export DEFAULT_LLM_MODEL=/d' "$USER_HOME/.bashrc" 2>/dev/null || true
+        cat <<EOF >> "$USER_HOME/.bashrc"
+
+# ==========================================
+# AI-FORGE DEFAULT LLM CONFIGURATION
+# ==========================================
+export DEFAULT_LLM_NAME="${llm_name}"
+export DEFAULT_LLM_BASE_URL="${llm_base_url}"
+export DEFAULT_LLM_API_KEY="${llm_api_key}"
+export DEFAULT_LLM_MODEL="${llm_model}"
+EOF
+        export DEFAULT_LLM_NAME="${llm_name}"
+        export DEFAULT_LLM_BASE_URL="${llm_base_url}"
+        export DEFAULT_LLM_API_KEY="${llm_api_key}"
+        export DEFAULT_LLM_MODEL="${llm_model}"
+        log_done "Exported default LLM environment variables in ~/.bashrc."
+    fi
+
+    # Update llm_config.py with this default LLM profile
+    log_step "Updating framework LLM configuration ($SCRIPT_DIR/llm_config.py)..."
+    python3 - "$SCRIPT_DIR/llm_config.py" "$llm_name" <<'PYEOF'
+import sys, re
+
+config_path = sys.argv[1]
+model_alias = sys.argv[2]
+
+try:
+    with open(config_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Point all active agent profiles to 0 (Host) and 1 (Container)
+    content = re.sub(r'ACTIVE_BRAIN_PROFILE\s*=\s*\d+', 'ACTIVE_BRAIN_PROFILE = 0', content)
+    content = re.sub(r'ACTIVE_CODER_PROFILE\s*=\s*\d+', 'ACTIVE_CODER_PROFILE = 1', content)
+    content = re.sub(r'ACTIVE_SUMMARIZER_PROFILE\s*=\s*\d+', 'ACTIVE_SUMMARIZER_PROFILE = 1', content)
+    content = re.sub(r'ACTIVE_ADVISER_PROFILE\s*=\s*\d+', 'ACTIVE_ADVISER_PROFILE = 1', content)
+    content = re.sub(r'ACTIVE_ANALYST_PROFILE\s*=\s*\d+', 'ACTIVE_ANALYST_PROFILE = 1', content)
+    content = re.sub(r'ACTIVE_ARCHITECT_PROFILE\s*=\s*\d+', 'ACTIVE_ARCHITECT_PROFILE = 1', content)
+
+    profile_marker = "# [0] Configured Default Model - WSL2 Host"
+    new_profiles = f"""    # [0] Configured Default Model - WSL2 Host
+    {{
+        "name": "{model_alias}",
+        "base_url": "http://localhost:4000/v1", 
+        "api_key": "sk-sandbox-fake-key",
+        "model": "{model_alias}",
+        "api_params": {{
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "timeout": 300.0,
+            "max_tokens": 16384,
+            "extra_body": {{
+                "chat_template_kwargs": {{"enable_thinking": True}}
+            }}
+        }}
+    }},
+    # [1] Configured Default Model - Podman Container
+    {{
+        "name": "{model_alias}",
+        "base_url": "http://host.containers.internal:4000/v1", 
+        "api_key": "sk-sandbox-fake-key",
+        "model": "{model_alias}",
+        "api_params": {{
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "timeout": 300.0,
+            "max_tokens": 16384,
+            "extra_body": {{
+                "chat_template_kwargs": {{"enable_thinking": True}}
+            }}
+        }}
+    }},
+"""
+
+    if profile_marker in content:
+        pattern = r"    # \[0\] Configured Default Model - WSL2 Host.*?    # \[1\] Configured Default Model - Podman Container.*?\n    \},\n"
+        content = re.sub(pattern, new_profiles, content, flags=re.DOTALL)
+    else:
+        content = content.replace("LLM_PROFILES = [\n", f"LLM_PROFILES = [\n{new_profiles}")
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write(content)
+except Exception as e:
+    print(f"Notice: llm_config.py profile update error: {e}", file=sys.stderr)
+PYEOF
+    log_done "Updated $SCRIPT_DIR/llm_config.py with active default profiles (0 & 1)."
 
     # LiteLLM Proxy Auto-Start helper in ~/.bashrc
     if [ -f "$USER_HOME/.bashrc" ] && ! grep -q "ZERO-TRUST AI PROXY AUTO-START" "$USER_HOME/.bashrc"; then
@@ -524,7 +709,43 @@ EOF
         log_done "Configured LiteLLM background auto-start in ~/.bashrc."
     fi
 
-    # 4. Build Rootless Podman Sandbox Container
+    # Start or restart LiteLLM Proxy in the background now so it's active immediately
+    log_step "Starting LiteLLM proxy in the background on port 4000..."
+    pkill -f "litellm.*--port 4000" 2>/dev/null || true
+    sleep 1
+    (cd "$PROXY_DIR" && nohup "$PIXI_BIN" run litellm --config config.yaml --port 4000 > proxy.log 2>&1 &) || true
+    sleep 2
+    if pgrep -f "litellm.*--port 4000" > /dev/null; then
+        log_done "LiteLLM Proxy is active and listening on port 4000."
+    else
+        log_info "LiteLLM proxy will start automatically on shell login (logs at $PROXY_DIR/proxy.log)."
+    fi
+
+    # 4. Ensure Rootless Podman Network Provider Fallback
+    mkdir -p "$USER_HOME/.config/containers"
+    local containers_conf="$USER_HOME/.config/containers/containers.conf"
+    if ! command -v pasta &>/dev/null; then
+        if [ ! -f "$containers_conf" ]; then
+            cat <<'EOF' > "$containers_conf"
+[network]
+default_rootless_network_cmd = "slirp4netns"
+EOF
+            log_info "Configured slirp4netns fallback in ~/.config/containers/containers.conf (pasta not found)."
+        elif ! grep -q "default_rootless_network_cmd" "$containers_conf" 2>/dev/null; then
+            if grep -q "^\[network\]" "$containers_conf" 2>/dev/null; then
+                sed -i '/^\[network\]/a default_rootless_network_cmd = "slirp4netns"' "$containers_conf"
+            else
+                cat <<'EOF' >> "$containers_conf"
+
+[network]
+default_rootless_network_cmd = "slirp4netns"
+EOF
+            fi
+            log_info "Added slirp4netns fallback to ~/.config/containers/containers.conf."
+        fi
+    fi
+
+    # 5. Build Rootless Podman Sandbox Container
     log_step "Building rootless Podman image '${IMAGE_NAME}' from Containerfile..."
     cd "$SCRIPT_DIR"
     if [ -f "Containerfile" ]; then
@@ -535,16 +756,16 @@ EOF
         exit 1
     fi
 
-    # 5. Pre-create required workspace folders
+    # 6. Pre-create required workspace folders
     log_step "Creating necessary session and IO folders..."
     mkdir -p "$SCRIPT_DIR/my_host_input"
     mkdir -p "$SCRIPT_DIR/sessions"
     mkdir -p "$SCRIPT_DIR/plugins"
     log_done "Folders initialized."
 
-    # 6. Self-Test / Verification
+    # 7. Self-Test / Verification
     log_step "Running sandbox container self-verification test..."
-    if podman run --rm "${IMAGE_NAME}" python -c "import fastmcp, sqlite_vec; print('Sandbox verification passed!')" 2>&1; then
+    if podman run --rm "${IMAGE_NAME}" pixi run python -c "import sys, fastmcp, sqlite_vec; print('Sandbox verification passed! Python:', sys.version)" 2>&1; then
         log_done "Rootless Podman sandbox self-test passed!"
     else
         log_warn "Sandbox verification test returned non-zero exit; please inspect Podman logs."
@@ -643,4 +864,3 @@ echo ""
 echo -e "${BOLD}Diagnostics command anytime:${RESET}"
 echo -e "  ${CYAN}./setup_wsl2.sh --check${RESET}"
 echo -e "${BOLD}${GREEN}======================================================================${RESET}"
-EOF
