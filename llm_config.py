@@ -20,12 +20,12 @@ Profiles can be addressed from:
 #   [6] Qwen 3.6 35B test (Container)
 #   [7] Gemini 3.5 Flash (Host)      | [8] Gemini 3.5 Flash (Container)
 #   [9] Laguna S 2.1 vLLM (Host)     | [10] Laguna S 2.1 vLLM (Container)
-ACTIVE_BRAIN_PROFILE = 0
-ACTIVE_CODER_PROFILE = 1  # must be reachable from Podman container
-ACTIVE_SUMMARIZER_PROFILE = 1  # can be the same as coder, or a cheaper fast model
-ACTIVE_ADVISER_PROFILE = 1
-ACTIVE_ANALYST_PROFILE = 1  # point this to your vision model
-ACTIVE_ARCHITECT_PROFILE = 1
+ACTIVE_BRAIN_PROFILE = 4
+ACTIVE_CODER_PROFILE = 5  # must be reachable from Podman container
+ACTIVE_SUMMARIZER_PROFILE = 5  # can be the same as coder, or a cheaper fast model
+ACTIVE_ADVISER_PROFILE = 5
+ACTIVE_ANALYST_PROFILE = 5  # point this to your vision model
+ACTIVE_ARCHITECT_PROFILE = 5
 
 # --- EMBEDDING CONFIGURATION ---
 # Hardcoded to prevent dimension mismatch in the vector database.

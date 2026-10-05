@@ -31,6 +31,9 @@ We must sever the default connections between WSL and your Windows host. Open th
     
 Paste the following configuration. This does three critical things: it sets `agent` as the default user, blocks WSL from automatically mounting your Windows hard drives (disabling `/mnt/c/`), and prevents WSL from executing Windows binaries (like `cmd.exe` or `powershell.exe`).
 
+    [boot]
+    systemd=true
+
     [user]
     default=agent
     
@@ -56,7 +59,7 @@ This project utilizes multiple distinct Large Language Models (LLMs) to maximize
 * **The Summarizer (The Memory Manager):** A background agent responsible for context compression using strict JSON schemas.
 * **The Adviser (The Strategist):** A slow, extremely heavy reasoning model (e.g., DeepSeek-R1, Qwen 397B). It is invoked exclusively when the Brain encounters critical bottlenecks or requires strategic redirection.
 * **The Analyst (The Eyes & Data Miner):** A specialized context-isolation and vision agent. When the Brain needs to read a massive 50,000-line error log, parse a raw data dump, or look at an image, it delegates the file to the Analyst. The Analyst processes the heavy payload and returns a highly concentrated summary, keeping the Brain's context window clean, fast, and immune to data-bloat.
-* **The Architect (The Methodologist & Skill Builder):** A specialized agent dedicated to Standard Operating Procedure (SOP) codification. When the Brain solves a novel or complex engineering task, it calls `commission_architect`. The Architect synthesizes the full workflow (prerequisites, setup commands, code patterns, edge cases, troubleshooting table, and verification checks) into a permanent, reusable `SKILL.md` file saved to `/skills/<skill_name>/`. The Brain dynamically loads and follows these skills via `load_skill`.
+* **The Architect (The Methodologist & Skill Builder):** A specialized agent dedicated to Standard Operating Procedure (SOP) codification. When the Brain solves a novel or complex engineering task, it calls `commission_architect`. The Architect synthesizes the full workflow (prerequisites, setup commands, code patterns, edge cases, troubleshooting table, and verification checks) into a permanent, reusable `SKILL.md` file saved to `/app/workspace/skills/<skill_name>/`. The Brain dynamically loads and follows these skills via `load_skill`.
 * **Universal Sub-Agents:** The Brain has the ability to dynamically spawn its own temporary LLM sub-agents to delegate isolated tasks, test prompt engineering, or request second opinions using custom temperature and parameters.
 * **Dynamic Payload Airlocks:** The framework utilizes a pre-flight token calculator (via `tiktoken`) for all sub-agent delegations. If the Brain attempts to send a 100,000-token log file to the Analyst or Adviser that exceeds 90% of their specific context window, the framework intercepts the request, blocks the API call, and bounces a `SYSTEM ERROR` back to the Brain instructing it to use `grep` or chunk the files first. This completely eliminates silent API truncation and OOM crashes.
 * **Pointer-Based Context Delegation (Pass-by-Reference):** To prevent the Overseer from running out of working memory, the system uses an architectural pattern where large codebaselines, historical logs, or environment files are never read directly into the main chat window. Instead, the Overseer passes absolute string paths via the `context_filepaths` parameter available across the `Coder`, `Adviser`, `Architect`, and `Universal LLM` sub-agents. The background tool engine processes the files ephemerally, shielding the main orchestration loop from context bloat and avoiding unexpected memory wipeouts.
@@ -74,7 +77,7 @@ LLMs occasionally make syntax errors when generating tools. The framework isolat
 To prevent overwhelming the AI with hundreds of tools and memories, knowledge is split into compact JSON indexes and detailed physical files:
 * **Tool Registry:** Plugins are categorized in `tool_registry.json`. The Brain navigates this in two steps: checking high-level categories, then diving into specific category descriptions to learn how to use its tools.
 * **Memory Registry:** Long-term facts and summaries are indexed in `memory_registry.json` with short descriptions and timestamps. The exhaustive details are saved as individual Markdown files (`.md`) in the `memories/` folder. The Brain can browse the lightweight index and only spend tokens to read the full file when explicitly needed.
-* **Skills Registry:** Standard operating procedures are organized under `/skills/<skill_name>/SKILL.md`. Available skills are dynamically cataloged in the Brain's prompt, and the Brain can load and follow them on demand via `load_skill` without bloating initial context.
+* **Skills Registry:** Standard operating procedures are organized under `/app/workspace/skills/<skill_name>/SKILL.md`. Available skills are dynamically cataloged in the Brain's prompt, and the Brain can load and follow them on demand via `load_skill` without bloating initial context.
 
 ### 4. Persistent Sessions & Isolated Environments
 Workspaces are strictly isolated. The system dynamically generates unique `Session_ID` folders. 
@@ -148,6 +151,7 @@ The Overseer natively decouples **Format** (how it looks) from **Verbosity** (ho
   * `/outputs`: The dedicated folder where the AI saves finished artifacts and generated files.
   * `/state`: Contains the critical JSON registries, the master plan, adviser reports, and the live `current_history.json` file.
   * `/plugins`: Where the generated Python scripts live.
+  * `/skills`: Where the Architect persists reusable SOP workflows (`SKILL.md`).
   * `/memories`: Where the detailed Markdown files live.
   * `/archive`: The dedicated "Soft-Delete" trash bin.
 * **Zero-Trust Architecture:** The container contains absolutely NO sensitive data, API keys, or `.env` files. The AI uses hardcoded dummy keys (e.g., `sk-sandbox-fake-key`) and routes all requests to a local `host.containers.internal` gateway. Authentication and routing are securely handled by a LiteLLM proxy running safely on the Windows/WSL host, making credential theft mathematically impossible.
@@ -204,7 +208,8 @@ sudo bash setup_wsl2.sh --user $(whoami)
 
 ### Script Commands & Diagnostics:
 * `./setup_wsl2.sh --check`: Non-destructive diagnostics health check (reports live status for OS, WSL version, systemd PID 1, GPU/CDI, subuids, packages, Pixi, Podman image, and LiteLLM proxy port 4000).
-* `./setup_wsl2.sh --user-only`: Runs only user-space setup as current user (Pixi, dependencies, LiteLLM, container build).
+* `sudo ./setup_wsl2.sh --system-only`: Runs only Phase 1 system provisioning (apt packages, GPU/CDI, subuids, user creation).
+* `./setup_wsl2.sh --user-only`: Runs only Phase 2 user-space setup as current user (Pixi, dependencies, LiteLLM wizard, container build).
 * `./setup_wsl2.sh --build-image`: Rebuilds the rootless Podman sandbox container (`ai-forge`).
 * `sudo ./setup_wsl2.sh -y`: Unattended installation accepting default air-gapped settings.
 
@@ -294,15 +299,11 @@ Add this auto-start script to the bottom of the `.bashrc` file:
     # ==========================================
     # ZERO-TRUST AI PROXY AUTO-START
     # ==========================================
-    # Check if the litellm proxy is already running
-    if ! pgrep -f "litellm --config config.yaml" > /dev/null; then
-        echo "🛡️ Starting Zero-Trust LiteLLM Proxy in the background..."
-        # Move to the proxy folder, start it silently, and drop the logs into proxy.log
-        cd ~/litellm_proxy
-        nohup pixi run litellm --config config.yaml --port 4000 > proxy.log 2>&1 &
-        
-        # Return to the home directory silently
-        cd ~
+    if [ -d "$HOME/litellm_proxy" ] && [ -f "$HOME/litellm_proxy/config.yaml" ]; then
+        if ! pgrep -f "litellm.*--port 4000" > /dev/null; then
+            echo "🛡️ Starting Zero-Trust LiteLLM Proxy on port 4000..."
+            (cd "$HOME/litellm_proxy" && nohup pixi run litellm --config config.yaml --port 4000 > proxy.log 2>&1 &)
+        fi
     fi
 
 Then, reload your profile by running this in your standard WSL2 terminal:
@@ -436,7 +437,9 @@ If the session grows too long, the system will inject a dynamic warning promptin
 ### 🐝 Swarm Mode (Parallel Execution)
 Because the framework strictly isolates state, memory, and Podman execution environments (dynamically generating container names via Session IDs and OS Process IDs), you can run multiple autonomous agents simultaneously on the same machine without them colliding.
 
-You can use `tmux` to launch a multi-agent swarm in a 2x2 split-pane dashboard. Paste this chained command into your terminal to boot 4 independent researchers at once:
+You can use `tmux` to launch a multi-agent swarm in a 2x2 split-pane dashboard. Pre-configured benchmark test scripts (`./start_tests_analysis_tmux_1` and `./start_tests_analysis_tmux_2`) are included in the repository root to boot a 4-agent parallel benchmark suite with automated post-task self-analysis.
+
+Alternatively, paste this chained command into your terminal to boot 4 independent researchers at once:
 
     tmux new-session -d -s forge_swarm \; \
       send-keys "pixi run python chat_overseer.py -f text -s 'Swarm_Text_1'" C-m \; \
