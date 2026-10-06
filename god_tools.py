@@ -311,7 +311,7 @@ async def consult_adviser(current_plan: str, encountered_problems: str, context_
     ]
     
     # --- DYNAMIC PAYLOAD CHECKER ---
-    max_context = adviser_profile.get("api_params", {}).get("max_tokens", 32768)
+    max_context = adviser_profile.get("context_window", adviser_profile.get("max_context_tokens", config.MAX_CONTEXT_TOKENS))
     safe_budget = int(max_context * 0.90)
     
     payload_tokens = get_payload_tokens(api_args["messages"])
@@ -682,8 +682,8 @@ async def compress_and_store_context() -> str:
     current_history = load_json(CURRENT_HISTORY_FILE)
     current_memories = load_json(MEMORY_REGISTRY_FILE)
     
-    # Look up max tokens for Summarizer
-    max_context = summarizer_profile.get("api_params", {}).get("max_tokens", 32768)
+    # Look up context window for Summarizer
+    max_context = summarizer_profile.get("context_window", summarizer_profile.get("max_context_tokens", config.MAX_CONTEXT_TOKENS))
     safe_budget = int(max_context * 0.85)
     
     # --- Safe string accumulator to prevent MCP stdio corruption ---
@@ -1880,8 +1880,8 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
         ]
         
         # --- DYNAMIC PAYLOAD CHECKER ---
-        # 1. Look up the max context limit for the Analyst profile (defaulting to 32k if missing)
-        max_context = analyst_profile.get("api_params", {}).get("max_tokens", 32768)
+        # 1. Look up the context limit for the Analyst profile
+        max_context = analyst_profile.get("context_window", analyst_profile.get("max_context_tokens", config.MAX_CONTEXT_TOKENS))
         safe_budget = int(max_context * 0.90) # Leave 10% for the response!
         
         # 2. Accurately measure what we are about to send

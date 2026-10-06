@@ -11,6 +11,7 @@ import argparse
 import sys
 import atexit
 import shutil
+import hashlib
 from datetime import datetime
 from openai import AsyncOpenAI
 import tiktoken
@@ -237,34 +238,47 @@ def save_history(messages):
     # 2. Atomically swap it
     os.replace(temp_path, CURRENT_HISTORY_FILE)
 
-def compact_historical_tool_outputs(messages, protect_recent: int = 20, max_head: int = 400, max_tail: int = 400):
+COMPACTION_MARKER = "characters of historical tool output compacted"
+
+def compact_historical_tool_outputs(messages, protect_recent: int = 20, max_head: int = 400, max_tail: int = 400, step: int = 10):
     """Ages older tool outputs in history (> protect_recent messages ago) to prevent quadratic context blowup.
     Preserves recent active turns at 100% full fidelity.
-    Retains the head and tail of older outputs so command context and exit status remain legible."""
+    Retains the head and tail of older outputs so command context and exit status remain legible.
+    Saves the full output to disk before compacting to guarantee zero data loss.
+    Advances the threshold in blocks of `step` messages so the history prefix cache is preserved."""
     if len(messages) <= protect_recent:
         return messages
     
-    threshold_idx = len(messages) - protect_recent
-    modified = False
+    threshold_idx = ((len(messages) - protect_recent) // step) * step
     new_messages = []
     
     for idx, msg in enumerate(messages):
         if idx < threshold_idx and msg.get("role") == "tool":
             content = str(msg.get("content", ""))
             min_compress_len = max_head + max_tail + 200
-            if len(content) > min_compress_len:
+            if len(content) > min_compress_len and COMPACTION_MARKER not in content:
+                digest = hashlib.sha1(content.encode("utf-8", errors="replace")).hexdigest()[:16]
+                rel_path = f"sandbox/history_tool_outputs/tool_output_{digest}.txt"
+                host_path = os.path.join(SESSION_DIR, rel_path)
+                try:
+                    if not os.path.exists(host_path):
+                        os.makedirs(os.path.dirname(host_path), exist_ok=True)
+                        with open(host_path, "w", encoding="utf-8") as f:
+                            f.write(content)
+                except Exception:
+                    new_messages.append(msg)
+                    continue
                 head = content[:max_head]
                 tail = content[-max_tail:]
                 compacted_body = (
                     f"{head}\n\n"
-                    f"[... {len(content) - max_head - max_tail:,} characters of historical tool output compacted for context efficiency. "
-                    f"Full log preserved on disk ...]\n\n"
+                    f"[... {len(content) - max_head - max_tail:,} {COMPACTION_MARKER} for context efficiency. "
+                    f"Full output saved to '/app/workspace/{rel_path}' ...]\n\n"
                     f"{tail}"
                 )
                 msg_copy = copy.copy(msg)
                 msg_copy["content"] = compacted_body
                 new_messages.append(msg_copy)
-                modified = True
                 continue
         new_messages.append(msg)
         
@@ -638,16 +652,9 @@ async def run_chat():
                             try:
                                 messages = load_history()
                                 
-                                # --- 1. TIME INJECTION (Sweep & Replace) ---
-                                # Remove any previous system clocks to prevent bloat
-                                messages = [msg for msg in messages if not (msg.get("role") == "user" and "[SYSTEM CLOCK:" in str(msg.get("content")))]
-                                
-                                # Inject the fresh clock
-                                live_time = datetime.now().strftime("%A, %B %d, %Y %H:%M:%S")
-                                messages.insert(1, {
-                                    "role": "user", 
-                                    "content": f"[SYSTEM CLOCK: It is currently {live_time}]"
-                                })
+                                # --- 1. SWEEP TRANSIENT INJECTIONS ---
+                                # Remove any previous system clocks or warnings to prevent bloat and maintain clean history
+                                messages = [msg for msg in messages if not (msg.get("role") == "user" and ("[SYSTEM CLOCK:" in str(msg.get("content")) or "[SYSTEM WARNING: Your context window is at" in str(msg.get("content"))))]
 
                                 # --- 2. HISTORICAL TOOL OUTPUT AGING (H3) ---
                                 messages = compact_historical_tool_outputs(messages, protect_recent=20)
@@ -662,9 +669,6 @@ async def run_chat():
                                     current_token_estimate = max(current_token_estimate, last_actual_prompt_tokens)
                                 last_history_len = len(messages)
                                 pct = current_token_estimate / config.MAX_CONTEXT_TOKENS
-                                
-                                # Prevent appending multiple warnings in a row or leaving stale warnings
-                                messages = [msg for msg in messages if not (msg.get("role") == "user" and "[SYSTEM WARNING: Your context window is at" in str(msg.get("content")))]
 
                                 if pct >= 0.80:
                                     warn_msg = f"[SYSTEM WARNING: Your context window is at ~{pct*100:.0f}%. "
@@ -674,6 +678,13 @@ async def run_chat():
                                     messages.append({"role": "user", "content": warn_msg})
                                     print(f"\n{COLOR_YELLOW}{warn_msg}{COLOR_RESET}", flush=True)
                                     log_event("SYSTEM", warn_msg)
+
+                                # --- 4. TIME INJECTION (Appended at end to preserve prefix caching) ---
+                                live_time = datetime.now().strftime("%A, %B %d, %Y %H:%M:%S")
+                                messages.append({
+                                    "role": "user", 
+                                    "content": f"[SYSTEM CLOCK: It is currently {live_time}]"
+                                })
 
                                 # --- 4. SAVE THE PURIST HISTORY BEFORE API CALL ---
                                 save_history(messages)
@@ -1069,6 +1080,12 @@ async def run_chat():
 
                                     if name == "compress_and_store_context":
                                         print(f"\n{COLOR_ORANGE}[SYSTEM] Memory compression cycle complete. Waking up with pristine context...{COLOR_RESET}")
+                                        messages = load_history()
+                                        messages.append({
+                                            "role": "user",
+                                            "content": output
+                                        })
+                                        save_history(messages)
                                         last_known_tokens = 0 
                                         consecutive_tool_chains = 0
                                         break
