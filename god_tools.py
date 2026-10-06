@@ -210,10 +210,10 @@ def gather_agent_context(filepaths: list[str] = None, max_chars_per_file: int = 
         
     context_str = "\n\n=== ATTACHED AGENT CONTEXT BACKGROUND ENVIRONMENT ==="
     for path in filepaths:
-        resolved_path = os.path.abspath(path)
+        resolved_path = os.path.realpath(path)
         if os.path.exists(resolved_path):
             try:
-                if not resolved_path.startswith("/app/workspace"):
+                if os.path.commonpath([resolved_path, "/app/workspace"]) != "/app/workspace":
                     context_str += f"\n\n[ACCESS DENIED: Path '{os.path.basename(resolved_path)}' falls outside safe workspace boundaries.]"
                     continue
                     
@@ -591,22 +591,22 @@ def write_file(filepath: str, content: str) -> str:
         os.makedirs(os.path.dirname(resolved_path), exist_ok=True)
 
         # Check if we are overwriting an existing file
-        if os.path.exists(filepath):
+        if os.path.exists(resolved_path):
             # Create a backup using your exact datetime idea!
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            filename = os.path.basename(filepath)
+            filename = os.path.basename(resolved_path)
             backup_dir = "/app/workspace/archive"
             os.makedirs(backup_dir, exist_ok=True)
             backup_path = os.path.join(backup_dir, f"{filename}.{timestamp}.bak")
-            shutil.copy2(filepath, backup_path)
+            shutil.copy2(resolved_path, backup_path)
             backup_msg = f"(Old version backed up to archive/{os.path.basename(backup_path)})"
         else:
             backup_msg = "(New file created)"
             
-        with open(filepath, "w", encoding="utf-8") as f:
+        with open(resolved_path, "w", encoding="utf-8") as f:
             f.write(content)
             
-        return f"SUCCESS: File saved to {filepath} {backup_msg}"
+        return f"SUCCESS: File saved to {resolved_path} {backup_msg}"
     except Exception as e:
         return f"Error writing file: {str(e)}"
 
@@ -1203,11 +1203,16 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
     - filepath: Absolute path to the file to modify.
     - edit_objective: Clear instruction on what needs to be changed, added, or fixed.
     """
-    if not os.path.exists(filepath):
+    real_target = os.path.realpath(filepath)
+    if not os.path.exists(real_target):
         return f"SYSTEM ERROR: Target file '{filepath}' does not exist."
+    if (os.path.commonpath([real_target, "/app/workspace"]) != "/app/workspace" or
+        os.path.commonpath([real_target, "/app/workspace/state"]) == "/app/workspace/state" or
+        os.path.commonpath([real_target, "/app/workspace/.git"]) == "/app/workspace/.git"):
+        return f"SYSTEM ERROR: Target file '{filepath}' is protected or falls outside workspace boundaries."
 
     # 1. Natively read the file content from disk so the Coder can see it
-    with open(filepath, "r", encoding="utf-8") as f:
+    with open(real_target, "r", encoding="utf-8") as f:
         current_code = f.read()
 
     # 2. Spawn a specialized system prompt forcing the Coder to emit structured search/replace format
@@ -1338,22 +1343,22 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                 return f"SYSTEM ERROR: Surgical edit aborted because it introduces a Python syntax error on line {e.lineno}{bad_line}: {e.msg}. File on disk was NOT modified."
 
         # Archive backup snapshot
-        filename = os.path.basename(filepath)
+        filename = os.path.basename(real_target)
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         backup_path = f"/app/workspace/archive/{filename}.{timestamp}.surgical.bak"
         with open(backup_path, "w", encoding="utf-8") as f:
             f.write(current_code)
 
         # Write applied changes back onto disk safely
-        with open(filepath, "w", encoding="utf-8") as f:
+        with open(real_target, "w", encoding="utf-8") as f:
             f.write(updated_code)
 
-        logger.info(f"[surgical_code_edit] Successfully applied {len(edits_list)} edit(s) to '{filepath}'")
+        logger.info(f"[surgical_code_edit] Successfully applied {len(edits_list)} edit(s) to '{real_target}'")
 
         # Dynamic Git Commit Tracking Checkpoint
         if os.path.exists("/app/workspace/.git"):
             try:
-                proc_add = await asyncio.create_subprocess_exec("git", "add", filepath, cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                proc_add = await asyncio.create_subprocess_exec("git", "add", real_target, cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 await proc_add.communicate()
                 proc_diff = await asyncio.create_subprocess_exec("git", "diff", "--cached", "--quiet", cwd=WORKSPACE_DIR)
                 diff_rc = await proc_diff.wait()
@@ -1494,11 +1499,23 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, sea
                     warning_msg = f"\n\n... [SYSTEM WARNING: The query returned {len(rows)} rows, but only the first {MAX_ROWS} are shown to protect context. Use 'LIMIT' to paginate.]"
                     rows = rows[:MAX_ROWS]
                 
-                data = [dict(row) for row in rows]
+                data = []
+                for row in rows:
+                    row_dict = {}
+                    for k in row.keys():
+                        v = row[k]
+                        if isinstance(v, (bytes, bytearray)) and len(v) > 64:
+                            row_dict[k] = f"<BLOB {len(v)} bytes>"
+                        else:
+                            row_dict[k] = v
+                    data.append(row_dict)
+
                 result_str = json.dumps(data, indent=2, default=str)
-                
-                if len(result_str) > 20000:
-                    result_str = result_str[:20000] + "\n\n... [SYSTEM WARNING: JSON output exceeded 20,000 characters and was truncated. Refine your SQL query.]"
+                if len(result_str) > 20000 and len(data) > 1:
+                    while len(result_str) > 20000 and len(data) > 1:
+                        data = data[:max(1, len(data) // 2)]
+                        result_str = json.dumps(data, indent=2, default=str)
+                    result_str += f"\n\n... [SYSTEM WARNING: Output was truncated to {len(data)} rows to stay within 20,000 characters. Refine your query or use LIMIT.]"
                 else:
                     result_str += warning_msg
                     
@@ -1583,7 +1600,7 @@ async def batch_generate_embeddings(db_path: str, vec_table: str, source_query: 
             for i, rowid in enumerate(chunk_rowids):
                 embedding_vector = response.data[i].embedding
                 vector_blob = array.array('f', embedding_vector).tobytes()
-                cursor.execute(f"INSERT INTO {vec_table}(rowid, embedding) VALUES (?, ?)", (rowid, vector_blob))
+                cursor.execute(f"INSERT OR REPLACE INTO {vec_table}(rowid, embedding) VALUES (?, ?)", (rowid, vector_blob))
                 inserted_count += 1
 
         config.log_token_usage(STATE_DIR, "embedding", total_tokens_in, 0, 0)
@@ -1752,6 +1769,17 @@ async def fetch_webpage(url: str) -> str:
                 )
                 
                 page = await context.new_page()
+                
+                # Protect against redirect SSRF to internal/host IPs
+                async def filter_navigation(route):
+                    if route.request.is_navigation_request():
+                        req_safe, _ = is_safe_web_url(route.request.url)
+                        if not req_safe:
+                            await route.abort()
+                            return
+                    await route.continue_()
+
+                await page.route("**/*", filter_navigation)
                             
                 # Navigate and wait for the page to finish loading its network requests (JS rendering)
                 await page.goto(url, wait_until="domcontentloaded", timeout=30000)

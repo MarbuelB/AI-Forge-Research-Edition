@@ -409,7 +409,6 @@ async def run_chat():
     
     prompt_session = None
     quit_app = False
-    last_known_tokens = 0 # State tracker for accurate token checking
     last_actual_prompt_tokens = 0
     last_estimated_payload_tokens = 0
     token_calibration_ratio = 1.0 # Calibrated ratio: serving model tokenizer vs cl100k_base
@@ -567,8 +566,7 @@ async def run_chat():
                             "function": {
                                 "name": t.name, 
                                 "description": t.description, 
-                                "parameters": t.inputSchema,
-                                "strict": True
+                                "parameters": t.inputSchema
                             }
                         } 
                         for t in mcp_tools.tools
@@ -857,7 +855,6 @@ async def run_chat():
                                             reasoning_tokens = len(full_thinking) // 4
                                         config.log_token_usage(os.path.join(SESSION_DIR, "state"), "brain", final_usage.prompt_tokens, final_usage.completion_tokens, reasoning_tokens)
 
-                                    last_known_tokens = 0
                                     consecutive_tool_chains = 0
                                     continue
                                 else:
@@ -866,7 +863,6 @@ async def run_chat():
 
                                 # Update exact token count state and calibrate tokenizer for the next loop!
                                 if final_usage:
-                                    last_known_tokens = final_usage.prompt_tokens + final_usage.completion_tokens
                                     if final_usage.prompt_tokens and last_estimated_payload_tokens > 0:
                                         # Calibrate ratio between serving model's tokenizer and local cl100k estimate
                                         observed_ratio = final_usage.prompt_tokens / last_estimated_payload_tokens
@@ -919,7 +915,6 @@ async def run_chat():
                                             "content": error_msg
                                         })
                                         save_history(messages)
-                                        last_known_tokens = 0
                                         continue 
 
                                     # Hide massive JSON strings from console if in minimal/standard
@@ -947,13 +942,16 @@ async def run_chat():
                                     state_dir = os.path.join(SESSION_DIR, "state")
                                     totals_before = config.get_token_totals(state_dir)
                                     
-                                    result = await session.call_tool(name, args)
-                                    if result.content and len(result.content) > 0 and hasattr(result.content[0], "text"):
-                                        output = result.content[0].text
-                                    elif result.content and len(result.content) > 0:
-                                        output = str(result.content[0])
-                                    else:
-                                        output = "SUCCESS: Tool executed with no output."
+                                    try:
+                                        result = await session.call_tool(name, args)
+                                        if result.content and len(result.content) > 0 and hasattr(result.content[0], "text"):
+                                            output = result.content[0].text
+                                        elif result.content and len(result.content) > 0:
+                                            output = str(result.content[0])
+                                        else:
+                                            output = "SUCCESS: Tool executed with no output."
+                                    except Exception as tool_err:
+                                        output = f"SYSTEM ERROR: Tool execution failed: {str(tool_err)}"
                                     
                                     totals_after = config.get_token_totals(state_dir)
                                     token_diff = config.get_totals_diff(totals_before, totals_after)
@@ -1086,7 +1084,8 @@ async def run_chat():
                                             "content": output
                                         })
                                         save_history(messages)
-                                        last_known_tokens = 0 
+                                        last_actual_prompt_tokens = 0
+                                        last_history_len = 0
                                         consecutive_tool_chains = 0
                                         break
 
@@ -1099,7 +1098,6 @@ async def run_chat():
                                             "content": output
                                         })
                                         save_history(messages)
-                                        last_known_tokens = 0
 
                                 # --- ESCALATING LOOP DETECTION (CHECK) ---
                                 consecutive_tool_chains += 1
@@ -1132,6 +1130,25 @@ async def run_chat():
                                 log_event("SYSTEM", "Process manually interrupted by user.")
                                 
                                 messages = load_history()
+                                # Reconcile pending tool_calls to maintain valid assistant->tool message structure
+                                if messages:
+                                    for msg in reversed(messages):
+                                        if msg.get("role") == "assistant":
+                                            if msg.get("tool_calls"):
+                                                existing_tc_ids = {m.get("tool_call_id") for m in messages if m.get("role") == "tool"}
+                                                for tc in msg["tool_calls"]:
+                                                    tc_id = tc.get("id")
+                                                    if tc_id and tc_id not in existing_tc_ids:
+                                                        messages.append({
+                                                            "role": "tool",
+                                                            "tool_call_id": tc_id,
+                                                            "name": tc.get("function", {}).get("name", "unknown"),
+                                                            "content": "[INTERRUPTED: Tool execution cancelled by user (Ctrl+C)]"
+                                                        })
+                                            break
+                                        elif msg.get("role") == "user":
+                                            break
+
                                 messages.append({
                                      "role": "user", 
                                      "content": "[SYSTEM ALERT: The user pressed Ctrl+C to instantly abort the previous text generation or tool execution. Stop what you were doing, acknowledge the interruption, and await new instructions.]"
