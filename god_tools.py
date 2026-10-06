@@ -665,16 +665,20 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
                 f.write(output)
                 
             total_lines = output.count('\n') + 1
-            preview = output[:3000] # Give it just enough to see the structure/headers
-            preview_lines = preview.count('\n') + 1
+            head_preview = output[:1500]
+            tail_preview = output[-1500:]
+            omitted_chars = len(output) - len(head_preview) - len(tail_preview)
+            head_lines = head_preview.count('\n') + 1
+            tail_lines = tail_preview.count('\n') + 1
             
             return (f"Exit Code: {process.returncode}\n"
-                    f"Output Preview (Lines 1–{preview_lines}, first 3,000 of {len(output):,} chars):\n{preview}\n\n"
-                    f"... [SYSTEM CONTEXT GUARDRAIL: Full command output is {len(output):,} characters ({total_lines:,} lines), "
-                    f"exceeding the 10,000 char threshold. The complete output was saved to '/app/workspace/sandbox/{temp_file_name}' "
-                    f"to protect your context window from blowing out.\n"
+                    f"Output Preview (Head: first 1,500 chars / {head_lines} lines | Tail: last 1,500 chars / {tail_lines} lines of {len(output):,} chars total):\n"
+                    f"--- [HEAD PREVIEW (First 1,500 chars)] ---\n{head_preview}\n\n"
+                    f"... [SNIP: {omitted_chars:,} characters omitted — complete {len(output):,} chars ({total_lines:,} lines) saved to '/app/workspace/sandbox/{temp_file_name}'] ...\n\n"
+                    f"--- [TAIL PREVIEW (Last 1,500 chars)] ---\n{tail_preview}\n\n"
+                    f"[SYSTEM CONTEXT GUARDRAIL: Output exceeded 10,000 characters. Both head (headers/start) and tail (final results/errors) are shown above.\n"
                     f"HOW TO GET AROUND THIS TRUNCATION:\n"
-                    f"- To inspect the tail/end of the output (e.g. exit errors or summary counts): execute_bash('tail -n 100 /app/workspace/sandbox/{temp_file_name}')\n"
+                    f"- To inspect additional tail lines: execute_bash('tail -n 100 /app/workspace/sandbox/{temp_file_name}')\n"
                     f"- To inspect a specific line range: execute_bash('sed -n \\'100,200p\\' /app/workspace/sandbox/{temp_file_name}')\n"
                     f"- To search for specific keywords: execute_bash('grep -n -C 3 \"ERROR\\|Exception\" /app/workspace/sandbox/{temp_file_name}')\n"
                     f"- To delegate analysis of the entire file: analyze_files(['/app/workspace/sandbox/{temp_file_name}'], 'Find errors ...')]")

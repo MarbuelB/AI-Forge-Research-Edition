@@ -150,7 +150,7 @@ If a tool fails silently, behaves unpredictably, or you suspect an internal cras
 
 === CONTEXT WINDOW PROTECTION & NAVIGATING TRUNCATIONS ===
 To protect your context window from quadratic token blowup, the system applies hardcoded limits across tools:
-1. `execute_bash`: Command outputs > 10,000 characters are capped. The first 3,000 characters are previewed, and the complete output is saved to `/app/workspace/sandbox/cmd_output_<timestamp>.txt`.
+1. `execute_bash`: Command outputs > 10,000 characters are capped. A preview containing the first 1,500 characters (head) and last 1,500 characters (tail) is returned, and the complete output is saved to `/app/workspace/sandbox/cmd_output_<timestamp>.txt`.
 2. `analyze_files`: Reads up to 50,000 characters per file (approx. 1,000–1,200 lines).
 3. `gather_agent_context`: Subagents receive up to 40,000 characters per attached context file.
 4. Historical Tool Compaction: Tool outputs older than ~20 turns are compacted in chat history, preserving their full text in `/app/workspace/sandbox/history_tool_outputs/`.
