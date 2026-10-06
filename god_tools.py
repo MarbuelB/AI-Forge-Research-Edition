@@ -165,6 +165,19 @@ def save_json(filepath, data):
     # If the system crashes during step 1, the original file is untouched!
     os.replace(temp_path, filepath)
 
+def save_failure_trace(subagent_name: str, payload: dict) -> str:
+    """Saves a failure trace / post-mortem diagnostic artifact to state/ for full observability."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"failure_{subagent_name}_{timestamp}.json"
+        filepath = os.path.join(STATE_DIR, filename)
+        save_json(filepath, payload)
+        return filepath
+    except Exception as e:
+        logger.error(f"[save_failure_trace] Failed to save trace for {subagent_name}: {e}")
+        return ""
+
 def sqlite_authorizer(action, arg1, arg2, dbname, source):
     # 9 = SQLITE_DELETE, 11 = SQLITE_DROP_TABLE
     if action in (sqlite3.SQLITE_DELETE, sqlite3.SQLITE_DROP_TABLE):
@@ -329,9 +342,9 @@ async def consult_adviser(current_plan: str, encountered_problems: str, context_
         response = await adviser_client.chat.completions.create(**api_args)
         adviser_thinking, advice_text = extract_thinking_and_content(response.choices[0].message)
         
-        # Log token usage
-        tokens_in = response.usage.prompt_tokens if response.usage else 0
-        tokens_out = response.usage.completion_tokens if response.usage else 0
+        # Log token usage with fallback
+        tokens_in = response.usage.prompt_tokens if (response.usage and response.usage.prompt_tokens) else get_payload_tokens(api_args["messages"])
+        tokens_out = response.usage.completion_tokens if (response.usage and response.usage.completion_tokens) else (len(tokenizer.encode(advice_text)) if tokenizer else len(advice_text) // 4)
         thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
         if thinking_tokens == 0 and adviser_thinking:
             thinking_tokens = len(adviser_thinking) // 4
@@ -342,9 +355,12 @@ async def consult_adviser(current_plan: str, encountered_problems: str, context_
         filename = f"{timestamp}_advice.md"
         filepath = os.path.join(STATE_DIR, filename)
         
-        # 6. Save the physical document to the state folder (pure report output)
+        # 6. Save the physical document to the state folder (with collapsible thinking for auditability)
+        file_body = advice_text
+        if adviser_thinking:
+            file_body = f"<details>\n<summary>Adviser Reasoning & Strategy</summary>\n\n{adviser_thinking}\n\n</details>\n\n{advice_text}"
         with open(filepath, "w", encoding="utf-8") as f:
-            f.write(advice_text)
+            f.write(file_body)
             
         # Context guardrail: truncate preview for context window if advice exceeds 12,000 characters
         if len(advice_text) > 12000:
@@ -364,7 +380,14 @@ async def consult_adviser(current_plan: str, encountered_problems: str, context_
         return result_msg
         
     except Exception as e:
-        return f"Failed to consult the adviser. Error: {str(e)}"
+        trace_file = save_failure_trace("adviser", {
+            "subagent": "adviser",
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "messages": api_args.get("messages", []) if 'api_args' in locals() else []
+        })
+        trace_note = f"\n[SYSTEM: Failure trace saved to '{trace_file}']" if trace_file else ""
+        return f"Failed to consult the adviser. Error: {str(e)}{trace_note}"
 
 
 @mcp.tool()
@@ -433,8 +456,9 @@ async def query_universal_llm(
             response = await universal_client.chat.completions.create(**api_args)
             thinking, content = extract_thinking_and_content(response.choices[0].message)
             
-            tokens_in = response.usage.prompt_tokens if response.usage else 0
-            tokens_out = response.usage.completion_tokens if response.usage else 0
+            # Log token usage with fallback
+            tokens_in = response.usage.prompt_tokens if (response.usage and response.usage.prompt_tokens) else get_payload_tokens(api_args["messages"])
+            tokens_out = response.usage.completion_tokens if (response.usage and response.usage.completion_tokens) else (len(tokenizer.encode(content)) if tokenizer else len(content) // 4)
             thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
             if thinking_tokens == 0 and thinking:
                 thinking_tokens = len(thinking) // 4
@@ -458,7 +482,15 @@ async def query_universal_llm(
             return result_str
             
         except Exception as e:
-            return f"LLM Query Failed. Error: {str(e)}"
+            trace_file = save_failure_trace("universal", {
+                "subagent": "universal",
+                "model": model,
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+                "messages": api_args.get("messages", []) if 'api_args' in locals() else []
+            })
+            trace_note = f"\n[SYSTEM: Failure trace saved to '{trace_file}']" if trace_file else ""
+            return f"LLM Query Failed. Error: {str(e)}{trace_note}"
                         
     else:
         return "Error: Invalid action. Must be 'list_models' or 'chat'."
@@ -688,6 +720,7 @@ async def compress_and_store_context() -> str:
     
     # --- Safe string accumulator to prevent MCP stdio corruption ---
     rolling_log = "" 
+    rolling_chunk_thoughts = []
     
     # --- SMART TOKEN-TARGETED ROLLING SUMMARIZATION ---
     current_tokens = len(tokenizer.encode(json.dumps(current_history)))
@@ -739,10 +772,12 @@ async def compress_and_store_context() -> str:
             try:
                 chunk_resp = await summarizer_client.chat.completions.create(**chunk_args)
                 chunk_thinking, dense_summary = extract_thinking_and_content(chunk_resp.choices[0].message)
+                if chunk_thinking:
+                    rolling_chunk_thoughts.append(f"--- CHUNK ROLLING SUMMARY THINKING ---\n{chunk_thinking}")
                 
-                # Log token usage
-                tokens_in = chunk_resp.usage.prompt_tokens if chunk_resp.usage else 0
-                tokens_out = chunk_resp.usage.completion_tokens if chunk_resp.usage else 0
+                # Log token usage with fallback
+                tokens_in = chunk_resp.usage.prompt_tokens if (chunk_resp.usage and chunk_resp.usage.prompt_tokens) else get_payload_tokens(chunk_prompt)
+                tokens_out = chunk_resp.usage.completion_tokens if (chunk_resp.usage and chunk_resp.usage.completion_tokens) else (len(tokenizer.encode(dense_summary)) if tokenizer else len(dense_summary) // 4)
                 thinking_tokens = getattr(chunk_resp.usage.completion_tokens_details, 'reasoning_tokens', 0) if chunk_resp.usage and hasattr(chunk_resp.usage, 'completion_tokens_details') and chunk_resp.usage.completion_tokens_details else 0
                 if thinking_tokens == 0 and chunk_thinking:
                     thinking_tokens = len(chunk_thinking) // 4
@@ -764,6 +799,13 @@ async def compress_and_store_context() -> str:
                 rolling_log += f"- Compressed a {chunk_tokens}-token chunk. New total: {current_tokens} tokens.\n"
                             
             except Exception as e:
+                save_failure_trace("summarizer_chunk", {
+                    "subagent": "summarizer",
+                    "phase": "rolling_chunk_compression",
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                    "prompt": chunk_prompt
+                })
                 rolling_log += f"- Error during chunk compression: {e}. Falling back to single-message truncation to survive.\n"
                 current_history.pop(1)
                 current_tokens = len(tokenizer.encode(json.dumps(current_history)))
@@ -831,9 +873,9 @@ async def compress_and_store_context() -> str:
         mem_response = await summarizer_client.chat.completions.create(**api_args)
         mem_thinking, mem_raw_content = extract_thinking_and_content(mem_response.choices[0].message)
         
-        # Log token usage
-        tokens_in = mem_response.usage.prompt_tokens if mem_response.usage else 0
-        tokens_out = mem_response.usage.completion_tokens if mem_response.usage else 0
+        # Log token usage with fallback
+        tokens_in = mem_response.usage.prompt_tokens if (mem_response.usage and mem_response.usage.prompt_tokens) else get_payload_tokens(api_args["messages"])
+        tokens_out = mem_response.usage.completion_tokens if (mem_response.usage and mem_response.usage.completion_tokens) else (len(tokenizer.encode(mem_raw_content)) if tokenizer else len(mem_raw_content) // 4)
         thinking_tokens = getattr(mem_response.usage.completion_tokens_details, 'reasoning_tokens', 0) if mem_response.usage and hasattr(mem_response.usage, 'completion_tokens_details') and mem_response.usage.completion_tokens_details else 0
         if thinking_tokens == 0 and mem_thinking:
             thinking_tokens = len(mem_thinking) // 4
@@ -875,7 +917,15 @@ async def compress_and_store_context() -> str:
         save_json(MEMORY_REGISTRY_FILE, current_memories)
         
     except Exception as e:
-        return f"FAILED during Memory Extraction Phase. Error: {str(e)}"
+        trace_file = save_failure_trace("summarizer_memory", {
+            "subagent": "summarizer",
+            "phase": "memory_extraction",
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "messages": api_args.get("messages", []) if 'api_args' in locals() else []
+        })
+        trace_note = f"\n[SYSTEM: Failure trace saved to '{trace_file}']" if trace_file else ""
+        return f"FAILED during Memory Extraction Phase. Error: {str(e)}{trace_note}"
         
     # ==========================================
     # STEP 2: COMPRESS HISTORY (Strict Schema)
@@ -931,9 +981,9 @@ async def compress_and_store_context() -> str:
         comp_response = await summarizer_client.chat.completions.create(**api_args)
         comp_thinking, comp_raw_content = extract_thinking_and_content(comp_response.choices[0].message)
         
-        # Log token usage
-        tokens_in = comp_response.usage.prompt_tokens if comp_response.usage else 0
-        tokens_out = comp_response.usage.completion_tokens if comp_response.usage else 0
+        # Log token usage with fallback
+        tokens_in = comp_response.usage.prompt_tokens if (comp_response.usage and comp_response.usage.prompt_tokens) else get_payload_tokens(api_args["messages"])
+        tokens_out = comp_response.usage.completion_tokens if (comp_response.usage and comp_response.usage.completion_tokens) else (len(tokenizer.encode(comp_raw_content)) if tokenizer else len(comp_raw_content) // 4)
         thinking_tokens = getattr(comp_response.usage.completion_tokens_details, 'reasoning_tokens', 0) if comp_response.usage and hasattr(comp_response.usage, 'completion_tokens_details') and comp_response.usage.completion_tokens_details else 0
         if thinking_tokens == 0 and comp_thinking:
             thinking_tokens = len(comp_thinking) // 4
@@ -952,6 +1002,7 @@ async def compress_and_store_context() -> str:
         _LOADED_SKILLS.clear()
         
         summarizer_thoughts = []
+        if rolling_chunk_thoughts: summarizer_thoughts.extend(rolling_chunk_thoughts)
         if mem_thinking: summarizer_thoughts.append(f"--- MEMORY EXTRACTION THINKING ---\n{mem_thinking}")
         if comp_thinking: summarizer_thoughts.append(f"--- HISTORY COMPRESSION THINKING ---\n{comp_thinking}")
         
@@ -966,7 +1017,15 @@ async def compress_and_store_context() -> str:
         return result_msg
         
     except Exception as e:
-        return f"FAILED during History Compression Phase. Error: {str(e)}"
+        trace_file = save_failure_trace("summarizer_compression", {
+            "subagent": "summarizer",
+            "phase": "history_compression",
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "messages": api_args.get("messages", []) if 'api_args' in locals() else []
+        })
+        trace_note = f"\n[SYSTEM: Failure trace saved to '{trace_file}']" if trace_file else ""
+        return f"FAILED during History Compression Phase. Error: {str(e)}{trace_note}"
 
 
 @mcp.tool()
@@ -1036,8 +1095,9 @@ async def forge_and_register_plugin(
             match = re.search(rf"```{md_block}[ \t]*\r?\n(.*?)\r?\n```", raw_content, re.DOTALL)
             code = match.group(1).strip() if match else raw_content.replace(f"```{md_block}", "").replace("```", "").strip()
     
-            tokens_in = response.usage.prompt_tokens if response.usage else 0
-            tokens_out = response.usage.completion_tokens if response.usage else 0
+            # Log token usage with fallback
+            tokens_in = response.usage.prompt_tokens if (response.usage and response.usage.prompt_tokens) else get_payload_tokens(api_args["messages"])
+            tokens_out = response.usage.completion_tokens if (response.usage and response.usage.completion_tokens) else (len(tokenizer.encode(raw_content)) if tokenizer else len(raw_content) // 4)
             thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
             if thinking_tokens == 0 and coder_thinking:
                 thinking_tokens = len(coder_thinking) // 4
@@ -1181,15 +1241,51 @@ edition = "2021"
                 last_validation_error = err_msg.strip() if err_msg else "Syntax validation failed"
                 logger.warning(f"[forge_and_register_plugin] Attempt {attempt+1} validation failed for '{plugin_name}': {last_validation_error[:200]}")
                 if os.path.exists(file_path): os.remove(file_path)
+                save_failure_trace("coder_forge", {
+                    "subagent": "coder",
+                    "action": "forge_and_register_plugin",
+                    "plugin_name": plugin_name,
+                    "target_language": target_lang,
+                    "attempt": attempt + 1,
+                    "validation_error": last_validation_error,
+                    "generated_code": code,
+                    "coder_thinking": coder_thinking,
+                    "prompt_messages": messages
+                })
                 messages.append({"role": "assistant", "content": code})
                 messages.append({"role": "user", "content": f"Code validation failed. Error:\n{err_msg}\nPlease patch the syntax rules and return the raw block."})
                 
         except Exception as e:
             logger.error(f"[forge_and_register_plugin] Exception on attempt {attempt+1} for '{plugin_name}': {str(e)}")
-            return f"Fatal Forging Exception on attempt {attempt+1}: {str(e)}"
+            trace_file = save_failure_trace("coder_forge_exception", {
+                "subagent": "coder",
+                "action": "forge_and_register_plugin",
+                "plugin_name": plugin_name,
+                "attempt": attempt + 1,
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+                "messages": messages
+            })
+            trace_note = f"\n[SYSTEM: Failure trace saved to '{trace_file}']" if trace_file else ""
+            return f"Fatal Forging Exception on attempt {attempt+1}: {str(e)}{trace_note}"
             
     logger.error(f"[forge_and_register_plugin] Forging failed after {config.MAX_PLUGIN_RETRIES} attempts for '{plugin_name}': {last_validation_error[:200]}")
-    return f"FAILED: Coder could not validate artifact constraints after {config.MAX_PLUGIN_RETRIES} runs.\nLast Validation Error:\n{last_validation_error}"
+    trace_file = save_failure_trace("coder_forge_final", {
+        "subagent": "coder",
+        "action": "forge_and_register_plugin",
+        "plugin_name": plugin_name,
+        "target_language": target_lang,
+        "attempts": config.MAX_PLUGIN_RETRIES,
+        "last_validation_error": last_validation_error
+    })
+    fail_msg = f"FAILED: Coder could not validate artifact constraints after {config.MAX_PLUGIN_RETRIES} runs.\nLast Validation Error:\n{last_validation_error}"
+    if trace_file:
+        fail_msg += f"\n[SYSTEM: Failure trace saved to '{trace_file}']"
+    if 'coder_thinking' in locals() and coder_thinking:
+        fail_msg += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
+    if 'code' in locals() and code:
+        fail_msg += f"\n<___CODER_CODE___>\n{code}\n</___CODER_CODE___>"
+    return fail_msg
 
 
 @mcp.tool()
@@ -1275,9 +1371,9 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
         response = await coder_client.chat.completions.create(**api_args)
         coder_thinking, raw_json_str = extract_thinking_and_content(response.choices[0].message)
         
-        # Log Coder token usage
-        tokens_in = response.usage.prompt_tokens if response.usage else 0
-        tokens_out = response.usage.completion_tokens if response.usage else 0
+        # Log Coder token usage with fallback
+        tokens_in = response.usage.prompt_tokens if (response.usage and response.usage.prompt_tokens) else get_payload_tokens(api_args["messages"])
+        tokens_out = response.usage.completion_tokens if (response.usage and response.usage.completion_tokens) else (len(tokenizer.encode(raw_json_str)) if tokenizer else len(raw_json_str) // 4)
         thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
         if thinking_tokens == 0 and coder_thinking:
             thinking_tokens = len(coder_thinking) // 4
@@ -1289,13 +1385,42 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                 raw_json_str = match.group(1).strip()
 
         # Parse structural change instructions safely
-        edit_data = json.loads(raw_json_str)
+        try:
+            edit_data = json.loads(raw_json_str)
+        except json.JSONDecodeError as e:
+            trace_file = save_failure_trace("coder_surgical_json", {
+                "subagent": "coder",
+                "action": "surgical_code_edit",
+                "filepath": filepath,
+                "objective": edit_objective,
+                "error": f"JSON decode error: {str(e)}",
+                "raw_response": raw_json_str,
+                "coder_thinking": coder_thinking
+            })
+            fail_msg = f"SYSTEM ERROR: Coder returned invalid JSON for surgical edit: {str(e)}"
+            if trace_file: fail_msg += f"\n[SYSTEM: Failure trace saved to '{trace_file}']"
+            if coder_thinking: fail_msg += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
+            fail_msg += f"\n<___CODER_CODE___>\n{raw_json_str}\n</___CODER_CODE___>"
+            return fail_msg
+
         edits_list = edit_data.get("edits", [])
         if not edits_list and "search_string" in edit_data:
             edits_list = [{"search_string": edit_data["search_string"], "replace_string": edit_data.get("replace_string", "")}]
 
         if not edits_list:
-            return "SYSTEM ERROR: The Coder returned an empty edits list. No modifications applied."
+            trace_file = save_failure_trace("coder_surgical_empty", {
+                "subagent": "coder",
+                "action": "surgical_code_edit",
+                "filepath": filepath,
+                "objective": edit_objective,
+                "error": "Empty edits list",
+                "raw_response": raw_json_str,
+                "coder_thinking": coder_thinking
+            })
+            fail_msg = f"SYSTEM ERROR: The Coder returned an empty edits list. No modifications applied."
+            if trace_file: fail_msg += f"\n[SYSTEM: Failure trace saved to '{trace_file}']"
+            if coder_thinking: fail_msg += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
+            return fail_msg
 
         # Validate that all search blocks exist before applying any modification
         working_code = current_code
@@ -1322,11 +1447,26 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                 diff_hint = ""
                 if near_lines:
                     diff_hint = f"\nClosest matching lines in file:\n```\n" + "\n".join(near_lines) + "\n```\n"
-                return (
+                trace_file = save_failure_trace("coder_surgical_mismatch", {
+                    "subagent": "coder",
+                    "action": "surgical_code_edit",
+                    "filepath": filepath,
+                    "objective": edit_objective,
+                    "edit_index": idx,
+                    "search_string": s_block,
+                    "replace_string": r_block,
+                    "coder_thinking": coder_thinking,
+                    "closest_lines": near_lines
+                })
+                fail_msg = (
                     f"SYSTEM ERROR: The Coder generated a 'search_string' in edit #{idx} that does not match the actual file lines exactly. "
                     f"Aborting all modifications for safety.{diff_hint}"
                     f"Ensure exact match of leading whitespace, indentation, and newlines."
                 )
+                if trace_file: fail_msg += f"\n[SYSTEM: Failure trace saved to '{trace_file}']"
+                if coder_thinking: fail_msg += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
+                fail_msg += f"\n<___CODER_CODE___>\n{raw_json_str}\n</___CODER_CODE___>"
+                return fail_msg
             working_code = working_code.replace(s_block, r_block, 1)
             applied_blocks.append(f"--- EDIT #{idx} ---\nSearch Block:\n{s_block}\n\nReplace Block:\n{r_block}")
 
@@ -1340,7 +1480,20 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
             except SyntaxError as e:
                 bad_line = f" ({e.text.strip()})" if e.text else ""
                 logger.error(f"[surgical_code_edit] Python syntax error in '{filepath}' on line {e.lineno}: {e.msg}{bad_line}")
-                return f"SYSTEM ERROR: Surgical edit aborted because it introduces a Python syntax error on line {e.lineno}{bad_line}: {e.msg}. File on disk was NOT modified."
+                trace_file = save_failure_trace("coder_surgical_syntax", {
+                    "subagent": "coder",
+                    "action": "surgical_code_edit",
+                    "filepath": filepath,
+                    "objective": edit_objective,
+                    "error": f"SyntaxError line {e.lineno}: {e.msg}{bad_line}",
+                    "coder_thinking": coder_thinking,
+                    "raw_json_str": raw_json_str
+                })
+                fail_msg = f"SYSTEM ERROR: Surgical edit aborted because it introduces a Python syntax error on line {e.lineno}{bad_line}: {e.msg}. File on disk was NOT modified."
+                if trace_file: fail_msg += f"\n[SYSTEM: Failure trace saved to '{trace_file}']"
+                if coder_thinking: fail_msg += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
+                fail_msg += f"\n<___CODER_CODE___>\n{raw_json_str}\n</___CODER_CODE___>"
+                return fail_msg
 
         # Archive backup snapshot
         filename = os.path.basename(real_target)
@@ -1389,7 +1542,16 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
 
     except Exception as e:
         logger.error(f"[surgical_code_edit] Exception on '{filepath}': {str(e)}")
-        return f"SYSTEM ERROR: Surgical Coder sequence aborted. Error: {str(e)}"
+        trace_file = save_failure_trace("coder_surgical_exception", {
+            "subagent": "coder",
+            "action": "surgical_code_edit",
+            "filepath": filepath,
+            "objective": edit_objective,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        })
+        trace_note = f"\n[SYSTEM: Failure trace saved to '{trace_file}']" if trace_file else ""
+        return f"SYSTEM ERROR: Surgical Coder sequence aborted. Error: {str(e)}{trace_note}"
 
 db_tool_desc = f"""Executes a SQL query against a specified SQLite database.
 'db_path' MUST be an absolute path (e.g., '/app/workspace/state/my_db.db').
@@ -1424,8 +1586,8 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, sea
                 input=search_text_to_embed
             )
             
-            # Log embedding token usage
-            tokens_in = response.usage.prompt_tokens if response.usage else 0
+            # Log embedding token usage with fallback
+            tokens_in = response.usage.prompt_tokens if (response.usage and response.usage.prompt_tokens) else len(tokenizer.encode(search_text_to_embed))
             config.log_token_usage(STATE_DIR, "embedding", tokens_in, 0, 0)
             
             embedding_vector = response.data[0].embedding
@@ -1593,8 +1755,10 @@ async def batch_generate_embeddings(db_path: str, vec_table: str, source_query: 
                 input=chunk_texts
             )
 
-            if response.usage:
+            if response.usage and response.usage.prompt_tokens:
                 total_tokens_in += response.usage.prompt_tokens
+            else:
+                total_tokens_in += sum(len(tokenizer.encode(t)) for t in chunk_texts)
 
             # Insert batch into vec table
             for i, rowid in enumerate(chunk_rowids):
@@ -1956,9 +2120,9 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
         if finish_reason == "length":
             logger.warning(f"[analyze_files] Analyst generation was truncated by max_tokens limit")
         
-        # Log token usage
-        tokens_in = response.usage.prompt_tokens if response.usage else 0
-        tokens_out = response.usage.completion_tokens if response.usage else 0
+        # Log token usage with fallback
+        tokens_in = response.usage.prompt_tokens if (response.usage and response.usage.prompt_tokens) else get_payload_tokens(api_args["messages"])
+        tokens_out = response.usage.completion_tokens if (response.usage and response.usage.completion_tokens) else (len(tokenizer.encode(raw_analyst_content)) if tokenizer else len(raw_analyst_content) // 4)
         thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
         if thinking_tokens == 0 and analyst_thinking:
             thinking_tokens = len(analyst_thinking) // 4
@@ -2009,7 +2173,16 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
 
     except Exception as e:
         logger.error(f"[analyze_files] Failed to process files: {str(e)}")
-        return f"Analyst failed to process files. Error: {str(e)}"
+        trace_file = save_failure_trace("analyst", {
+            "subagent": "analyst",
+            "filepaths": filepaths,
+            "instruction": instruction,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "messages": api_args.get("messages", []) if 'api_args' in locals() else []
+        })
+        trace_note = f"\n[SYSTEM: Failure trace saved to '{trace_file}']" if trace_file else ""
+        return f"Analyst failed to process files. Error: {str(e)}{trace_note}"
         
 @mcp.tool()
 def load_skill(skill_name: str = "") -> str:
@@ -2096,9 +2269,9 @@ async def commission_architect(skill_name: str, objective: str, brain_notes: str
         response = await architect_client.chat.completions.create(**api_args)
         architect_thinking, formatted_skill_md = extract_thinking_and_content(response.choices[0].message)
         
-        # Log token usage
-        tokens_in = response.usage.prompt_tokens if response.usage else 0
-        tokens_out = response.usage.completion_tokens if response.usage else 0
+        # Log token usage with fallback
+        tokens_in = response.usage.prompt_tokens if (response.usage and response.usage.prompt_tokens) else get_payload_tokens(api_args["messages"])
+        tokens_out = response.usage.completion_tokens if (response.usage and response.usage.completion_tokens) else (len(tokenizer.encode(formatted_skill_md)) if tokenizer else len(formatted_skill_md) // 4)
         thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
         if thinking_tokens == 0 and architect_thinking:
             thinking_tokens = len(architect_thinking) // 4
@@ -2123,7 +2296,17 @@ async def commission_architect(skill_name: str, objective: str, brain_notes: str
         result_msg += f"\n<___ARCHITECT_SKILL___>\n{clean_skill_md}\n</___ARCHITECT_SKILL___>"
         return result_msg
     except Exception as e:
-        return f"[ARCHITECT ERROR] Failed to generate skill: {str(e)}"
+        trace_file = save_failure_trace("architect", {
+            "subagent": "architect",
+            "skill_name": skill_name,
+            "objective": objective,
+            "brain_notes": brain_notes,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "messages": api_args.get("messages", []) if 'api_args' in locals() else []
+        })
+        trace_note = f"\n[SYSTEM: Failure trace saved to '{trace_file}']" if trace_file else ""
+        return f"[ARCHITECT ERROR] Failed to generate skill: {str(e)}{trace_note}"
 
 
 if __name__ == "__main__":

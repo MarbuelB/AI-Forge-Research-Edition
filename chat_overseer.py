@@ -12,6 +12,7 @@ import sys
 import atexit
 import shutil
 import hashlib
+import types
 from datetime import datetime
 from openai import AsyncOpenAI
 import tiktoken
@@ -845,50 +846,68 @@ async def run_chat():
                                             "2. IF YOU ARE INTENTIONALLY GENERATING REPETITIVE DATA FOR A USER TEST: Acknowledge that the system's streaming guardrail was tripped by the repetition. Do NOT keep trying to stream the exact same multi-paragraph payload out to the console. Instead, use 'write_file' to dump the requested repetitive dataset cleanly into an output file for the user, summarize what you did in a brief sentence, and wait for new instructions.]"
                                             )
                                     })
+                                    if not final_usage:
+                                        fb_prompt = estimate_tokens(messages)
+                                        fb_comp = len(tokenizer.encode(full_content)) if tokenizer else len(full_content) // 4
+                                        fb_reasoning = len(full_thinking) // 4 if full_thinking else 0
+                                        final_usage = types.SimpleNamespace(
+                                            prompt_tokens=fb_prompt,
+                                            completion_tokens=fb_comp,
+                                            completion_tokens_details=types.SimpleNamespace(reasoning_tokens=fb_reasoning)
+                                        )
                                     save_history(messages)
                                     log_event("BRAIN", full_content, final_usage, full_thinking)
                                     
                                     # ◄--- Keeps session statistics completely accurate! ---
-                                    if final_usage:
-                                        reasoning_tokens = getattr(final_usage.completion_tokens_details, 'reasoning_tokens', 0) if hasattr(final_usage, 'completion_tokens_details') and final_usage.completion_tokens_details else 0
-                                        if reasoning_tokens == 0 and full_thinking: 
-                                            reasoning_tokens = len(full_thinking) // 4
-                                        config.log_token_usage(os.path.join(SESSION_DIR, "state"), "brain", final_usage.prompt_tokens, final_usage.completion_tokens, reasoning_tokens)
+                                    reasoning_tokens = getattr(final_usage.completion_tokens_details, 'reasoning_tokens', 0) if hasattr(final_usage, 'completion_tokens_details') and final_usage.completion_tokens_details else 0
+                                    if reasoning_tokens == 0 and full_thinking: 
+                                        reasoning_tokens = len(full_thinking) // 4
+                                    config.log_token_usage(os.path.join(SESSION_DIR, "state"), "brain", final_usage.prompt_tokens, final_usage.completion_tokens, reasoning_tokens)
 
                                     consecutive_tool_chains = 0
                                     continue
                                 else:
+                                    is_actual_usage = final_usage is not None
+                                    if not final_usage:
+                                        fb_prompt = estimate_tokens(messages)
+                                        fb_comp = len(tokenizer.encode(full_content)) if tokenizer else len(full_content) // 4
+                                        fb_reasoning = len(full_thinking) // 4 if full_thinking else 0
+                                        final_usage = types.SimpleNamespace(
+                                            prompt_tokens=fb_prompt,
+                                            completion_tokens=fb_comp,
+                                            completion_tokens_details=types.SimpleNamespace(reasoning_tokens=fb_reasoning)
+                                        )
                                     save_history(messages)
                                     log_event("BRAIN", full_content, final_usage, full_thinking)
 
                                 # Update exact token count state and calibrate tokenizer for the next loop!
-                                if final_usage:
-                                    if final_usage.prompt_tokens and last_estimated_payload_tokens > 0:
-                                        # Calibrate ratio between serving model's tokenizer and local cl100k estimate
-                                        observed_ratio = final_usage.prompt_tokens / last_estimated_payload_tokens
-                                        if 0.5 <= observed_ratio <= 3.0:
-                                            token_calibration_ratio = (0.7 * token_calibration_ratio) + (0.3 * observed_ratio)
-                                    last_actual_prompt_tokens = final_usage.prompt_tokens
-                                    reasoning_tokens = 0
-                                    if hasattr(final_usage, 'completion_tokens_details') and final_usage.completion_tokens_details:
-                                        reasoning_tokens = getattr(final_usage.completion_tokens_details, 'reasoning_tokens', 0)
+                                if is_actual_usage and final_usage.prompt_tokens and last_estimated_payload_tokens > 0:
+                                    # Calibrate ratio between serving model's tokenizer and local cl100k estimate
+                                    observed_ratio = final_usage.prompt_tokens / last_estimated_payload_tokens
+                                    if 0.5 <= observed_ratio <= 3.0:
+                                        token_calibration_ratio = (0.7 * token_calibration_ratio) + (0.3 * observed_ratio)
+                                last_actual_prompt_tokens = final_usage.prompt_tokens
+                                reasoning_tokens = 0
+                                if hasattr(final_usage, 'completion_tokens_details') and final_usage.completion_tokens_details:
+                                    reasoning_tokens = getattr(final_usage.completion_tokens_details, 'reasoning_tokens', 0)
+                                
+                                if reasoning_tokens == 0 and full_thinking:
+                                    reasoning_tokens = len(full_thinking) // 4
                                     
-                                    if reasoning_tokens == 0 and full_thinking:
-                                        reasoning_tokens = len(full_thinking) // 4
-                                        
-                                    config.log_token_usage(
-                                        os.path.join(SESSION_DIR, "state"),
-                                        "brain",
-                                        final_usage.prompt_tokens,
-                                        final_usage.completion_tokens,
-                                        reasoning_tokens
-                                    )
-                                        
-                                    if config.VERBOSITY_MODE != "silent":   
-                                        if reasoning_tokens > 0:
-                                            print(f"{COLOR_YELLOW}[Tokens: {final_usage.prompt_tokens} in | {final_usage.completion_tokens} out (~{reasoning_tokens} thinking)]{COLOR_RESET}")
-                                        else:
-                                            print(f"{COLOR_YELLOW}[Tokens: {final_usage.prompt_tokens} in | {final_usage.completion_tokens} out]{COLOR_RESET}")
+                                config.log_token_usage(
+                                    os.path.join(SESSION_DIR, "state"),
+                                    "brain",
+                                    final_usage.prompt_tokens,
+                                    final_usage.completion_tokens,
+                                    reasoning_tokens
+                                )
+                                    
+                                if config.VERBOSITY_MODE != "silent":   
+                                    est_tag = "" if is_actual_usage else " (est)"
+                                    if reasoning_tokens > 0:
+                                        print(f"{COLOR_YELLOW}[Tokens{est_tag}: {final_usage.prompt_tokens} in | {final_usage.completion_tokens} out (~{reasoning_tokens} thinking)]{COLOR_RESET}")
+                                    else:
+                                        print(f"{COLOR_YELLOW}[Tokens{est_tag}: {final_usage.prompt_tokens} in | {final_usage.completion_tokens} out]{COLOR_RESET}")
 
                                 if not tool_calls_dict:
                                     break
