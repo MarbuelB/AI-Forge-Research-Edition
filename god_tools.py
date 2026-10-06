@@ -1318,9 +1318,11 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
         "Analyze the provided source code, identify the precise snippet(s) needing correction, "
         "and return a clean JSON object structure containing an 'edits' array of search/replace objects.\n"
         "Each item in 'edits' must have 'search_string' and 'replace_string'.\n"
-        "CRITICAL:\n"
-        "1. Each 'search_string' MUST exist inside the source code word-for-word, down to the exact spacing and newlines.\n"
-        "2. If multiple separate locations need changes (e.g. imports at top, flags in main), provide multiple discrete edit items in 'edits' in the order they appear in the file. Do NOT lump unrelated sections into one giant search block.\n"
+        "CRITICAL RULES:\n"
+        "1. UNIQUE & EXACT MATCH: Each 'search_string' MUST exist inside the source code word-for-word, down to the exact spacing and newlines. Include enough surrounding lines so each 'search_string' matches uniquely.\n"
+        "2. TARGET INTEGRITY: If the edit objective instructs you to modify, replace, or delete specific lines, functions, or symbols that DO NOT exist in the provided source code, you MUST NOT hallucinate, invent, or append them. Do NOT substitute an unrelated search block. Set 'status' to 'target_not_found', explain what was missing in 'explanation', and return an empty 'edits' array (`\"edits\": []`).\n"
+        "3. MINIMAL SCOPE: Change ONLY the lines necessary to satisfy the objective. Do not alter surrounding formatting or unrelated logic.\n"
+        "4. ORDER OF EDITS: If multiple separate locations need changes (e.g. imports at top, flags in main), provide multiple discrete edit items in 'edits' in the order they appear in the file. Do NOT lump unrelated sections into one giant search block.\n"
         "Output ONLY a valid, single JSON block wrapped inside a standard markdown json code block token. No conversational filler text."
     )
 
@@ -1328,7 +1330,9 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
         f"--- TARGET FILE LOCATION ---\n{filepath}\n\n"
         f"--- EDIT OBJECTIVE ---\n{edit_objective}\n\n"
         f"--- CURRENT ON-DISK SOURCE CODE ---\n{current_code}\n\n"
-        "Perform your analysis and return the json code block immediately."
+        "Perform your analysis and return the json code block immediately. "
+        "If any target code specified to be modified in the objective does not exist in the source code above, "
+        "set status to 'target_not_found' and edits to []."
     )
 
     messages = [
@@ -1348,9 +1352,18 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                 "schema": {
                     "type": "object",
                     "properties": {
+                        "status": {
+                            "type": "string",
+                            "enum": ["success", "target_not_found", "error"],
+                            "description": "'success' if all targets exist and can be safely patched, or 'target_not_found'/'error' if target code does not exist in source."
+                        },
+                        "explanation": {
+                            "type": "string",
+                            "description": "Clear explanation of changes made or why the target code was not found."
+                        },
                         "edits": {
                             "type": "array",
-                            "description": "Sequential search/replace blocks applied in file order",
+                            "description": "Sequential search/replace blocks applied in file order. Empty if target_not_found.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -1362,7 +1375,7 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                             }
                         }
                     },
-                    "required": ["edits"],
+                    "required": ["status", "explanation", "edits"],
                     "additionalProperties": False
                 }
             }
@@ -1403,23 +1416,28 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
             fail_msg += f"\n<___CODER_CODE___>\n{raw_json_str}\n</___CODER_CODE___>"
             return fail_msg
 
+        status = str(edit_data.get("status", "success")).lower()
+        explanation = edit_data.get("explanation", "")
         edits_list = edit_data.get("edits", [])
         if not edits_list and "search_string" in edit_data:
             edits_list = [{"search_string": edit_data["search_string"], "replace_string": edit_data.get("replace_string", "")}]
 
-        if not edits_list:
-            trace_file = save_failure_trace("coder_surgical_empty", {
+        if status in ("target_not_found", "error") or not edits_list:
+            reason = explanation or ("Target code specified in objective not found in file." if status == "target_not_found" else "The Coder returned an empty edits list. No modifications applied.")
+            trace_file = save_failure_trace("coder_surgical_target_missing", {
                 "subagent": "coder",
                 "action": "surgical_code_edit",
                 "filepath": filepath,
                 "objective": edit_objective,
-                "error": "Empty edits list",
+                "status": status,
+                "explanation": explanation,
                 "raw_response": raw_json_str,
                 "coder_thinking": coder_thinking
             })
-            fail_msg = f"SYSTEM ERROR: The Coder returned an empty edits list. No modifications applied."
+            fail_msg = f"SYSTEM ERROR: The Coder could not apply surgical edit ({status}): {reason}"
             if trace_file: fail_msg += f"\n[SYSTEM: Failure trace saved to '{trace_file}']"
             if coder_thinking: fail_msg += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
+            fail_msg += f"\n<___CODER_CODE___>\n{raw_json_str}\n</___CODER_CODE___>"
             return fail_msg
 
         # Validate that all search blocks exist before applying any modification
@@ -1534,7 +1552,8 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                         blueprint_hint = "\nREMINDER: This is a C++ asset. Ensure you re-compile the source file using g++ before executing the binary path."
 
         edit_summary_block = "\n\n".join(applied_blocks)
-        res = f"SUCCESS: Coder surgically applied {len(edits_list)} edit(s) to '{filepath}' to achieve the objective. Backup generated: {os.path.basename(backup_path)}.{blueprint_hint}"
+        explanation_note = f" Note: {explanation}" if explanation else ""
+        res = f"SUCCESS: Coder surgically applied {len(edits_list)} edit(s) to '{filepath}' to achieve the objective.{explanation_note} Backup generated: {backup_path}.{blueprint_hint}"
         if coder_thinking:
             res += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
         res += f"\n<___CODER_CODE___>\n{edit_summary_block}\n</___CODER_CODE___>"
