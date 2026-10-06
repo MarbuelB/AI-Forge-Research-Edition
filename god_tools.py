@@ -243,8 +243,9 @@ def gather_agent_context(filepaths: list[str] = None, max_chars_per_file: int = 
                     est_tokens = len(tokenizer.encode(content))
                     
                     context_str += f"\n\n--- REFERENCE FILE STATE: {os.path.basename(resolved_path)} (~{est_tokens} tokens) ---\n{content}"
-                    if len(content) >= max_chars_per_file:
-                        context_str += "\n... [TRUNCATED NATIVELY DUE TO SUB-AGENT CONTEXT BUDGET LIMITS] ..."
+                    if len(content) >= max_chars_per_file and file_size_bytes > len(content):
+                        pct = int((len(content) / file_size_bytes) * 100)
+                        context_str += f"\n... [COVERAGE WARNING: TRUNCATED NATIVELY — Read {len(content)} of {file_size_bytes} chars ({pct}%). Tail omitted due to sub-agent budget limits.] ..."
             except Exception as e:
                 context_str += f"\n\n[READ FAULT: {os.path.basename(resolved_path)} - Error: {str(e)}]"
         else:
@@ -505,12 +506,16 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
     if not command or not isinstance(command, str):
         return 'SYSTEM ERROR: The "command" parameter must be a non-empty string. Example: command="ls -la"'
 
-    # 2. Block Destructive Commands (Using strict word boundaries to avoid false positives)
+    # 2. Block Destructive Commands (rm as an executed command, not an argument inside quotes/grep)
     if re.search(r'\bgit\s+rm\s+--cached\b', command.lower()):
         pass  # Explicitly permit non-destructive git index untracking
-    elif re.search(r'\brm\s+-[rRf]+\b', command.lower()) or re.search(r'\brm\s+', command.lower()):
-        logger.warning(f"[execute_bash] Security block: destructive rm command rejected: {command[:200]}")
-        return "SYSTEM ERROR: Destructive commands (rm) are blocked. Use the archive folder instead."
+    elif re.search(r'(?:^|[;&|\n]|\bxargs\b)\s*rm\s+', command.strip().lower()):
+        first_token = command.strip().split()[0].lower() if command.strip().split() else ""
+        if first_token in ("grep", "egrep", "fgrep", "rg", "echo", "printf", "sed", "awk"):
+            pass
+        else:
+            logger.warning(f"[execute_bash] Security block: destructive rm command rejected: {command[:200]}")
+            return "SYSTEM ERROR: Destructive commands (rm) are blocked. Use the archive folder instead."
 
     try:
         if not command.strip():
@@ -558,6 +563,8 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
 
         if process.returncode != 0:
             logger.warning(f"[execute_bash] Non-zero exit ({process.returncode}) for: {command[:200]} | output: {output[:300]}")
+            if "no such module: vec0" in output.lower() or "no such function: vec_" in output.lower():
+                output += "\n[SYSTEM HINT: The sqlite3 CLI binary does not load the sqlite-vec extension. Use the native 'query_sqlite_db' tool instead, which pre-loads sqlite-vec.]"
         else:
             logger.info(f"[execute_bash] Success (exit 0): {command[:200]}")
 
@@ -588,9 +595,10 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
         
 
 @mcp.tool()
-def write_file(filepath: str, content: str) -> str:
-    """Creates or overwrites a file with the provided content.
-    If the file already exists, it automatically creates a timestamped backup before overwriting.
+def write_file(filepath: str, content: str, mode: str = "w") -> str:
+    """Writes text content to a file in 'outputs' or 'sandbox' directory.
+    - mode: 'w' (default) to overwrite, or 'a' to append content to an existing file.
+    When mode='w' and the file already exists, an archive backup is automatically created.
     Use this instead of bash 'echo' or 'cat' to write markdown, or text files safely.
     You can only write to 'outputs' or 'sandbox' directories.
     IMPORTANT: For any source code files (Python, JS, TS, Rust, C++), you MUST use forge_and_register_plugin!
@@ -622,9 +630,18 @@ def write_file(filepath: str, content: str) -> str:
         # Ensure parent directory exists for nested paths
         os.makedirs(os.path.dirname(resolved_path), exist_ok=True)
 
-        # Check if we are overwriting an existing file
-        if os.path.exists(resolved_path):
-            # Create a backup using your exact datetime idea!
+        # Check existing file status
+        file_exists = os.path.exists(resolved_path)
+        write_mode = "a" if mode.lower().strip() == "a" else "w"
+
+        if file_exists and write_mode == "w":
+            existing_size = os.path.getsize(resolved_path)
+            # Size-shrink guard: prevent accidental clobbering if new content is drastically smaller (< 40%)
+            if existing_size > 1000 and len(content) < int(existing_size * 0.4):
+                return (f"SYSTEM WARNING: Overwrite blocked to protect data integrity. "
+                        f"Existing file is {existing_size} bytes, but incoming content is only {len(content)} bytes ({int(len(content)/existing_size*100)}%). "
+                        f"If you intended to append, call write_file with mode='a'. If you intentionally wish to replace the file with this shorter content, write via execute_bash redirection.")
+
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             filename = os.path.basename(resolved_path)
             backup_dir = "/app/workspace/archive"
@@ -632,13 +649,16 @@ def write_file(filepath: str, content: str) -> str:
             backup_path = os.path.join(backup_dir, f"{filename}.{timestamp}.bak")
             shutil.copy2(resolved_path, backup_path)
             backup_msg = f"(Old version backed up to archive/{os.path.basename(backup_path)})"
+        elif file_exists and write_mode == "a":
+            backup_msg = f"(Content appended to existing file)"
         else:
             backup_msg = "(New file created)"
             
-        with open(resolved_path, "w", encoding="utf-8") as f:
+        with open(resolved_path, write_mode, encoding="utf-8") as f:
             f.write(content)
             
-        return f"SUCCESS: File saved to {resolved_path} {backup_msg}"
+        action_verb = "appended to" if write_mode == "a" else "saved to"
+        return f"SUCCESS: File {action_verb} {resolved_path} {backup_msg}"
     except Exception as e:
         return f"Error writing file: {str(e)}"
 
@@ -1114,7 +1134,10 @@ async def forge_and_register_plugin(
                 requires_match = re.search(r"# REQUIRES:\s*(.*)", code, re.IGNORECASE)
                 if requires_match:
                     raw_reqs = requires_match.group(1).replace("pip install", "").replace("pixi add", "").replace(",", " ").strip()
-                    safe_deps_list = shlex.split(raw_reqs)
+                    cleaned_reqs = re.sub(r'\(.*?\)', '', raw_reqs).strip()
+                    words = [w.strip() for w in cleaned_reqs.split() if w.strip()]
+                    ignored_words = {"none", "null", "nil", "standard", "stdlib", "library", "only", "built-in", "builtin", "no", "external", "dependencies", "deps", "-"}
+                    safe_deps_list = [w for w in words if re.match(r'^[A-Za-z0-9_]+[A-Za-z0-9_.-]*(?:\[.*\])?(?:[<>=!~].*)?$', w) and w.lower() not in ignored_words]
                     if safe_deps_list:
                         os.makedirs("/app/workspace/custom_packages", exist_ok=True)
                         proc_install = await asyncio.create_subprocess_exec(
@@ -2037,6 +2060,7 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
     
     # We build a multi-part message array
     user_content = [{"type": "text", "text": f"Instruction: {instruction}\n\n"}]
+    truncated_files_info = []
     
     try:
         # Pre-flight check: if all requested existing files are empty (0 bytes), return immediately
@@ -2080,8 +2104,10 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
                     file_content = text_file.read(50000) # Only reads the first 50k characters
                     
                 # Truncate to ~50k chars per file to prevent crashing the Analyst on multi-file requests
-                if len(file_content) == 50000:
-                    file_content += "\n... [TRUNCATED DUE TO SIZE]"
+                if len(file_content) == 50000 and file_size > 50000:
+                    pct = int((50000 / file_size) * 100)
+                    truncated_files_info.append(f"'{filename}' (read 50,000/{file_size} chars, {pct}%)")
+                    file_content += f"\n... [COVERAGE WARNING: TRUNCATED DUE TO SIZE — Read 50,000 of {file_size} chars ({pct}%). Tail omitted.]"
                     
                 user_content.append({"type": "text", "text": f"\n--- TEXT FILE: {filename} ---\n{file_content}\n"})
 
@@ -2176,14 +2202,18 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
             f.write(combined_text)
             
         # --- 4. YOUR DYNAMIC ROUTING LOGIC ---
+        coverage_banner = ""
+        if truncated_files_info:
+            coverage_banner = f"[COVERAGE WARNING: Partial read for: {', '.join(truncated_files_info)}. Findings may be incomplete; use grep or line ranges if needed.]\n\n"
+
         if len(combined_text) > 20000:
             # Return ONLY the summary
-            result_msg = (f"--- ANALYST EXECUTIVE SUMMARY FOR [{file_list}] ---\n{ex_summ}\n\n"
+            result_msg = (f"{coverage_banner}--- ANALYST EXECUTIVE SUMMARY FOR [{file_list}] ---\n{ex_summ}\n\n"
                     f"... [SYSTEM ALERT: The detailed report was {len(combined_text)} chars long. To protect your context window, "
                     f"the full analysis was saved to '/app/workspace/state/{filename}'.]")
         else:
             # Return BOTH
-            result_msg = f"--- ANALYST REPORT FOR [{file_list}] ---\n{combined_text}\n\n[SYSTEM: A backup of this report was saved to '/app/workspace/state/{filename}']"
+            result_msg = f"{coverage_banner}--- ANALYST REPORT FOR [{file_list}] ---\n{combined_text}\n\n[SYSTEM: A backup of this report was saved to '/app/workspace/state/{filename}']"
 
         if analyst_thinking:
             result_msg += f"\n<___ANALYST_THOUGHTS___>\n{analyst_thinking}\n</___ANALYST_THOUGHTS___>"

@@ -988,7 +988,7 @@ async def run_chat():
                                     # Determine if the output looks like a true execution failure
                                     is_error = False
                                     output_lower = output.lower()
-                                    if "system error:" in output_lower or "traceback (most recent" in output_lower or "error executing" in output_lower:
+                                    if "system error:" in output_lower or "traceback (most recent" in output_lower or "error executing" in output_lower or "unknown tool" in output_lower or "tool not found" in output_lower or "validation error" in output_lower:
                                         is_error = True
                                     elif "exit code:" in output_lower and "exit code: 0" not in output_lower:
                                         # Distinguish benign inspection status codes from true execution errors
@@ -1014,7 +1014,7 @@ async def run_chat():
                                         tool_last_failed_args[name] = ""
 
                                     # Trigger the intervention if stuck
-                                    if tool_failure_streaks.get(name, 0) >= 5:
+                                    if tool_failure_streaks.get(name, 0) >= 3:
                                         intervention_msg = (
                                             f"[CRITICAL SYSTEM ALERT: You have failed to use the '{name}' tool {tool_failure_streaks[name]} times in a row. "
                                             f"YOU ARE STUCK IN A LOOP. You MUST STOP trying the exact same command. "

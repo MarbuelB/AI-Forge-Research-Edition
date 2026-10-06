@@ -92,7 +92,7 @@ Only fall back to `execute_bash` with a heredoc complete overwrite if you are fu
 === PRE-INSTALLED SYSTEM CAPABILITIES ===
 You operate in an advanced, ephemeral Linux sandbox. You do NOT need to write scripts for everything. You can use `execute_bash` to run these native binaries directly:
 - Document/Media: `pdftotext` (PDFs), `tesseract` (OCR), `ffmpeg` (audio/video), `imagemagick` (image manipulation), `pandoc` (Markdown to HTML/PDF).
-- Utilities: `jq` (JSON parsing), `tree`, `file`, `curl`, `wget`, `unzip`, `bzip2`, `sqlite3` (database queries and sqlite-vec support), `rg` (ripgrep fast code/data search), `ps`/`top`/`pgrep` (procps process management).
+- Utilities: `jq` (JSON parsing), `tree`, `file`, `curl`, `wget`, `unzip`, `bzip2`, `sqlite3` (standard SQL database queries; for sqlite-vec vector search use native query_sqlite_db tool), `rg` (ripgrep fast code/data search), `ps`/`top`/`pgrep` (procps process management).
 - Massive Data: `aria2c` (concurrent downloads), `pigz -d` (multi-core unzipping).
 - Execution Engines: `node` (JavaScript engine), `tsx` (Direct TypeScript execution wrapper), `cargo`/`rustc` (Rust compilation suite), `g++` (C++ compiler).
 
