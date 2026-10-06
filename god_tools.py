@@ -214,6 +214,70 @@ def get_payload_tokens(messages):
     return text_tokens + image_tokens
 
 
+def read_file_slice(
+    filepath: str,
+    start_line: int = 1,
+    max_lines: int = None,
+    tail_mode: bool = False,
+    max_chars: int = 50000
+) -> tuple[str, int, int, int, bool]:
+    """Reads a bounded slice of a text file, reporting exact line numbers and coverage.
+    Returns: (content, line_start_idx, line_end_idx, total_lines, is_partial)
+    """
+    file_size = os.path.getsize(filepath)
+    if file_size == 0:
+        return "", 0, 0, 0, False
+
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        all_lines = f.readlines()
+
+    total_lines = len(all_lines)
+    if total_lines == 0:
+        return "", 0, 0, 0, False
+
+    if tail_mode:
+        candidate_lines = all_lines[-max_lines:] if (max_lines and max_lines > 0) else all_lines
+        selected = []
+        chars = 0
+        for line in reversed(candidate_lines):
+            if chars + len(line) > max_chars and selected:
+                break
+            selected.append(line)
+            chars += len(line)
+        selected.reverse()
+        start_idx = total_lines - len(selected) + 1
+        end_idx = total_lines
+        content = "".join(selected)
+    elif start_line > 1 or (max_lines is not None and max_lines > 0):
+        s_idx = max(0, start_line - 1)
+        e_idx = s_idx + max_lines if (max_lines and max_lines > 0) else total_lines
+        candidate_lines = all_lines[s_idx:e_idx]
+        selected = []
+        chars = 0
+        for line in candidate_lines:
+            if chars + len(line) > max_chars and selected:
+                break
+            selected.append(line)
+            chars += len(line)
+        start_idx = s_idx + 1
+        end_idx = s_idx + len(selected)
+        content = "".join(selected)
+    else:
+        selected = []
+        chars = 0
+        for line in all_lines:
+            if chars + len(line) > max_chars and selected:
+                break
+            selected.append(line)
+            chars += len(line)
+        start_idx = 1
+        end_idx = len(selected)
+        content = "".join(selected)
+
+    is_partial = (len(content) < file_size)
+    return content, start_idx, end_idx, total_lines, is_partial
+
+
 def gather_agent_context(filepaths: list[str] = None, max_chars_per_file: int = 40000) -> str:
     """Natively extracts and strings together absolute file contents inside the sandbox environment, 
     allowing sub-agents to read project code states without blowing out the main Overseer memory bank.
@@ -236,16 +300,25 @@ def gather_agent_context(filepaths: list[str] = None, max_chars_per_file: int = 
                     context_str += f"\n\n--- REFERENCE FILE STATE: {os.path.basename(resolved_path)} ---\n[SYSTEM NOTICE: This file is too massive ({file_size_bytes / 1024 / 1024:.2f} MB) to read directly. Use dedicated grep or chunk analysis tools.]"
                     continue
 
-                with open(resolved_path, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read(max_chars_per_file)
-                    
-                    # Calculate estimated token overhead for safe budgeting
-                    est_tokens = len(tokenizer.encode(content))
-                    
-                    context_str += f"\n\n--- REFERENCE FILE STATE: {os.path.basename(resolved_path)} (~{est_tokens} tokens) ---\n{content}"
-                    if len(content) >= max_chars_per_file and file_size_bytes > len(content):
-                        pct = int((len(content) / file_size_bytes) * 100)
-                        context_str += f"\n... [COVERAGE WARNING: TRUNCATED NATIVELY — Read {len(content)} of {file_size_bytes} chars ({pct}%). Tail omitted due to sub-agent budget limits.] ..."
+                content, start_idx, end_idx, total_lines, is_partial = read_file_slice(
+                    resolved_path, max_chars=max_chars_per_file
+                )
+                est_tokens = len(tokenizer.encode(content))
+                
+                if is_partial:
+                    pct = max(1, int((len(content) / file_size_bytes) * 100)) if file_size_bytes > 0 else 100
+                    context_str += (
+                        f"\n\n--- REFERENCE FILE STATE: {os.path.basename(resolved_path)} (~{est_tokens} tokens) "
+                        f"[PARTIALLY INGESTED: lines {start_idx}–{end_idx} of {total_lines:,} ({pct}% coverage)] ---\n"
+                        f"[COVERAGE BOUNDARY: Read first {len(content):,} of {file_size_bytes:,} chars (lines {start_idx} to {end_idx}). "
+                        f"The remaining {total_lines - end_idx:,} lines were omitted to protect sub-agent context budget. "
+                        f"ANTI-HALLUCINATION DIRECTIVE: Do NOT assume or guess function signatures, logic, or variables in unread lines {end_idx + 1}–{total_lines:,}.]\n"
+                        f"{content}\n"
+                        f"... [COVERAGE WARNING: TRUNCATED NATIVELY — Read lines {start_idx}–{end_idx} of {total_lines:,} ({pct}%). "
+                        f"Lines {end_idx + 1} to {total_lines:,} omitted. To inspect downstream lines, slice with bash 'sed -n \\'{end_idx + 1},{end_idx + 500}p\\' <path>' or 'grep'.] ..."
+                    )
+                else:
+                    context_str += f"\n\n--- REFERENCE FILE STATE: {os.path.basename(resolved_path)} (~{est_tokens} tokens, {total_lines:,} lines) [FULL CONTENT] ---\n{content}"
             except Exception as e:
                 context_str += f"\n\n[READ FAULT: {os.path.basename(resolved_path)} - Error: {str(e)}]"
         else:
@@ -274,27 +347,36 @@ def view_tool_registry(category: str = None) -> str:
 @mcp.tool()
 def manage_plan(action: str, content: str = None) -> str:
     """Reads or completely overwrites the Master Project Plan.
-    'action' must be exactly 'read' or 'write'.
+    'action' must be 'read' or 'write'.
     If action is 'write', you MUST provide the full, updated markdown text in 'content'.
     """
     plan_path = os.path.join(STATE_DIR, "active_plan.md")
+    normalized_action = action.strip().rstrip(">").rstrip(":").strip().lower() if action else ""
     
-    if action == "read":
+    if normalized_action == "read":
         if os.path.exists(plan_path):
             with open(plan_path, "r", encoding="utf-8") as f:
                 return f"--- CURRENT MASTER PLAN ---\n{f.read()}"
         else:
             return "No active plan exists yet. Please initialize one using the 'write' action."
             
-    elif action == "write":
+    elif normalized_action == "write":
         if not content:
             return "Error: You must provide the full markdown string in the 'content' argument to write."
+        if os.path.exists(plan_path):
+            try:
+                with open(plan_path, "r", encoding="utf-8") as f_cur:
+                    current_plan = f_cur.read()
+                if current_plan.strip() == content.strip():
+                    return "SUCCESS: Master Plan is already up to date (no changes detected)."
+            except Exception:
+                pass
         with open(plan_path, "w", encoding="utf-8") as f:
             f.write(content)
         return "SUCCESS: Master Plan has been updated and saved to disk."
         
     else:
-        return "Error: Invalid action. Must be 'read' or 'write'."
+        return f"Error: Invalid action '{action}'. Valid actions are 'read' and 'write'."
 
 @mcp.tool()
 async def consult_adviser(current_plan: str, encountered_problems: str, context_filepaths: list[str] = None) -> str:
@@ -363,12 +445,14 @@ async def consult_adviser(current_plan: str, encountered_problems: str, context_
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(file_body)
             
-        # Context guardrail: truncate preview for context window if advice exceeds 12,000 characters
-        if len(advice_text) > 12000:
-            preview = advice_text[:4000]
+        # Context guardrail: truncate preview for context window if advice exceeds 8,000 characters
+        if len(advice_text) > 8000:
+            preview = advice_text[:3000]
             display_feedback = (
-                f"{preview}\n\n... [SYSTEM: The full Adviser report ({len(advice_text)} chars) was saved to '{filepath}'. "
-                f"A truncated preview is shown above to protect your context window. Refer to the saved file or specific sections if needed.]"
+                f"{preview}\n\n... [SYSTEM CONTEXT GUARDRAIL: The full Adviser report ({len(advice_text):,} chars) was saved to '{filepath}'. "
+                f"A preview of the first 3,000 characters is shown above to protect your context window.\n"
+                f"HOW TO GET AROUND THIS TRUNCATION: Inspect specific sections of the saved report using analyze_files(['{filepath}'], ...) "
+                f"or bash tools: execute_bash('sed -n \\'100,200p\\' {filepath}') or 'grep'.]"
             )
         else:
             display_feedback = advice_text
@@ -580,12 +664,20 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
             with open(temp_file_path, "w", encoding="utf-8") as f:
                 f.write(output)
                 
+            total_lines = output.count('\n') + 1
             preview = output[:3000] # Give it just enough to see the structure/headers
+            preview_lines = preview.count('\n') + 1
             
             return (f"Exit Code: {process.returncode}\n"
-                    f"Output Preview (First 3000 chars):\n{preview}\n\n"
-                    f"... [SYSTEM: The full output ({len(output)} chars) was too large for your context window and was saved to '/app/workspace/sandbox/{temp_file_name}'. "
-                    f"Do NOT attempt to parse this preview. If you need the full data, use the 'analyze_files' tool or bash 'grep'.]")
+                    f"Output Preview (Lines 1–{preview_lines}, first 3,000 of {len(output):,} chars):\n{preview}\n\n"
+                    f"... [SYSTEM CONTEXT GUARDRAIL: Full command output is {len(output):,} characters ({total_lines:,} lines), "
+                    f"exceeding the 10,000 char threshold. The complete output was saved to '/app/workspace/sandbox/{temp_file_name}' "
+                    f"to protect your context window from blowing out.\n"
+                    f"HOW TO GET AROUND THIS TRUNCATION:\n"
+                    f"- To inspect the tail/end of the output (e.g. exit errors or summary counts): execute_bash('tail -n 100 /app/workspace/sandbox/{temp_file_name}')\n"
+                    f"- To inspect a specific line range: execute_bash('sed -n \\'100,200p\\' /app/workspace/sandbox/{temp_file_name}')\n"
+                    f"- To search for specific keywords: execute_bash('grep -n -C 3 \"ERROR\\|Exception\" /app/workspace/sandbox/{temp_file_name}')\n"
+                    f"- To delegate analysis of the entire file: analyze_files(['/app/workspace/sandbox/{temp_file_name}'], 'Find errors ...')]")
 
         return f"Exit Code: {process.returncode}\nOutput:\n{output}"
         
@@ -2038,9 +2130,11 @@ async def fetch_webpage(url: str) -> str:
                     
                 preview = clean_text[:6000]
                 
-                return (f"--- PREVIEW FROM {url} ---\n\n{preview}\n\n"
-                        f"... [SYSTEM: The webpage was {len(clean_text)} characters long. To protect your context window, "
-                        f"the full text was saved to '/app/workspace/sandbox/{temp_file_name}'. Use the 'analyze_files' tool to read it fully if needed.]")
+                return (f"--- PREVIEW FROM {url} (First 6,000 of {len(clean_text):,} chars) ---\n\n{preview}\n\n"
+                        f"... [SYSTEM CONTEXT GUARDRAIL: The webpage was {len(clean_text):,} characters long. To protect your context window, "
+                        f"the full text was saved to '/app/workspace/sandbox/{temp_file_name}'.\n"
+                        f"HOW TO GET AROUND THIS TRUNCATION: Inspect the full text using analyze_files(['/app/workspace/sandbox/{temp_file_name}'], ...) "
+                        f"or bash tools: execute_bash('grep -n -C 3 <pattern> /app/workspace/sandbox/{temp_file_name}') or 'sed'.]")
                 
             return f"--- CONTENT FROM {url} ---\n\n{clean_text}"
 
@@ -2049,11 +2143,20 @@ async def fetch_webpage(url: str) -> str:
 
 
 @mcp.tool()
-async def analyze_files(filepaths: list[str], instruction: str) -> str:
+async def analyze_files(
+    filepaths: list[str], 
+    instruction: str,
+    start_line: int = 1,
+    max_lines: int = None,
+    tail_mode: bool = False
+) -> str:
     """Delegates the analysis of multiple massive text files, logs, or images to the Analyst LLM.
     Use this to prevent large files from blowing out your context window, or to compare multiple files.
     'filepaths' must be a list of absolute paths to the files.
     'instruction' must be a specific question or command (e.g., "Compare these logs", "Find the error between this code and this log").
+    'start_line': 1-indexed line number to start reading from (defaults to 1). Use this to read a specific slice of a large file.
+    'max_lines': Maximum number of lines to read (capped at 50,000 characters per file to protect the Analyst context window).
+    'tail_mode': If True, reads from the end (tail) of the file up to 50,000 characters. Perfect for inspecting recent errors in large log files!
     """
     api_args = analyst_profile["api_params"].copy()
     api_args["model"] = analyst_profile["model"]
@@ -2100,16 +2203,23 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
                     user_content.append({"type": "text", "text": f"\n--- TEXT FILE: {filename} (EMPTY - 0 bytes) ---\n[This file is currently 0 bytes / empty. No data has been written to it.]\n"})
                     continue
 
-                with open(filepath, "r", encoding="utf-8", errors="replace") as text_file:
-                    file_content = text_file.read(50000) # Only reads the first 50k characters
+                content, start_idx, end_idx, total_lines, is_partial = read_file_slice(
+                    filepath, start_line=start_line, max_lines=max_lines, tail_mode=tail_mode, max_chars=50000
+                )
+
+                if is_partial:
+                    pct = max(1, int((len(content) / file_size) * 100)) if file_size > 0 else 100
+                    truncated_files_info.append(f"'{filename}' (read lines {start_idx}–{end_idx} of {total_lines:,}, {len(content):,}/{file_size:,} chars, {pct}%)")
                     
-                # Truncate to ~50k chars per file to prevent crashing the Analyst on multi-file requests
-                if len(file_content) == 50000 and file_size > 50000:
-                    pct = int((50000 / file_size) * 100)
-                    truncated_files_info.append(f"'{filename}' (read 50,000/{file_size} chars, {pct}%)")
-                    file_content += f"\n... [COVERAGE WARNING: TRUNCATED DUE TO SIZE — Read 50,000 of {file_size} chars ({pct}%). Tail omitted.]"
-                    
-                user_content.append({"type": "text", "text": f"\n--- TEXT FILE: {filename} ---\n{file_content}\n"})
+                    coverage_header = (
+                        f"[COVERAGE BOUNDARY: Read lines {start_idx} to {end_idx} of {total_lines:,} total lines "
+                        f"({len(content):,} of {file_size:,} chars, {pct}% coverage). "
+                        f"Lines outside this window were omitted to protect your context window. "
+                        f"MANDATORY: State this coverage explicitly in your report. Do NOT guess or extrapolate events or errors outside this ingested window.]\n"
+                    )
+                    content = coverage_header + content + f"\n... [END OF INGESTED SLICE (lines {start_idx}–{end_idx} of {total_lines:,})] ..."
+
+                user_content.append({"type": "text", "text": f"\n--- TEXT FILE: {filename} ---\n{content}\n"})
 
         api_args["messages"] = [
             {"role": "system", "content": config.PROMPTS["analyst_system"]},
@@ -2204,13 +2314,21 @@ async def analyze_files(filepaths: list[str], instruction: str) -> str:
         # --- 4. YOUR DYNAMIC ROUTING LOGIC ---
         coverage_banner = ""
         if truncated_files_info:
-            coverage_banner = f"[COVERAGE WARNING: Partial read for: {', '.join(truncated_files_info)}. Findings may be incomplete; use grep or line ranges if needed.]\n\n"
+            coverage_banner = (
+                f"[COVERAGE WARNING: Partial read for: {', '.join(truncated_files_info)}.\n"
+                f"The Analyst ONLY analyzed the ingested lines. Do NOT assume facts about unread lines.\n"
+                f"HOW TO GET AROUND THIS TRUNCATION:\n"
+                f"- To inspect a subsequent slice: analyze_files(filepaths=[...], instruction='...', start_line=<N>)\n"
+                f"- To inspect the tail of a log file: analyze_files(filepaths=[...], instruction='...', tail_mode=True)\n"
+                f"- Or use execute_bash with: 'tail -n 200 <path>', 'sed -n \\'<start>,<end>p\\' <path>', or 'grep -n <pattern> <path>'.]\n\n"
+            )
 
         if len(combined_text) > 20000:
             # Return ONLY the summary
             result_msg = (f"{coverage_banner}--- ANALYST EXECUTIVE SUMMARY FOR [{file_list}] ---\n{ex_summ}\n\n"
-                    f"... [SYSTEM ALERT: The detailed report was {len(combined_text)} chars long. To protect your context window, "
-                    f"the full analysis was saved to '/app/workspace/state/{filename}'.]")
+                    f"... [SYSTEM ALERT: The detailed report was {len(combined_text):,} chars long. To protect your context window, "
+                    f"the full analysis was saved to '/app/workspace/state/{filename}'.\n"
+                    f"HOW TO GET AROUND THIS TRUNCATION: Inspect specific sections using 'analyze_files' or bash 'sed/grep' on '/app/workspace/state/{filename}'.]")
         else:
             # Return BOTH
             result_msg = f"{coverage_banner}--- ANALYST REPORT FOR [{file_list}] ---\n{combined_text}\n\n[SYSTEM: A backup of this report was saved to '/app/workspace/state/{filename}']"

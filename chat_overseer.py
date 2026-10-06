@@ -274,7 +274,8 @@ def compact_historical_tool_outputs(messages, protect_recent: int = 20, max_head
                 compacted_body = (
                     f"{head}\n\n"
                     f"[... {len(content) - max_head - max_tail:,} {COMPACTION_MARKER} for context efficiency. "
-                    f"Full output saved to '/app/workspace/{rel_path}' ...]\n\n"
+                    f"Full output safely preserved at '/app/workspace/{rel_path}'. "
+                    f"To inspect the full archived output, use analyze_files or bash grep/cat on '/app/workspace/{rel_path}' ...]\n\n"
                     f"{tail}"
                 )
                 msg_copy = copy.copy(msg)
@@ -1001,7 +1002,7 @@ async def run_chat():
                                             is_error = True
 
                                     # Update the streak, tracking command variance so pivoting does not trigger false loops
-                                    cmd_fingerprint = str(args) if isinstance(args, dict) else ""
+                                    cmd_fingerprint = json.dumps(args, sort_keys=True) if isinstance(args, dict) else str(args)
                                     if is_error:
                                         prev_cmd = tool_last_failed_args.get(name, "")
                                         if prev_cmd and prev_cmd == cmd_fingerprint:
