@@ -1154,10 +1154,18 @@ async def forge_and_register_plugin(
     language: str = "python",
     context_filepaths: list[str] = None  # ◄--- Universal Context Entrypoint
 ) -> str:
-    """Delegates code writing to the Coder LLM and maps the artifact with rich metadata execution patterns.
-    'plugin_name' should exclude standard trailing extensions.
-    'language' parameter supports exact validation strategies: 'python', 'javascript', 'typescript', 'rust', 'cpp'.
-    'context_filepaths' allows passing a list of absolute file paths that the Coder must read to adapt to your existing systems.
+    """Delegates code writing to the Coder LLM, validates compilation, and registers the plugin.
+    CRITICAL: Set 'language' explicitly to match your objective!
+    - 'language': Target programming language: 'python' (default), 'rust', 'cpp', 'javascript', or 'typescript'.
+      If your objective asks for Rust (cargo/rustc), you MUST pass language='rust'.
+      If your objective asks for C++, you MUST pass language='cpp'.
+      If your objective asks for TypeScript, you MUST pass language='typescript'.
+    - 'plugin_name': Base filename for the tool (without file extension, e.g. 'kmer_counter').
+    - 'category': Grouping tag (e.g. 'bioinformatics', 'database', 'parsing').
+    - 'category_description': Brief description of the category.
+    - 'plugin_description': Summary of what this tool does.
+    - 'objective': Detailed functional requirements, CLI arguments, I/O formats, and logic for the Coder.
+    - 'context_filepaths': Optional list of absolute file paths for the Coder to read to adapt to existing schemas/code.
     """
     lang_map = {
         "python": {"ext": ".py", "block": "python"},
@@ -1272,8 +1280,8 @@ async def forge_and_register_plugin(
                             if c:
                                 extra_deps.append(c if "=" in c else f'{c} = "*"')
                                 
-                deps_lines = ['rand = "0.8"'] + extra_deps
-                deps_block = "\n".join(deps_lines) + "\n"
+                deps_lines = extra_deps
+                deps_block = "\n".join(deps_lines) + ("\n" if deps_lines else "")
                 
                 cargo_toml_content = f"""[package]
 name = "check_rust"
@@ -1351,9 +1359,10 @@ edition = "2021"
                         f"cd /app/workspace/sandbox/{safe_name}_project && cargo run')"
                     )
 
-                logger.info(f"[forge_and_register_plugin] Successfully registered '{plugin_name}' ({target_lang}) on attempt {attempt+1}")
+                code_lines = len(code.splitlines())
                 report = f"SUCCESS (Attempt {attempt+1}): {language.upper()} Asset '{plugin_name}' saved to registry.\n"
-                report += f"[Tokens: {tokens_in} in | {tokens_out} out]\n{deps_report}Execution Blueprint: {run_hint}\n\n<___CODER_CODE___>\n{code}\n</___CODER_CODE___>"
+                report += f"[File: {file_path} | Lines: {code_lines} | Size: {len(code):,} bytes]\n"
+                report += f"[Tokens: {tokens_in} in | {tokens_out} out]\n{deps_report}Execution Blueprint: {run_hint}"
                 if coder_thinking: report += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
                 return report
             else:
