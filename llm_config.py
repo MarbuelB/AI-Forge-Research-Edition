@@ -134,12 +134,12 @@ LLM_PROFILES = [
         "api_key": "sk-sandbox-fake-key",
         "model": "Qwen3.8-Flash-Next-FP8",
         "api_params": {
-            "temperature": 1.0,
-            "top_p": 0.95,
+            "temperature": 0.7, # 1.0 for thinking
+            "top_p": 0.80, # 0.95 for thinking
             "reasoning_effort": "low",
             "max_tokens": 65536,
-            "presence_penalty": 0.0,
-            "timeout": 180.0,
+            "presence_penalty": 1.5, # 0.0 for thinking
+            "timeout": 600.0,
             "extra_body": {
                 "top_k": 20,
                 "min_p": 0.0,
@@ -156,12 +156,12 @@ LLM_PROFILES = [
         "api_key": "sk-sandbox-fake-key",
         "model": "Qwen3.8-Flash-Next-FP8",
         "api_params": {
-            "temperature": 1.0,
-            "top_p": 0.95,
+            "temperature": 0.7, # 1.0 for thinking
+            "top_p": 0.80, # 0.95 for thinking
             "reasoning_effort": "low",
             "max_tokens": 65536,
-            "presence_penalty": 0.0,
-            "timeout": 180.0,
+            "presence_penalty": 1.5, # 0.0 for thinking
+            "timeout": 600.0,
             "extra_body": {
                 "top_k": 20,
                 "min_p": 0.0,

@@ -647,6 +647,7 @@ async def run_chat():
 
                         # --- ESCALATING LOOP DETECTION (INIT) ---
                         consecutive_tool_chains = 0
+                        consecutive_no_tool_turns = 0
                         
                         while True:
                             try:
@@ -911,7 +912,19 @@ async def run_chat():
                                         print(f"{COLOR_YELLOW}[Tokens{est_tag}: {final_usage.prompt_tokens} in | {final_usage.completion_tokens} out]{COLOR_RESET}")
 
                                 if not tool_calls_dict:
+                                    if cli_args.exit and consecutive_no_tool_turns == 0:
+                                        consecutive_no_tool_turns += 1
+                                        nudge_msg = config.PROMPTS["autonomous_audit_nudge"]
+                                        messages = load_history()
+                                        messages.append({"role": "user", "content": nudge_msg})
+                                        save_history(messages)
+                                        if config.VERBOSITY_MODE != "silent":
+                                            print(f"\n{COLOR_YELLOW}{nudge_msg}{COLOR_RESET}", flush=True)
+                                        log_event("SYSTEM", nudge_msg)
+                                        continue
                                     break
+
+                                consecutive_no_tool_turns = 0
 
                                 for tc_data in assistant_message["tool_calls"]:
                                     name = tc_data["function"]["name"]
