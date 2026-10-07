@@ -800,6 +800,7 @@ EOF
     mkdir -p "$SCRIPT_DIR/my_host_input"
     mkdir -p "$SCRIPT_DIR/sessions"
     mkdir -p "$SCRIPT_DIR/plugins"
+    mkdir -p "$SCRIPT_DIR/logs"
     log_done "Folders initialized."
 
     # 7. Self-Test / Verification
