@@ -135,17 +135,29 @@ embedding_client = AsyncOpenAI(
 
 # --- HELPER FUNCTIONS ---
 def extract_thinking_and_content(message) -> tuple[str, str]:
-    """Extracts thinking/reasoning content and main text content from an OpenAI message object."""
-    thinking = getattr(message, 'reasoning_content', None)
-    if not thinking and hasattr(message, 'model_extra') and message.model_extra:
-        thinking = message.model_extra.get('reasoning_content') or message.model_extra.get('reasoning')
+    """Extracts thinking/reasoning content and main text content from an OpenAI message object or dict."""
+    thinking = None
+    if isinstance(message, dict):
+        thinking = message.get('reasoning_content') or message.get('reasoning')
+        content = message.get('content') or ""
+    else:
+        thinking = getattr(message, 'reasoning_content', None)
+        if not thinking and hasattr(message, 'model_extra') and message.model_extra:
+            thinking = message.model_extra.get('reasoning_content') or message.model_extra.get('reasoning')
+        content = getattr(message, 'content', None) or ""
     
-    content = message.content or ""
-    if not thinking and "<think>" in content:
-        think_match = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
-        if think_match:
-            thinking = think_match.group(1).strip()
-            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    if not thinking:
+        for tag in ["think", "thought"]:
+            if f"<{tag}>" in content:
+                think_match = re.search(rf"<{tag}>(.*?)</{tag}>", content, re.DOTALL)
+                if think_match:
+                    thinking = think_match.group(1).strip()
+                    content = re.sub(rf"<{tag}>.*?</{tag}>", "", content, flags=re.DOTALL).strip()
+                    break
+                elif content.strip().startswith(f"<{tag}>"):
+                    thinking = re.sub(rf"^<{tag}>\s*", "", content, flags=re.DOTALL).strip()
+                    content = ""
+                    break
             
     return (thinking or "").strip(), (content or "").strip()
 
@@ -1337,6 +1349,7 @@ edition = "2021"
                 report += f"[File: {file_path} | Lines: {code_lines} | Size: {len(code):,} bytes]\n"
                 report += f"[Tokens: {tokens_in} in | {tokens_out} out]\n{deps_report}Execution Blueprint: {run_hint}"
                 if coder_thinking: report += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
+                report += f"\n<___CODER_CODE___>\n{code}\n</___CODER_CODE___>"
                 return report
             else:
                 last_validation_error = err_msg.strip() if err_msg else "Syntax validation failed"
@@ -2294,8 +2307,11 @@ async def analyze_files(
         filename = f"{timestamp}_analyst_report.md"
         filepath = os.path.join(STATE_DIR, filename)
         
+        report_body = combined_text
+        if analyst_thinking:
+            report_body = f"<details>\n<summary>Analyst Reasoning & Strategy</summary>\n\n{analyst_thinking}\n\n</details>\n\n{combined_text}"
         with open(filepath, "w", encoding="utf-8") as f:
-            f.write(combined_text)
+            f.write(report_body)
             
         # --- 4. YOUR DYNAMIC ROUTING LOGIC ---
         coverage_banner = ""

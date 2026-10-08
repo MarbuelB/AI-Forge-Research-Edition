@@ -413,7 +413,15 @@ def log_event(role, content, usage=None, thinking=None, text_color=None, hide_co
         file_msg += f"<thinking>\n{thinking}\n</thinking>\n\n"
     file_msg += f"{content}\n"
     if usage and usage.prompt_tokens is not None:
-        file_msg += f"[Tokens: {usage.prompt_tokens} in | {usage.completion_tokens} out]\n"
+        reasoning_str = ""
+        r_tokens = 0
+        if hasattr(usage, 'completion_tokens_details') and usage.completion_tokens_details:
+            r_tokens = getattr(usage.completion_tokens_details, 'reasoning_tokens', 0)
+        if r_tokens == 0 and thinking:
+            r_tokens = len(thinking) // 4
+        if r_tokens > 0:
+            reasoning_str = f" (~{r_tokens} thinking)"
+        file_msg += f"[Tokens: {usage.prompt_tokens} in | {usage.completion_tokens} out{reasoning_str}]\n"
         
     with open(LOG_FILE, "a", encoding="utf-8") as f: 
         f.write(file_msg)
@@ -887,8 +895,21 @@ async def run_chat():
 
                                 # If mode is "silent", we do nothing visually!
                                 if config.VERBOSITY_MODE != "silent":
-                                    print() # Drop a clean newline after the stream is fully finished
-                                    
+                                    print()  # Drop a clean newline after the stream is fully finished
+
+                                if not full_thinking and full_content:
+                                    for tag in ["think", "thought"]:
+                                        if f"<{tag}>" in full_content:
+                                            think_match = re.search(rf"<{tag}>(.*?)</{tag}>", full_content, re.DOTALL)
+                                            if think_match:
+                                                full_thinking = think_match.group(1).strip()
+                                                full_content = re.sub(rf"<{tag}>.*?</{tag}>", "", full_content, flags=re.DOTALL).strip()
+                                                break
+                                            elif full_content.strip().startswith(f"<{tag}>"):
+                                                full_thinking = re.sub(rf"^<{tag}>\s*", "", full_content, flags=re.DOTALL).strip()
+                                                full_content = ""
+                                                break
+
                                 assistant_message = {"role": "assistant", "content": full_content}
                                 
                                 if full_thinking:
