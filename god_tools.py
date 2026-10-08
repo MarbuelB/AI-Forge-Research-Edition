@@ -290,6 +290,72 @@ def read_file_slice(
     return content, start_idx, end_idx, total_lines, is_partial
 
 
+def filter_file_lines(
+    filepath: str,
+    pattern: str,
+    context_lines: int = 2,
+    max_chars: int = 250000
+) -> tuple[str, int, int, int, bool]:
+    """Scans a file using regex/keyword matching and extracts matching lines 
+    along with surrounding context lines. Merges contiguous/overlapping windows.
+    Returns: (formatted_content, total_matches, included_matches, total_lines, is_partial)
+    """
+    file_size = os.path.getsize(filepath)
+    if file_size == 0:
+        return "", 0, 0, 0, False
+
+    try:
+        regex = re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        regex = re.compile(re.escape(pattern), re.IGNORECASE)
+
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        all_lines = f.readlines()
+
+    total_lines = len(all_lines)
+    if total_lines == 0:
+        return "", 0, 0, 0, False
+
+    match_indices = [idx + 1 for idx, l in enumerate(all_lines) if regex.search(l)]
+    total_matches = len(match_indices)
+    if total_matches == 0:
+        return f"[NO MATCHES: Filter pattern '{pattern}' found 0 occurrences across {total_lines:,} total lines.]", 0, 0, total_lines, False
+
+    intervals = []
+    for m_idx in match_indices:
+        start = max(1, m_idx - context_lines)
+        end = min(total_lines, m_idx + context_lines)
+        if intervals and start <= intervals[-1][1] + 1:
+            intervals[-1] = (intervals[-1][0], max(intervals[-1][1], end))
+        else:
+            intervals.append((start, end))
+
+    blocks = []
+    current_chars = 0
+    included_matches = 0
+    is_partial = False
+
+    for (start, end) in intervals:
+        interval_matches = [m for m in match_indices if start <= m <= end]
+        lines_text = []
+        for l_no in range(start, end + 1):
+            prefix = ">>>" if l_no in match_indices else "   "
+            lines_text.append(f"{prefix} {l_no:6d} | {all_lines[l_no - 1]}")
+        block_str = f"--- [Lines {start}–{end}] ---\n" + "".join(lines_text)
+        if current_chars + len(block_str) > max_chars and blocks:
+            is_partial = True
+            break
+        blocks.append(block_str)
+        current_chars += len(block_str)
+        included_matches += len(interval_matches)
+
+    if len(intervals) > len(blocks):
+        is_partial = True
+
+    content = "\n\n".join(blocks)
+    return content, total_matches, included_matches, total_lines, is_partial
+
+
 def gather_agent_context(filepaths: list[str] = None, max_chars_per_file: int = 40000) -> str:
     """Natively extracts and strings together absolute file contents inside the sandbox environment, 
     allowing sub-agents to read project code states without blowing out the main Overseer memory bank.
@@ -2147,15 +2213,23 @@ async def analyze_files(
     instruction: str,
     start_line: int = 1,
     max_lines: int = None,
-    tail_mode: bool = False
+    tail_mode: bool = False,
+    max_chars: int = None,
+    filter_pattern: str = None,
+    context_lines: int = 2
 ) -> str:
     """Delegates the analysis of multiple massive text files, logs, or images to the Analyst LLM.
     Use this to prevent large files from blowing out your context window, or to compare multiple files.
-    'filepaths' must be a list of absolute paths to the files.
-    'instruction' must be a specific question or command (e.g., "Compare these logs", "Find the error between this code and this log").
-    'start_line': 1-indexed line number to start reading from (defaults to 1). Use this to read a specific slice of a large file.
-    'max_lines': Maximum number of lines to read (capped at 50,000 characters per file to protect the Analyst context window).
-    'tail_mode': If True, reads from the end (tail) of the file up to 50,000 characters. Perfect for inspecting recent errors in large log files!
+    
+    Parameters:
+    - filepaths: List of absolute paths to the files (text or images).
+    - instruction: Specific question or analysis directive (e.g., "Find all error root causes and timeout occurrences").
+    - filter_pattern: Optional regex or keyword pattern to filter massive files (e.g., "ERROR|Traceback|TimeoutException"). When specified, extracts all matching lines and surrounding context lines with line numbers instead of reading sequentially.
+    - context_lines: Number of surrounding lines of context to include around each match when filter_pattern is set (defaults to 2).
+    - start_line: 1-indexed line number to start reading from when reading sequentially (defaults to 1).
+    - max_lines: Maximum number of lines to read sequentially.
+    - tail_mode: If True, reads from the end (tail) of the file up to the character budget. Perfect for inspecting recent errors in large log files!
+    - max_chars: Optional manual character limit per file. If omitted, the budget dynamically scales up to 80% of the Analyst's context window (~280,000 characters / ~70,000 tokens for a single file).
     """
     api_args = analyst_profile["api_params"].copy()
     api_args["model"] = analyst_profile["model"]
@@ -2170,6 +2244,16 @@ async def analyze_files(
         if existing_files and all(os.path.getsize(f) == 0 for f in existing_files):
             file_names = ", ".join([os.path.basename(f) for f in existing_files])
             return f"SYSTEM NOTICE: Target file(s) [{file_names}] are currently 0 bytes (empty). No content or tracebacks exist to analyze."
+
+        # Dynamically scale the per-file ingestion budget based on Analyst profile capacity (80% safe ceiling)
+        max_context = analyst_profile.get("context_window", analyst_profile.get("max_context_tokens", config.MAX_CONTEXT_TOKENS))
+        safe_budget = int(max_context * 0.80)  # Conservative 80% ceiling to account for tokenizer variance & report response room
+        
+        available_text_tokens = max(10000, safe_budget - 5000)
+        total_char_budget = int(available_text_tokens * 3.2)  # Conservative 3.2 chars/token
+        num_text_files = max(1, len([f for f in filepaths if os.path.exists(f) and not os.path.isdir(f) and not (mimetypes.guess_type(f)[0] and mimetypes.guess_type(f)[0].startswith('image/'))]))
+        allocated_chars = max(40000, min(280000, total_char_budget // num_text_files))
+        effective_max_chars = max_chars if (max_chars and max_chars > 0) else allocated_chars
 
         for filepath in filepaths:
             if not os.path.exists(filepath):
@@ -2202,23 +2286,51 @@ async def analyze_files(
                     user_content.append({"type": "text", "text": f"\n--- TEXT FILE: {filename} (EMPTY - 0 bytes) ---\n[This file is currently 0 bytes / empty. No data has been written to it.]\n"})
                     continue
 
-                content, start_idx, end_idx, total_lines, is_partial = read_file_slice(
-                    filepath, start_line=start_line, max_lines=max_lines, tail_mode=tail_mode, max_chars=50000
-                )
-
-                if is_partial:
-                    pct = max(1, int((len(content) / file_size) * 100)) if file_size > 0 else 100
-                    truncated_files_info.append(f"'{filename}' (read lines {start_idx}–{end_idx} of {total_lines:,}, {len(content):,}/{file_size:,} chars, {pct}%)")
-                    
-                    coverage_header = (
-                        f"[COVERAGE BOUNDARY: Read lines {start_idx} to {end_idx} of {total_lines:,} total lines "
-                        f"({len(content):,} of {file_size:,} chars, {pct}% coverage). "
-                        f"Lines outside this window were omitted to protect your context window. "
-                        f"MANDATORY: State this coverage explicitly in your report. Do NOT guess or extrapolate events or errors outside this ingested window.]\n"
+                if filter_pattern:
+                    content, total_matches, included_matches, total_lines, is_partial = filter_file_lines(
+                        filepath, filter_pattern, context_lines=context_lines, max_chars=effective_max_chars
                     )
-                    content = coverage_header + content + f"\n... [END OF INGESTED SLICE (lines {start_idx}–{end_idx} of {total_lines:,})] ..."
+                    if is_partial:
+                        pct = max(1, int((included_matches / total_matches) * 100)) if total_matches > 0 else 100
+                        truncated_files_info.append(
+                            f"'{filename}' [FILTER: '{filter_pattern}'] ({included_matches} of {total_matches} matches, {len(content):,} chars, {pct}%)"
+                        )
+                        coverage_header = (
+                            f"[FILTERED EXTRACTION: Pattern '{filter_pattern}' matched {total_matches} occurrences across {total_lines:,} total lines.\n"
+                            f"INCLUDED IN THIS WINDOW: First {included_matches} matches ({len(content):,} chars, {pct}% coverage). Remaining {total_matches - included_matches} matches were omitted to protect context window limits.\n"
+                            f"MANDATORY INSTRUCTION FOR ANALYST:\n"
+                            f"- State this filtered coverage explicitly in your executive summary.\n"
+                            f"- Do NOT assume what occurred in the omitted {total_matches - included_matches} matches.\n"
+                            f"- If your analysis requires inspecting the remaining matches or other sections, explicitly advise the Brain in your next steps to narrow the filter pattern or inspect specific line ranges with `start_line`.]\n"
+                        )
+                    else:
+                        coverage_header = (
+                            f"[FILTERED EXTRACTION: Pattern '{filter_pattern}' matched {total_matches} occurrences across {total_lines:,} total lines (100% of matches included, {len(content):,} chars).\n"
+                            f"Note: Only lines matching the filter and their context (±{context_lines} lines) are displayed. Matching lines are prefixed with '>>>'.]\n"
+                        )
+                    content = coverage_header + content
+                    user_content.append({"type": "text", "text": f"\n--- TEXT FILE (FILTERED): {filename} ---\n{content}\n"})
+                else:
+                    content, start_idx, end_idx, total_lines, is_partial = read_file_slice(
+                        filepath, start_line=start_line, max_lines=max_lines, tail_mode=tail_mode, max_chars=effective_max_chars
+                    )
 
-                user_content.append({"type": "text", "text": f"\n--- TEXT FILE: {filename} ---\n{content}\n"})
+                    if is_partial:
+                        pct = max(1, int((len(content) / file_size) * 100)) if file_size > 0 else 100
+                        truncated_files_info.append(f"'{filename}' (read lines {start_idx}–{end_idx} of {total_lines:,}, {len(content):,}/{file_size:,} chars, {pct}%)")
+                        
+                        coverage_header = (
+                            f"[COVERAGE BOUNDARY: Read lines {start_idx} to {end_idx} of {total_lines:,} total lines "
+                            f"({len(content):,} of {file_size:,} chars, {pct}% coverage). "
+                            f"Lines outside this window were omitted to protect context window limits.\n"
+                            f"MANDATORY INSTRUCTION FOR ANALYST:\n"
+                            f"- State this crop/coverage explicitly in your executive summary.\n"
+                            f"- Do NOT assume, extrapolate, or hallucinate events or errors in unread lines (lines {end_idx + 1}–{total_lines:,}).\n"
+                            f"- If your analysis requires inspecting unread parts of this file, explicitly advise the Brain in your next steps to retrieve subsequent chunks (e.g. `analyze_files(..., start_line={end_idx + 1})`), inspect the tail (`tail_mode=True`), or apply a targeted filter (`filter_pattern='...'`).]\n"
+                        )
+                        content = coverage_header + content + f"\n... [END OF INGESTED SLICE (lines {start_idx}–{end_idx} of {total_lines:,})] ..."
+
+                    user_content.append({"type": "text", "text": f"\n--- TEXT FILE: {filename} ---\n{content}\n"})
 
         api_args["messages"] = [
             {"role": "system", "content": config.PROMPTS["analyst_system"]},
@@ -2226,18 +2338,15 @@ async def analyze_files(
         ]
         
         # --- DYNAMIC PAYLOAD CHECKER ---
-        # 1. Look up the context limit for the Analyst profile
-        max_context = analyst_profile.get("context_window", analyst_profile.get("max_context_tokens", config.MAX_CONTEXT_TOKENS))
-        safe_budget = int(max_context * 0.90) # Leave 10% for the response!
-        
-        # 2. Accurately measure what we are about to send
+        # 1. Accurately measure what we are about to send
         payload_tokens = get_payload_tokens(api_args["messages"])
         
-        # 3. Bounce the request back to the Brain if it's too massive
+        # 2. Bounce the request back to the Brain if it's too massive
         if payload_tokens > safe_budget:
-            return (f"SYSTEM ERROR: The files you asked the Analyst to read are too massive! "
-                    f"Your payload is {payload_tokens} tokens, but the safety limit is {safe_budget} tokens. "
-                    f"Please run 'analyze_files' on fewer files at a time, or use bash tools like 'head', 'tail', or 'grep' to narrow down the data first.")
+            return (f"SYSTEM ERROR: The data sent to the Analyst is too massive! "
+                    f"Your payload is {payload_tokens} tokens, but the safe 80% limit is {safe_budget} tokens. "
+                    f"Please run 'analyze_files' with 'filter_pattern' (e.g. filter_pattern='ERROR|Traceback'), "
+                    f"or use 'start_line'/'max_lines' to analyze in smaller slices.")
                     
         # --- 1. FORCE THE JSON SCHEMA ---
         api_args["response_format"] = {
@@ -2317,12 +2426,13 @@ async def analyze_files(
         coverage_banner = ""
         if truncated_files_info:
             coverage_banner = (
-                f"[COVERAGE WARNING: Partial read for: {', '.join(truncated_files_info)}.\n"
-                f"The Analyst ONLY analyzed the ingested lines. Do NOT assume facts about unread lines.\n"
-                f"HOW TO GET AROUND THIS TRUNCATION:\n"
+                f"[COVERAGE ALERT: Partial read or filtered extraction applied to: {', '.join(truncated_files_info)}.\n"
+                f"The Analyst ONLY analyzed the ingested window. Do NOT assume facts about unread lines.\n"
+                f"HOW TO GET SUBSEQUENT CHUNKS OR TARGETED DATA:\n"
                 f"- To inspect a subsequent slice: analyze_files(filepaths=[...], instruction='...', start_line=<N>)\n"
                 f"- To inspect the tail of a log file: analyze_files(filepaths=[...], instruction='...', tail_mode=True)\n"
-                f"- Or use execute_bash with: 'tail -n 200 <path>', 'sed -n \\'<start>,<end>p\\' <path>', or 'grep -n <pattern> <path>'.]\n\n"
+                f"- To extract specific keywords/errors: analyze_files(filepaths=[...], instruction='...', filter_pattern='<regex>')\n"
+                f"- Or inspect via bash: execute_bash('sed -n \\'<start>,<end>p\\' <path>')]\n\n"
             )
 
         if len(combined_text) > 20000:
