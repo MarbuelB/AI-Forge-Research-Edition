@@ -161,6 +161,63 @@ def extract_thinking_and_content(message) -> tuple[str, str]:
             
     return (thinking or "").strip(), (content or "").strip()
 
+def extract_json_payload(raw_text: str):
+    """
+    Robustly extracts and parses a JSON payload from an LLM response string.
+    Handles:
+    1. Pure valid JSON strings.
+    2. JSON wrapped in markdown fences (```json ... ``` or ``` ... ```).
+    3. JSON containing inner markdown fences inside string values without corrupting the outer structure.
+    4. Leading or trailing conversational text wrapping a JSON object or array.
+    """
+    if not raw_text or not isinstance(raw_text, str):
+        raise json.JSONDecodeError("Empty or non-string input", str(raw_text), 0)
+    
+    clean_text = raw_text.strip()
+    
+    # 1. Direct parse attempt (fastest, cleanest, handles inner markdown untouched)
+    try:
+        return json.loads(clean_text)
+    except Exception:
+        pass
+        
+    # 2. Outer markdown code fence stripping
+    if clean_text.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*\r?\n?", "", clean_text, flags=re.IGNORECASE)
+        stripped = re.sub(r"\r?\n?```\s*$", "", stripped).strip()
+        try:
+            return json.loads(stripped)
+        except Exception:
+            pass
+
+    # 3. Outer code block regex (matching outermost ``` fence)
+    match = re.search(r"```(?:json)?\s*(\{.*\}|\[.*\])\s*```", clean_text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1).strip())
+        except Exception:
+            pass
+
+    # 4. Outermost brace/bracket extraction (for conversational wrapper text)
+    first_brace = clean_text.find("{")
+    last_brace = clean_text.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        try:
+            return json.loads(clean_text[first_brace:last_brace+1])
+        except Exception:
+            pass
+
+    first_bracket = clean_text.find("[")
+    last_bracket = clean_text.rfind("]")
+    if first_bracket != -1 and last_bracket != -1 and last_bracket > first_bracket:
+        try:
+            return json.loads(clean_text[first_bracket:last_bracket+1])
+        except Exception:
+            pass
+
+    # 5. Fallback: try raw json.loads to raise standard JSONDecodeError
+    return json.loads(clean_text)
+
 def load_json(filepath):
     if not os.path.exists(filepath): return {}
     with open(filepath, "r") as f: return json.load(f)
@@ -1027,7 +1084,7 @@ async def compress_and_store_context() -> str:
             thinking_tokens = len(mem_thinking) // 4
         config.log_token_usage(STATE_DIR, "summarizer", tokens_in, tokens_out, thinking_tokens)
 
-        mem_data = json.loads(mem_raw_content)
+        mem_data = extract_json_payload(mem_raw_content)
         for memory in mem_data.get("extracted_memories", []):
             cat = memory["category"]
             cat_desc = memory["category_description"]
@@ -1138,7 +1195,7 @@ async def compress_and_store_context() -> str:
             thinking_tokens = len(handoff_thinking) // 4
         config.log_token_usage(STATE_DIR, "summarizer", tokens_in, tokens_out, thinking_tokens)
 
-        handoff_data = json.loads(handoff_raw_content)
+        handoff_data = extract_json_payload(handoff_raw_content)
         handoff_markdown = handoff_data.get("handoff_markdown", "")
 
         # Backup the old bloated history before overwriting
@@ -1572,14 +1629,9 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
             thinking_tokens = len(coder_thinking) // 4
         config.log_token_usage(STATE_DIR, "coder", tokens_in, tokens_out, thinking_tokens)
 
-        if "```" in raw_json_str:
-            match = re.search(r"```(?:json)?\s*(.*?)\s*```", raw_json_str, re.DOTALL)
-            if match:
-                raw_json_str = match.group(1).strip()
-
         # Parse structural change instructions safely
         try:
-            edit_data = json.loads(raw_json_str)
+            edit_data = extract_json_payload(raw_json_str)
         except json.JSONDecodeError as e:
             trace_file = save_failure_trace("coder_surgical_json", {
                 "subagent": "coder",
@@ -2393,12 +2445,7 @@ async def analyze_files(
         
         # --- 2. PARSE THE JSON ---
         try:
-            clean_json = raw_analyst_content.strip()
-            if "```" in clean_json:
-                match = re.search(r"```(?:json)?\s*(.*?)\s*```", clean_json, re.DOTALL)
-                if match:
-                    clean_json = match.group(1).strip()
-            report_data = json.loads(clean_json)
+            report_data = extract_json_payload(raw_analyst_content)
             ex_summ = report_data.get("executive_summary", "")
             full_rep = report_data.get("full_report", "")
         except json.JSONDecodeError:

@@ -747,9 +747,11 @@ async def run_chat():
                                     if pct >= 0.90: warn_msg += "CRITICAL LIMIT REACHED. You MUST use the compress_and_store_context tool immediately.]"
                                     else: warn_msg += "Consider finishing your current task and using the compress_and_store_context tool soon.]"
                                     
-                                    messages.append({"role": "user", "content": warn_msg})
-                                    print(f"\n{COLOR_YELLOW}{warn_msg}{COLOR_RESET}", flush=True)
-                                    log_event("SYSTEM", warn_msg)
+                                    # Avoid appending duplicate warnings on consecutive tool turns
+                                    if not any(m.get("content", "").startswith("[SYSTEM WARNING: Your context window is at") for m in messages[-2:]):
+                                        messages.append({"role": "user", "content": warn_msg})
+                                        print(f"\n{COLOR_YELLOW}{warn_msg}{COLOR_RESET}", flush=True)
+                                        log_event("SYSTEM", warn_msg)
 
                                 # --- 4. TIME INJECTION (Appended at end to preserve prefix caching) ---
                                 live_time = datetime.now().strftime("%A, %B %d, %Y %H:%M:%S")

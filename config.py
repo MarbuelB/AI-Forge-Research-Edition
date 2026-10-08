@@ -19,7 +19,7 @@ MAX_PLUGIN_RETRIES = 3
 MAX_CONTEXT_TOKENS = 120000 # The max tokens you want the active history to reach - there is hard limit on OpenAI call, we have to prevent hitting that!
 
 # --- TOOL OUTPUT PRUNING SETTINGS ---
-TOOL_PRUNE_PROTECT_RECENT_CALLS = 20  # Keep the N most recent tool calls 100% intact
+TOOL_PRUNE_PROTECT_RECENT_CALLS = 10  # Keep the N most recent tool calls 100% intact
 TOOL_PRUNE_MIN_CHARS = 500            # Only prune tool outputs exceeding this character length
 
 # --- SESSION MANAGEMENT ---
@@ -170,15 +170,16 @@ If a tool fails silently, behaves unpredictably, or you suspect an internal cras
 === CONTEXT WINDOW PROTECTION & NAVIGATING TRUNCATIONS ===
 To protect your context window from quadratic token blowup, the system applies hardcoded limits across tools:
 1. `execute_bash`: Command outputs > 10,000 characters are capped. A preview containing the first 1,500 characters (head) and last 1,500 characters (tail) is returned, and the complete output is saved to `/app/workspace/sandbox/cmd_output_<timestamp>.txt`.
-2. `analyze_files`: Reads up to 50,000 characters per file (approx. 1,000–1,200 lines).
+2. `analyze_files`: Dynamically scales up to 80% of the Analyst LLM context (~280,000 characters / ~70,000 tokens for a single file).
 3. `gather_agent_context`: Subagents receive up to 40,000 characters per attached context file.
-4. Historical Tool Compaction: Tool outputs older than ~20 turns are compacted in chat history, preserving their full text in `/app/workspace/sandbox/history_tool_outputs/`.
+4. Historical Tool Compaction: Tool outputs older than ~10 turns are compacted in chat history, preserving their full text in `/app/workspace/sandbox/history_tool_outputs/`.
 5. `fetch_webpage`: Webpages > 6,000 characters are saved to sandbox with a preview returned.
 
 HOW TO GET AROUND TRUNCATIONS WITHOUT BLOWING UP YOUR CONTEXT WINDOW:
 - NEVER GUESS UNREAD CONTENT: When an output or subagent reports `[COVERAGE WARNING: ...]` or `[TRUNCATED ...]`, do NOT extrapolate, invent, or guess what happened in unread lines. Verify explicitly!
+- TARGETED PATTERN FILTERING: In `analyze_files`, pass `filter_pattern="<regex>"` and optional `context_lines=N` (e.g., `filter_pattern="Exit Code: [1-9]|Traceback|SYSTEM ERROR"`). This performs instant regex line extraction with surrounding context and line numbers over massive files with zero token bloat.
 - INSPECTING TAILS (LOG ERRORS & EXIT SUMMARIES): Errors and session summaries in logs are almost always at the end. 
-  * In `analyze_files`: pass `tail_mode=True` to read the last 50,000 characters / lines of the file, or pass `start_line=<N>` to read a specific slice.
+  * In `analyze_files`: pass `tail_mode=True` to read the ending slice of the file up to the budget, or pass `start_line=<N>` / `max_lines=<M>` to read a specific slice.
   * In `execute_bash`: run `tail -n 200 <path>` to see the end of any file or command output.
 - TARGETED LINE RANGES: Use `sed -n '<start>,<end>p' <path>` or `analyze_files(filepaths=[...], start_line=..., max_lines=...)` to inspect an exact line window.
 - FOCUSED PRE-FILTERING: Use `grep -n -C 3 'ERROR\\|Exception' <path> > /app/workspace/sandbox/errors.txt` then analyze or read that focused file instead of reading entire monolithic dumps.
