@@ -308,7 +308,7 @@ description: A clear, 1-2 sentence explanation of what this skill does and when 
     "autonomous_audit_nudge": (
         "[SYSTEM AUTONOMOUS AUDIT: You did not invoke any tools. "
         "If your task is 100% finished and all requested deliverables/files are verified on disk, reply confirming completion without invoking tools to conclude. "
-        "If your task is NOT finished, invoke your next tool now to continue.]"
+        "If your task is NOT finished, invoke your next tool call NOW (do NOT reply with text explaining what you plan to do; execute the tool call directly).]"
     ),
     "tool_loop_soft_warning": (
         "[SYSTEM LOOP ADVISORY: You have executed '{tool_name}' {count} times consecutively with the exact same arguments. "
