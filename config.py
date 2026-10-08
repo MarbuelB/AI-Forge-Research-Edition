@@ -99,7 +99,8 @@ Only fall back to `execute_bash` with a heredoc complete overwrite if you are fu
 === PRE-INSTALLED SYSTEM CAPABILITIES ===
 You operate in an advanced, ephemeral Linux sandbox. You do NOT need to write scripts for everything. You can use `execute_bash` to run these native binaries directly:
 - Document/Media: `pdftotext` (PDFs), `tesseract` (OCR), `ffmpeg` (audio/video), `imagemagick` (image manipulation), `pandoc` (Markdown to HTML/PDF).
-- Utilities: `jq` (JSON parsing), `tree`, `file`, `curl`, `wget`, `unzip`, `bzip2`, `sqlite3` (standard SQL database queries; for sqlite-vec vector search use native query_sqlite_db tool), `rg` (ripgrep fast code/data search), `ps`/`top`/`pgrep` (procps process management).
+- Utilities: `jq` (JSON parsing), `tree`, `file`, `curl`, `wget`, `unzip`, `bzip2`, `sqlite3` (standard SQL database queries; for sqlite-vec vector search use native query_sqlite_db tool), `rg` (ripgrep fast code/data search), `ps`/`top`/`pgrep`/`pstree`/`fuser`/`killall` (procps & psmisc process management).
+- Bioinformatics CLI: `mafft` (fast multiple sequence alignment), `hmmsearch`, `hmmscan`, `hmmbuild` (HMMER profile hidden Markov models suite).
 - Massive Data: `aria2c` (concurrent downloads), `pigz -d` (multi-core unzipping).
 - Execution Engines: `node` (JavaScript engine), `tsx` (Direct TypeScript execution wrapper), `cargo`/`rustc` (Rust compilation suite), `g++` (C++ compiler).
 
@@ -110,7 +111,7 @@ The following libraries are ALREADY pre-installed, baked into the container imag
 - Data Science & ML: `pandas`, `numpy`, `scipy`, `matplotlib`, `seaborn`, `scikit-learn`, `statsmodels`, `pyarrow`, `networkx`, `duckdb`, `sympy`, `openpyxl`, `h5py`, `pyyaml`
 - Web Scraping: `requests`, `beautifulsoup4`, `lxml`, `playwright`
 - Document/Image Parsing: `PyPDF2`, `python-docx`, `pillow`
-- Science: `biopython`, `rdkit`
+- Science: `biopython`, `rdkit`, `pyhmmer`
 - Database: `sqlalchemy`
 
 DEPENDENCY INSTALLATION RULE: If a custom Python tool requires an external package not listed above:
@@ -209,7 +210,7 @@ You now have access to PLUGINS (custom scripts you write) and SKILLS (Standard O
 3. ALIGNMENT: Follow standard structural patterns for file reading and random generation rules explicitly dictated by user specifications to ensure deterministic output verification.
 4. LANGUAGE-SPECIFIC DEPENDENCIES: 
 - For Python: If you require third-party libraries not already in the system, write a clear comment on line 1: `# REQUIRES: package_name1 package_name2`. The system will auto-install them into your persistent delta folder. Ensure you use the exact PyPI package name in the comment, but the correct module name in your imports.
-- Pre-installed Python Packages (Do not require these): `openai`, `mcp`, `fastmcp`, `tiktoken`, `sqlite-vec`, `pandas`, `numpy`, `scipy`, `matplotlib`, `seaborn`, `scikit-learn`, `statsmodels`, `pyarrow`, `networkx`, `duckdb`, `sympy`, `openpyxl`, `h5py`, `pyyaml`, `requests`, `beautifulsoup4`, `lxml`, `playwright`, `PyPDF2`, `python-docx`, `pillow`, `biopython`, `rdkit`, `sqlalchemy`.
+- Pre-installed Python Packages (Do not require these): `openai`, `mcp`, `fastmcp`, `tiktoken`, `sqlite-vec`, `pandas`, `numpy`, `scipy`, `matplotlib`, `seaborn`, `scikit-learn`, `statsmodels`, `pyarrow`, `networkx`, `duckdb`, `sympy`, `openpyxl`, `h5py`, `pyyaml`, `requests`, `beautifulsoup4`, `lxml`, `playwright`, `PyPDF2`, `python-docx`, `pillow`, `biopython`, `rdkit`, `pyhmmer`, `sqlalchemy`.
 - For Rust: You can write standalone code using the Rust standard library (`std::*`), which compiles fastest with zero network overhead. If external crates are needed, declare them at the top of the file as: `// REQUIRES: crate_name = "version"` (e.g., `// REQUIRES: rand = "0.8", serde = "1.0", serde_json = "1.0"`). Standard library-only code requires no `// REQUIRES:` comments.
 5. SQLITE VECTOR SEARCH (Python Specific): If you write a Python script that interacts with SQLite and needs vector capabilities, you MUST use this exact verified initialization pattern:
    import sqlite3, sqlite_vec
@@ -303,6 +304,11 @@ description: A clear, 1-2 sentence explanation of what this skill does and when 
         "[SYSTEM AUTONOMOUS AUDIT: You did not invoke any tools. "
         "If your task is 100% finished and all requested deliverables/files are verified on disk, reply confirming completion without invoking tools to conclude. "
         "If your task is NOT finished, invoke your next tool now to continue.]"
+    ),
+    "tool_loop_soft_warning": (
+        "[SYSTEM LOOP ADVISORY: You have executed '{tool_name}' {count} times consecutively with the exact same arguments. "
+        "Please verify that this repeated execution is making meaningful progress. "
+        "If you are stuck in an unintended loop, adjust your strategy or proceed to your next step.]"
     ),
 }
 

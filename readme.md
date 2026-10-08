@@ -110,13 +110,15 @@ To prevent the Brain from getting lost in the weeds of complex multi-step tasks,
 * **The Red Team Loop (Adviser):** If the Brain gets stuck on a coding error or logical dead end, it uses the `consult_adviser` tool. This packages the current plan, registries, and the encountered problem, and sends it to a Senior Adviser LLM. The Adviser generates a timestamped strategic advisory report saved to disk, enabling true autonomous self-correction without user hand-holding. If the report exceeds 12,000 characters, context guardrails automatically truncate the feedback preview in conversation memory while keeping the full document on disk.
 
 ### 9. Intelligent Loop Detection & Circuit Breakers
-To prevent the AI from burning tokens in infinite error loops, the Overseer utilizes two distinct failsafes:
-* **The Micro-Breaker (Failure Streaks):** The script tracks consecutive errors per tool. If the AI goes "blind" and fails to use the exact same tool 5 times in a row, the system forcefully intercepts the prompt with a [CRITICAL SYSTEM ALERT], snapping the AI out of its apology loop and commanding it to pivot its strategy.
+To prevent the AI from burning tokens in infinite error loops, the Overseer utilizes four layered failsafes:
+* **The Micro-Breaker (Failure Streaks):** The script tracks consecutive errors per tool. If the AI goes "blind" and fails to use the exact same tool 5 times in a row, the system forcefully intercepts the prompt with a `[CRITICAL SYSTEM ALERT]`, snapping the AI out of its apology loop and commanding it to pivot its strategy.
+* **The Soft Tool-Call Loop Advisory (Repeated Identical Calls):** The script fingerprints `(tool_name, arguments)` across every invocation. If the AI calls the exact same tool with byte-identical arguments 5 consecutive times (regardless of success, such as repeated redundant plan reads or status checks), a non-blocking `[SYSTEM LOOP ADVISORY]` is appended to the tool result every 5 repetitions. This prompts self-reflection without restricting legitimate polling or repeated edits.
 * **The Macro-Breaker (Runaway Trains):** The script tracks uninterrupted tool chains. Every 300 tool calls, it triggers a "Soft Pause" by injecting a system prompt that forces the Brain to self-evaluate. If the AI hits 1,000 consecutive tool chains, the system executes a "Hard Stop," forcing the AI to await human intervention.
 * **The Real-Time Stream Circuit Breaker (Anti-Trapping):** Large Language Models occasionally encounter attention loops where they repeat multi-paragraph blocks of text or internal logic sequences. To arrest this, the framework evaluates incoming data streams chunk-by-chunk across two independent channels: the standard text content channel (`full_content`) and the model's internal reasoning phase (`full_thinking`). 
   * *Alphanumeric Normalization:* The detector normalizes text in real time by stripping all whitespaces, newlines, and punctuation formatting noise (`re.sub(r'[^a-zA-Z0-9]', '', text)`), preventing the model from bypassing detection loops by altering paragraph layouts or spaces.
   * *Threshold & Backtracking:* The circuit breaker allows exactly 3 identical sequences to execute (original text plus 2 loops) and instantly trips on the first token of the 4th attempt. Rather than cutting text blindly by percentage slices, a dedicated helper (`clean_tail_by_alphanumeric_count`) backtracks from the end of the string, stripping out character bytes until it hits the exact boundary of the third iteration, preserving pristine trailing word boundaries without splitting words in half.
   * *Autonomous Self-Healing Retries:* The moment a loop is aborted, the system appends a hard `[CRITICAL ARCHITECTURAL DIRECTIVE]` warning statement directly into the history array, resets the local turn boundaries, and issues an asynchronous loop `continue`. This forces an immediate, automatic turn re-generation on the spot—intercepting the loop, injecting strategic course corrections, and executing a structural fallback tool (such as `consult_adviser` or `manage_plan`) without dropping the execution stream or stopping to wait for manual human keyboard inputs.
+* **Autonomous Batch Guard & Two-Turn Termination (`-x` mode):** When running in non-interactive batch mode (`-x`), the system prevents premature exits caused by single transitional status statements (e.g. *"Now writing the interpretation document"*). If the Brain outputs a turn without invoking any tools, an autonomous audit nudge (`[SYSTEM AUTONOMOUS AUDIT]`) is injected into the context. The process terminates only upon receiving two consecutive no-tool turns, ensuring multi-step pipelines drive relentlessly until all deliverables are verified on disk.
  
 ### 10. Perfect Temporal Awareness (The Live Clock)
 Traditional agents lose track of time during long workflows. This framework utilizes a "Sweep & Replace" dynamic time injection. On every single API turn, the AI's context is injected with a Live System Clock down to the exact second. This allows the AI to accurately timestamp files and memories, without bloating the permanent `current_history.json` log with stale timestamps.
@@ -356,7 +358,7 @@ Create a file named `Containerfile` in your workspace root. Notice that it conta
 		xvfb git git-lfs curl wget unzip aria2 file jq pigz zstd \
 		poppler-utils tesseract-ocr ffmpeg imagemagick graphviz pandoc sqlite3 \
 		build-essential cmake gfortran libgl1 libglib2.0-0 libxml2-dev libxslt-dev \
-		procps ripgrep tree bzip2 \
+		procps ripgrep tree bzip2 psmisc \
 		&& rm -rf /var/lib/apt/lists/*
 		
 	# USER SETUP: Remove default base image user (UID 1000) and establish agent with UID 1000
@@ -393,6 +395,7 @@ Create a file named `Containerfile` in your workspace root. Notice that it conta
 		biopython rdkit sqlalchemy networkx \
 		scikit-learn seaborn statsmodels openpyxl \
 		duckdb sympy pyyaml h5py \
+		mafft hmmer pyhmmer \
 		nodejs && \
 		pixi run npm install -g tsx && \
 		pixi add --pypi sqlite-vec playwright playwright-stealth && \

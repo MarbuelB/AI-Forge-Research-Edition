@@ -648,6 +648,8 @@ async def run_chat():
                         # --- ESCALATING LOOP DETECTION (INIT) ---
                         consecutive_tool_chains = 0
                         consecutive_no_tool_turns = 0
+                        last_tool_call_signature = None
+                        consecutive_identical_tool_calls = 0
                         
                         while True:
                             try:
@@ -1042,6 +1044,26 @@ async def run_chat():
                                             print(f"\n{COLOR_RED}[SYSTEM: AI is stuck looping on {name}. Injecting forced intervention!]{COLOR_RESET}")
                                         
                                         log_event("SYSTEM", f"Forced intervention triggered for tool: {name}")
+
+                                    # --- CONSECUTIVE IDENTICAL TOOL CALL TRACKER (SOFT ADVISORY) ---
+                                    current_call_sig = (name, cmd_fingerprint)
+                                    if current_call_sig == last_tool_call_signature:
+                                        consecutive_identical_tool_calls += 1
+                                    else:
+                                        last_tool_call_signature = current_call_sig
+                                        consecutive_identical_tool_calls = 1
+
+                                    if consecutive_identical_tool_calls >= 5 and consecutive_identical_tool_calls % 5 == 0:
+                                        soft_loop_msg = config.PROMPTS["tool_loop_soft_warning"].format(
+                                            tool_name=name,
+                                            count=consecutive_identical_tool_calls
+                                        )
+                                        output += f"\n\n{soft_loop_msg}"
+                                        
+                                        if config.VERBOSITY_MODE != "silent":
+                                            print(f"\n{COLOR_YELLOW}[SYSTEM: Soft loop advisory for '{name}' ({consecutive_identical_tool_calls} identical calls in a row)]{COLOR_RESET}")
+                                        
+                                        log_event("SYSTEM", f"Soft loop advisory triggered for tool: {name} ({consecutive_identical_tool_calls} identical calls)")
 
                                     # --- SUBAGENT HIDDEN THOUGHTS & ARTIFACTS LOGGING ---
                                     subagent_specs = [

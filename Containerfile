@@ -5,7 +5,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     xvfb git git-lfs curl wget unzip aria2 file jq pigz zstd \
     poppler-utils tesseract-ocr ffmpeg imagemagick graphviz pandoc sqlite3 \
     build-essential cmake gfortran libgl1 libglib2.0-0 libxml2-dev libxslt-dev \
-    procps ripgrep tree bzip2 \
+    procps ripgrep tree bzip2 psmisc \
     && rm -rf /var/lib/apt/lists/*
 	
 # USER SETUP: Remove default base image user (UID 1000) and establish agent with UID 1000
@@ -42,6 +42,7 @@ RUN pixi init && \
     biopython rdkit sqlalchemy networkx \
     scikit-learn seaborn statsmodels openpyxl \
     duckdb sympy pyyaml h5py \
+    mafft hmmer pyhmmer \
     nodejs && \
     pixi run npm install -g tsx && \
     pixi add --pypi sqlite-vec playwright playwright-stealth && \
