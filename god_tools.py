@@ -826,109 +826,53 @@ def store_memory(category: str, category_description: str, title: str, short_des
 
 @mcp.tool()
 async def compress_and_store_context() -> str:
-    """Triggers the background Memory Manager to sequence a memory extraction followed by a history compression."""
+    """Triggers the background Memory Manager to sequence a memory extraction followed by a targeted handoff history compression."""
     current_history = load_json(CURRENT_HISTORY_FILE)
     current_memories = load_json(MEMORY_REGISTRY_FILE)
     
-    # Look up context window for Summarizer
-    max_context = summarizer_profile.get("context_window", summarizer_profile.get("max_context_tokens", config.MAX_CONTEXT_TOKENS))
-    safe_budget = int(max_context * 0.85)
-    
-    # --- Safe string accumulator to prevent MCP stdio corruption ---
-    rolling_log = "" 
-    rolling_chunk_thoughts = []
-    
-    # --- SMART TOKEN-TARGETED ROLLING SUMMARIZATION ---
-    current_tokens = len(tokenizer.encode(json.dumps(current_history)))
-    
-    # 1. Pre-compute token counts for each message ONCE
-    msg_tokens = [len(tokenizer.encode(json.dumps(msg))) for msg in current_history]
-    current_tokens = sum(msg_tokens)
-    
-    
-    if current_tokens > safe_budget:
-        rolling_log += f"\n\n[SYSTEM METRIC: Pre-compression history exceeded limits ({current_tokens} > {safe_budget}). Executed Smart Rolling Summarization:]\n"
-        
-        while current_tokens > safe_budget and len(current_history) > 3:
-            excess_tokens = current_tokens - safe_budget
-            
-            max_chunk_size = safe_budget - 2000 
-            target_chunk_size = min(excess_tokens + 500, max_chunk_size)
-            
-            chunk_to_compress = []
-            chunk_tokens = 0
-            slice_end_index = 1
-            
-            for i in range(1, len(current_history)):
-                # Use our pre-computed array instead of recalculating!
-                if chunk_tokens + msg_tokens[i] > max_chunk_size and chunk_tokens > 0:
-                    break
-                    
-                chunk_to_compress.append(current_history[i])
-                chunk_tokens += msg_tokens[i]
-                slice_end_index = i + 1
-                
-                if chunk_tokens >= target_chunk_size:
-                    break
-                                
-            # --- Chronological Bulleted List ---
-            chunk_prompt = [
-                {"role": "system", "content": config.SYSTEM_PROMPTS["summarizer"]},
-                {"role": "user", "content": json.dumps(chunk_to_compress)}
-            ]
-           
-            chunk_args = summarizer_profile["api_params"].copy()
-            chunk_args["model"] = summarizer_profile["model"]
-            chunk_args["messages"] = chunk_prompt
-            
-            if config.VERBOSITY_MODE != "silent":
-                payload_tokens = get_payload_tokens(chunk_prompt)
-                sys.stderr.write(f"\n\033[93m[System: Summarizer chunk payload is ~{payload_tokens} estimated tokens]\033[0m\n")
-            
-            try:
-                chunk_resp = await summarizer_client.chat.completions.create(**chunk_args)
-                chunk_thinking, dense_summary = extract_thinking_and_content(chunk_resp.choices[0].message)
-                if chunk_thinking:
-                    rolling_chunk_thoughts.append(f"--- CHUNK ROLLING SUMMARY THINKING ---\n{chunk_thinking}")
-                
-                # Log token usage with fallback
-                tokens_in = chunk_resp.usage.prompt_tokens if (chunk_resp.usage and chunk_resp.usage.prompt_tokens) else get_payload_tokens(chunk_prompt)
-                tokens_out = chunk_resp.usage.completion_tokens if (chunk_resp.usage and chunk_resp.usage.completion_tokens) else (len(tokenizer.encode(dense_summary)) if tokenizer else len(dense_summary) // 4)
-                thinking_tokens = getattr(chunk_resp.usage.completion_tokens_details, 'reasoning_tokens', 0) if chunk_resp.usage and hasattr(chunk_resp.usage, 'completion_tokens_details') and chunk_resp.usage.completion_tokens_details else 0
-                if thinking_tokens == 0 and chunk_thinking:
-                    thinking_tokens = len(chunk_thinking) // 4
-                config.log_token_usage(STATE_DIR, "summarizer", tokens_in, tokens_out, thinking_tokens)
-                
-                # Formatted clearly so the Brain can read it easily
-                summary_msg = {"role": "system", "content": f"[ARCHIVED HISTORY (Chronological Summary)]\n{dense_summary}"}
-                
-                # Calculate the token size of the new summary message
-                summary_tokens = len(tokenizer.encode(json.dumps(summary_msg)))
-                
-                # Splice the history array
-                current_history = [current_history[0]] + [summary_msg] + current_history[slice_end_index:]
-                
-                # Splicing the token array mathematically (O(1) speed!)
-                msg_tokens = [msg_tokens[0]] + [summary_tokens] + msg_tokens[slice_end_index:]
-                current_tokens = sum(msg_tokens)
-                
-                rolling_log += f"- Compressed a {chunk_tokens}-token chunk. New total: {current_tokens} tokens.\n"
-                            
-            except Exception as e:
-                save_failure_trace("summarizer_chunk", {
-                    "subagent": "summarizer",
-                    "phase": "rolling_chunk_compression",
-                    "error": str(e),
-                    "traceback": traceback.format_exc(),
-                    "prompt": chunk_prompt
-                })
-                rolling_log += f"- Error during chunk compression: {e}. Falling back to single-message truncation to survive.\n"
-                current_history.pop(1)
-                current_tokens = len(tokenizer.encode(json.dumps(current_history)))
+    # 1. Extract the initial user objective from the first user turn
+    initial_user_prompt = ""
+    for msg in current_history:
+        if msg.get("role") == "user":
+            content = str(msg.get("content", ""))
+            if not content.startswith("[SYSTEM CLOCK") and not content.startswith("[SYSTEM WARNING"):
+                initial_user_prompt = content
+                break
+    if not initial_user_prompt:
+        initial_user_prompt = "No initial user prompt identified."
 
-    # Serialize compactly to save token overhead before sending to the main summarizer
-    bloated_text = json.dumps(current_history)
-        
+    # 2. Read the Master Plan (active_plan.md)
+    plan_path = os.path.join(STATE_DIR, "active_plan.md")
+    active_plan_text = "No active plan found on disk."
+    if os.path.exists(plan_path):
+        try:
+            with open(plan_path, "r", encoding="utf-8") as f:
+                c = f.read().strip()
+                if c:
+                    active_plan_text = c
+        except Exception:
+            pass
+
+    # 3. Inventory verified deliverables in /app/workspace/outputs/
+    deliverables = []
+    outputs_dir = os.path.join(WORKSPACE_DIR, "outputs")
+    if os.path.exists(outputs_dir):
+        try:
+            for root, _, files in os.walk(outputs_dir):
+                for file in files:
+                    rel = os.path.relpath(os.path.join(root, file), WORKSPACE_DIR)
+                    deliverables.append(f"/app/workspace/{rel}")
+        except Exception:
+            pass
+    deliverables_summary = "\n".join(f"- {d}" for d in deliverables) if deliverables else "None identified yet in /app/workspace/outputs/."
+
+    # 4. Extract recent execution window (last 20 messages)
+    recent_turns = current_history[-20:] if len(current_history) > 20 else current_history
+    recent_context_text = json.dumps(recent_turns, indent=2)
+
+    # Accumulators for subagent telemetry
+    summarizer_thoughts = []
+
     # ==========================================
     # STEP 1: EXTRACT MEMORIES (Strict Schema)
     # ==========================================
@@ -963,185 +907,214 @@ async def compress_and_store_context() -> str:
         }
     }
 
-    api_args = summarizer_profile["api_params"].copy()
-    api_args["model"] = summarizer_profile["model"]
-    
-    # Explicitly warn the Summarizer to check existing memories first
-    sys_prompt = (
-        "You are a data extractor. Analyze the chat history and extract NEW crucial long-term facts, completed objectives, or system states into the memory schema. "
+    mem_sys_prompt = (
+        "You are a data extractor. Analyze the mission objective, active plan, verified deliverables, and recent turns. "
+        "Extract NEW crucial long-term facts, completed objectives, database paths, or forged tools into the memory schema. "
         "Write highly detailed markdown files for the 'detailed_markdown' field. "
-        "CRITICAL: Cross-reference the provided CURRENT MEMORY REGISTRY. Do NOT extract or duplicate facts that are already saved in the registry!"
+        "CRITICAL: Cross-reference the provided CURRENT MEMORY REGISTRY. Do NOT extract or duplicate facts already saved in the registry!"
     )
     
-    user_prompt = f"CURRENT MEMORY REGISTRY (DO NOT DUPLICATE THESE):\n{json.dumps(current_memories, indent=2)}\n\nCHAT HISTORY TO ANALYZE:\n{bloated_text}"
+    mem_user_prompt = (
+        f"CURRENT MEMORY REGISTRY (DO NOT DUPLICATE THESE):\n{json.dumps(current_memories, indent=2)}\n\n"
+        f"ORIGINAL GOAL:\n{initial_user_prompt}\n\n"
+        f"ACTIVE MASTER PLAN:\n{active_plan_text}\n\n"
+        f"VERIFIED DELIVERABLES ON DISK:\n{deliverables_summary}\n\n"
+        f"RECENT EXECUTION TURNS:\n{recent_context_text}"
+    )
 
-    api_args["messages"] = [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": user_prompt}
+    mem_api_args = summarizer_profile["api_params"].copy()
+    mem_api_args["model"] = summarizer_profile["model"]
+    mem_api_args["messages"] = [
+        {"role": "system", "content": mem_sys_prompt},
+        {"role": "user", "content": mem_user_prompt}
     ]
-    api_args["response_format"] = memory_schema
+    mem_api_args["response_format"] = memory_schema
 
     if config.VERBOSITY_MODE != "silent":
-        payload_tokens = get_payload_tokens(api_args["messages"])
+        payload_tokens = get_payload_tokens(mem_api_args["messages"])
         sys.stderr.write(f"\n\033[93m[System: Summarizer memory extraction payload is ~{payload_tokens} estimated tokens]\033[0m\n")
 
+    added_titles = []
     try:
-        mem_response = await summarizer_client.chat.completions.create(**api_args)
+        mem_response = await summarizer_client.chat.completions.create(**mem_api_args)
         mem_thinking, mem_raw_content = extract_thinking_and_content(mem_response.choices[0].message)
-        
+        if mem_thinking:
+            summarizer_thoughts.append(f"--- MEMORY EXTRACTION THINKING ---\n{mem_thinking}")
+
         # Log token usage with fallback
-        tokens_in = mem_response.usage.prompt_tokens if (mem_response.usage and mem_response.usage.prompt_tokens) else get_payload_tokens(api_args["messages"])
+        tokens_in = mem_response.usage.prompt_tokens if (mem_response.usage and mem_response.usage.prompt_tokens) else get_payload_tokens(mem_api_args["messages"])
         tokens_out = mem_response.usage.completion_tokens if (mem_response.usage and mem_response.usage.completion_tokens) else (len(tokenizer.encode(mem_raw_content)) if tokenizer else len(mem_raw_content) // 4)
         thinking_tokens = getattr(mem_response.usage.completion_tokens_details, 'reasoning_tokens', 0) if mem_response.usage and hasattr(mem_response.usage, 'completion_tokens_details') and mem_response.usage.completion_tokens_details else 0
         if thinking_tokens == 0 and mem_thinking:
             thinking_tokens = len(mem_thinking) // 4
         config.log_token_usage(STATE_DIR, "summarizer", tokens_in, tokens_out, thinking_tokens)
-        
+
         mem_data = json.loads(mem_raw_content)
-        
-        added_titles = []
         for memory in mem_data.get("extracted_memories", []):
             cat = memory["category"]
             cat_desc = memory["category_description"]
             title = memory["title"]
             short_desc = memory["short_description"]
             full_text = memory["detailed_markdown"]
-            
-            if cat not in current_memories: 
+
+            if cat not in current_memories:
                 current_memories[cat] = {"category_description": cat_desc, "memories": {}}
             else:
-                # Always update the category description to keep it fresh
                 current_memories[cat]["category_description"] = cat_desc
-            
-            # Save the detailed MD file with a perfect chronological sorting name
+
             safe_title = re.sub(r'[^a-zA-Z0-9_]', '', title)
             timestamp_prefix = datetime.now().strftime("%Y%m%d%H%M%S")
             filename = f"{timestamp_prefix}_{safe_title}.md"
             filepath = os.path.join(MEMORIES_DIR, filename)
-            
+
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(full_text)
-            
-            # Update the compact registry
+
             current_memories[cat]["memories"][title] = {
                 "description": short_desc,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "file": f"memories/{filename}"
             }
             added_titles.append(f"{{'category': '{cat}', 'title': '{title}'}}")
-            
+
         save_json(MEMORY_REGISTRY_FILE, current_memories)
-        
+
     except Exception as e:
         trace_file = save_failure_trace("summarizer_memory", {
             "subagent": "summarizer",
             "phase": "memory_extraction",
             "error": str(e),
             "traceback": traceback.format_exc(),
-            "messages": api_args.get("messages", []) if 'api_args' in locals() else []
+            "messages": mem_api_args.get("messages", [])
         })
         trace_note = f"\n[SYSTEM: Failure trace saved to '{trace_file}']" if trace_file else ""
         return f"FAILED during Memory Extraction Phase. Error: {str(e)}{trace_note}"
-        
+
     # ==========================================
-    # STEP 2: COMPRESS HISTORY (Strict Schema)
+    # STEP 2: TARGETED HANDOFF SYNTHESIS
     # ==========================================
-    compression_schema = {
+    handoff_schema = {
         "type": "json_schema",
         "json_schema": {
-            "name": "history_compression",
+            "name": "targeted_handoff",
             "strict": True,
             "schema": {
                 "type": "object",
                 "properties": {
-                    "compressed_history": {
-                        "type": "array",
-                        "description": "The compressed message array. Do NOT include the system prompt.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "role": {"type": "string", "enum": ["user", "assistant"]},
-                                "content": {"type": "string"}
-                            },
-                            "required": ["role", "content"],
-                            "additionalProperties": False
-                        }
+                    "handoff_markdown": {
+                        "type": "string",
+                        "description": "The concise 3-section transition handoff report in markdown."
                     }
                 },
-                "required": ["compressed_history"],
+                "required": ["handoff_markdown"],
                 "additionalProperties": False
             }
         }
     }
 
-    api_args["messages"] = [
-        {"role": "system", "content": (
-            "You are a context compressor. Analyze the bloated chat log. "
-            "Output a new, tiny chat log containing ONLY a single 'user' message. "
-            "Do NOT output an 'assistant' acknowledgment or the system prompt.\n\n"
-            "CRITICAL: The 'user' message MUST contain three distinct sections:\n"
-            "1. 'Current State': A summary of what has been accomplished so far.\n"
-            "2. 'Active Plan & Next Steps': Explicitly list the pending tasks, or the exact next action the Brain was about to take.\n"
-            "3. 'Pending User Input': Summarize any REMAINING or UNANSWERED questions/requests from the user's last message. Do NOT include commands to 'compress context' or 'save memory', as those were just fulfilled."
-        )},
-        {"role": "user", "content": bloated_text}
+    handoff_sys_prompt = (
+        "You are an operational handoff synthesizer. The agent's working context is being compacted. "
+        "Synthesize a concise, high-signal Transition Handoff Report for the incoming Brain turn.\n\n"
+        "CRITICAL REQUIREMENTS:\n"
+        "1. Anchor strictly on the Original User Goal, the Master Plan, verified workspace deliverables, and recent actions.\n"
+        "2. Format your response into exactly three structured sections:\n"
+        "   ### 1. Accomplished Deliverables & Workspace State\n"
+        "   - List exact verified filepaths created on disk, tools forged, and biological/scientific findings established.\n"
+        "   ### 2. Current Plan Status\n"
+        "   - Specific checklist items completed vs. still pending in active_plan.md.\n"
+        "   ### 3. Immediate Next Steps\n"
+        "   - The precise next action or tool call the Brain should execute to continue progress toward the original goal.\n"
+        "3. Be technical, precise, and completely free of conversational filler."
+    )
+
+    handoff_user_prompt = (
+        f"=== ORIGINAL USER GOAL ===\n{initial_user_prompt}\n\n"
+        f"=== ACTIVE MASTER PLAN (active_plan.md) ===\n{active_plan_text}\n\n"
+        f"=== VERIFIED WORKSPACE DELIVERABLES ===\n{deliverables_summary}\n\n"
+        f"=== RECENT EXECUTION TURNS ===\n{recent_context_text}"
+    )
+
+    handoff_api_args = summarizer_profile["api_params"].copy()
+    handoff_api_args["model"] = summarizer_profile["model"]
+    handoff_api_args["messages"] = [
+        {"role": "system", "content": handoff_sys_prompt},
+        {"role": "user", "content": handoff_user_prompt}
     ]
-        
-    api_args["response_format"] = compression_schema
+    handoff_api_args["response_format"] = handoff_schema
 
     if config.VERBOSITY_MODE != "silent":
-        payload_tokens = get_payload_tokens(api_args["messages"])
-        sys.stderr.write(f"\n\033[93m[System: Summarizer history compression payload is ~{payload_tokens} estimated tokens]\033[0m\n")
+        payload_tokens = get_payload_tokens(handoff_api_args["messages"])
+        sys.stderr.write(f"\n\033[93m[System: Summarizer targeted handoff payload is ~{payload_tokens} estimated tokens]\033[0m\n")
 
     try:
-        comp_response = await summarizer_client.chat.completions.create(**api_args)
-        comp_thinking, comp_raw_content = extract_thinking_and_content(comp_response.choices[0].message)
-        
+        handoff_resp = await summarizer_client.chat.completions.create(**handoff_api_args)
+        handoff_thinking, handoff_raw_content = extract_thinking_and_content(handoff_resp.choices[0].message)
+        if handoff_thinking:
+            summarizer_thoughts.append(f"--- TARGETED HANDOFF THINKING ---\n{handoff_thinking}")
+
         # Log token usage with fallback
-        tokens_in = comp_response.usage.prompt_tokens if (comp_response.usage and comp_response.usage.prompt_tokens) else get_payload_tokens(api_args["messages"])
-        tokens_out = comp_response.usage.completion_tokens if (comp_response.usage and comp_response.usage.completion_tokens) else (len(tokenizer.encode(comp_raw_content)) if tokenizer else len(comp_raw_content) // 4)
-        thinking_tokens = getattr(comp_response.usage.completion_tokens_details, 'reasoning_tokens', 0) if comp_response.usage and hasattr(comp_response.usage, 'completion_tokens_details') and comp_response.usage.completion_tokens_details else 0
-        if thinking_tokens == 0 and comp_thinking:
-            thinking_tokens = len(comp_thinking) // 4
+        tokens_in = handoff_resp.usage.prompt_tokens if (handoff_resp.usage and handoff_resp.usage.prompt_tokens) else get_payload_tokens(handoff_api_args["messages"])
+        tokens_out = handoff_resp.usage.completion_tokens if (handoff_resp.usage and handoff_resp.usage.completion_tokens) else (len(tokenizer.encode(handoff_raw_content)) if tokenizer else len(handoff_raw_content) // 4)
+        thinking_tokens = getattr(handoff_resp.usage.completion_tokens_details, 'reasoning_tokens', 0) if handoff_resp.usage and hasattr(handoff_resp.usage, 'completion_tokens_details') and handoff_resp.usage.completion_tokens_details else 0
+        if thinking_tokens == 0 and handoff_thinking:
+            thinking_tokens = len(handoff_thinking) // 4
         config.log_token_usage(STATE_DIR, "summarizer", tokens_in, tokens_out, thinking_tokens)
-        
-        comp_data = json.loads(comp_raw_content)
-        
-        # Backup the old bloated history before we overwrite it
+
+        handoff_data = json.loads(handoff_raw_content)
+        handoff_markdown = handoff_data.get("handoff_markdown", "")
+
+        # Backup the old bloated history before overwriting
         backup_file = os.path.join(HISTORIES_DIR, f"backup_history_{datetime.now().strftime('%Y%m%d%H%M%S')}.json")
         save_json(backup_file, current_history)
-        
-        # Overwrite the active working memory
-        new_history = comp_data.get("compressed_history", [])
-        new_history.insert(0, {"role": "system", "content": config.SYSTEM_PROMPTS["brain"]})
+
+        handoff_directive = config.PROMPTS.get(
+            "handoff_wake_up_directive",
+            "[SYSTEM TRANSITION HANDOFF: Context has been compacted and archived to disk. "
+            "Memory compression is COMPLETE (do NOT call compress_and_store_context again). "
+            "Revisit your plan: "
+            "- If any tasks still need to be done, proceed with them. "
+            "- If everything is already finished, output your final summary to conclude.]"
+        )
+
+        handoff_full_text = (
+            f"=== SESSION TRANSITION HANDOFF ===\n\n"
+            f"**Original Goal:**\n{initial_user_prompt}\n\n"
+            f"{handoff_markdown}\n\n"
+            f"===================================\n\n"
+            f"{handoff_directive}"
+        )
+
+        # Overwrite the active working memory with pristine context
+        new_history = [
+            {"role": "system", "content": config.SYSTEM_PROMPTS["brain"]},
+            {"role": "user", "content": handoff_full_text}
+        ]
         save_json(CURRENT_HISTORY_FILE, new_history)
         _LOADED_SKILLS.clear()
-        
-        summarizer_thoughts = []
-        if rolling_chunk_thoughts: summarizer_thoughts.extend(rolling_chunk_thoughts)
-        if mem_thinking: summarizer_thoughts.append(f"--- MEMORY EXTRACTION THINKING ---\n{mem_thinking}")
-        if comp_thinking: summarizer_thoughts.append(f"--- HISTORY COMPRESSION THINKING ---\n{comp_thinking}")
-        
-        summarizer_output = f"Extracted Memories: {added_titles}\nCompressed History: {len(new_history)} messages"
-        
-        result_msg = f"SUCCESS: Context compressed and old history moved to {os.path.basename(backup_file)}.{rolling_log}\nNew detailed memories extracted to disk: {added_titles}. \n[SYSTEM INSTRUCTION: Your context has been reset, and any requested memory extraction has been completed. Review your 'Active Plan'. If the user's last command was simply to compress/save memory, do NOT do it again—simply tell them it is complete.]"
-        
+
+        summarizer_output = f"Extracted Memories: {added_titles}\nCompressed History: 2 messages (Pristine Handoff)"
+        result_msg = (
+            f"SUCCESS: Context compressed and old history moved to {os.path.basename(backup_file)}.\n"
+            f"New detailed memories extracted to disk: {added_titles}.\n"
+            f"{handoff_directive}"
+        )
+
         if summarizer_thoughts:
             result_msg += f"\n<___SUMMARIZER_THOUGHTS___>\n" + "\n\n".join(summarizer_thoughts) + "\n</___SUMMARIZER_THOUGHTS___>"
         result_msg += f"\n<___SUMMARIZER_OUTPUT___>\n{summarizer_output}\n</___SUMMARIZER_OUTPUT___>"
-        
+
         return result_msg
-        
+
     except Exception as e:
-        trace_file = save_failure_trace("summarizer_compression", {
+        trace_file = save_failure_trace("summarizer_handoff", {
             "subagent": "summarizer",
-            "phase": "history_compression",
+            "phase": "targeted_handoff_synthesis",
             "error": str(e),
             "traceback": traceback.format_exc(),
-            "messages": api_args.get("messages", []) if 'api_args' in locals() else []
+            "messages": handoff_api_args.get("messages", []) if 'handoff_api_args' in locals() else []
         })
         trace_note = f"\n[SYSTEM: Failure trace saved to '{trace_file}']" if trace_file else ""
-        return f"FAILED during History Compression Phase. Error: {str(e)}{trace_note}"
+        return f"FAILED during Targeted Handoff Synthesis Phase. Error: {str(e)}{trace_note}"
 
 
 @mcp.tool()

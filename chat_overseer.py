@@ -239,52 +239,113 @@ def save_history(messages):
     # 2. Atomically swap it
     os.replace(temp_path, CURRENT_HISTORY_FILE)
 
-COMPACTION_MARKER = "characters of historical tool output compacted"
+COMPACTION_MARKER = "HISTORICAL TOOL OUTPUT PRUNED"
 
-def compact_historical_tool_outputs(messages, protect_recent: int = 20, max_head: int = 400, max_tail: int = 400, step: int = 10):
-    """Ages older tool outputs in history (> protect_recent messages ago) to prevent quadratic context blowup.
-    Preserves recent active turns at 100% full fidelity.
-    Retains the head and tail of older outputs so command context and exit status remain legible.
-    Saves the full output to disk before compacting to guarantee zero data loss.
-    Advances the threshold in blocks of `step` messages so the history prefix cache is preserved."""
-    if len(messages) <= protect_recent:
+def compact_historical_tool_outputs(messages, protect_recent: int = None, min_chars: int = None):
+    """Prunes older tool outputs in history (> protect_recent tool calls ago) to prevent quadratic context blowup.
+    Preserves recent active tool turns at 100% full fidelity.
+    Only tool outputs exceeding min_chars are pruned; smaller outputs remain verbatim.
+    Saves full output to disk and records metadata in manifest.json before compacting to guarantee zero data loss.
+    Replaces pruned in-memory content with a lean pointer containing file path, character count, and preview."""
+    if protect_recent is None:
+        protect_recent = getattr(config, "TOOL_PRUNE_PROTECT_RECENT_CALLS", 20)
+    if min_chars is None:
+        min_chars = getattr(config, "TOOL_PRUNE_MIN_CHARS", 500)
+
+    # 1. Identify all tool output messages by role
+    tool_indices = [idx for idx, msg in enumerate(messages) if msg.get("role") == "tool"]
+    
+    if len(tool_indices) <= protect_recent:
         return messages
     
-    threshold_idx = ((len(messages) - protect_recent) // step) * step
-    new_messages = []
+    # 2. Protect the most recent N tool calls; all older tool calls are pruning candidates
+    protected_tool_indices = set(tool_indices[-protect_recent:])
     
+    manifest_path = os.path.join(SESSION_DIR, "sandbox/history_tool_outputs/manifest.json")
+    manifest = {}
+    manifest_updated = False
+    
+    new_messages = []
     for idx, msg in enumerate(messages):
-        if idx < threshold_idx and msg.get("role") == "tool":
+        if idx in tool_indices and idx not in protected_tool_indices:
             content = str(msg.get("content", ""))
-            min_compress_len = max_head + max_tail + 200
-            if len(content) > min_compress_len and COMPACTION_MARKER not in content:
-                digest = hashlib.sha1(content.encode("utf-8", errors="replace")).hexdigest()[:16]
-                rel_path = f"sandbox/history_tool_outputs/tool_output_{digest}.txt"
-                host_path = os.path.join(SESSION_DIR, rel_path)
-                try:
-                    if not os.path.exists(host_path):
-                        os.makedirs(os.path.dirname(host_path), exist_ok=True)
-                        with open(host_path, "w", encoding="utf-8") as f:
-                            f.write(content)
-                except Exception:
-                    new_messages.append(msg)
-                    continue
-                head = content[:max_head]
-                tail = content[-max_tail:]
-                compacted_body = (
-                    f"{head}\n\n"
-                    f"[... {len(content) - max_head - max_tail:,} {COMPACTION_MARKER} for context efficiency. "
-                    f"Full output safely preserved at '/app/workspace/{rel_path}'. "
-                    f"To inspect the full archived output, use analyze_files or bash grep/cat on '/app/workspace/{rel_path}' ...]\n\n"
-                    f"{tail}"
-                )
-                msg_copy = copy.copy(msg)
-                msg_copy["content"] = compacted_body
-                new_messages.append(msg_copy)
+            
+            # Skip if already pruned or under the character threshold
+            if (COMPACTION_MARKER in content or 
+                "characters of historical tool output compacted" in content or 
+                len(content) <= min_chars):
+                new_messages.append(msg)
                 continue
+                
+            # Compute deterministic SHA1 digest for disk storage
+            digest = hashlib.sha1(content.encode("utf-8", errors="replace")).hexdigest()[:16]
+            rel_path = f"sandbox/history_tool_outputs/tool_output_{digest}.txt"
+            host_path = os.path.join(SESSION_DIR, rel_path)
+            
+            # Save full verbatim output to disk safely
+            try:
+                if not os.path.exists(host_path):
+                    os.makedirs(os.path.dirname(host_path), exist_ok=True)
+                    with open(host_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+            except Exception:
+                new_messages.append(msg)
+                continue
+                
+            # Maintain disk manifest
+            try:
+                if not manifest and os.path.exists(manifest_path):
+                    with open(manifest_path, "r", encoding="utf-8") as mf:
+                        manifest = json.load(mf)
+                entry_key = f"tool_output_{digest}"
+                if entry_key not in manifest:
+                    manifest[entry_key] = {
+                        "tool_name": msg.get("name", "tool"),
+                        "tool_call_id": msg.get("tool_call_id", ""),
+                        "char_count": len(content),
+                        "sha1": digest,
+                        "file_path": f"/app/workspace/{rel_path}",
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    manifest_updated = True
+            except Exception:
+                pass
+                
+            # Extract high-signal preview (first non-empty line + exit status if present)
+            lines = [line.strip() for line in content.splitlines() if line.strip()]
+            first_line = lines[0][:140] if lines else ""
+            last_line = lines[-1][:140] if len(lines) > 1 else ""
+            preview_items = []
+            if first_line:
+                preview_items.append(f"Preview: {first_line}")
+            if last_line and last_line != first_line and any(k in last_line.lower() for k in ["exit code", "error", "success", "done", "status"]):
+                preview_items.append(f"Status: {last_line}")
+            preview_text = ("\n".join(preview_items) + "\n") if preview_items else ""
+            
+            compacted_body = (
+                f"[{COMPACTION_MARKER}: {len(content):,} characters pruned for context efficiency]\n"
+                f"Tool: {msg.get('name', 'tool')} | Call ID: {msg.get('tool_call_id', 'unknown')}\n"
+                f"Archived on disk: /app/workspace/{rel_path}\n"
+                f"{preview_text}"
+                f"[NOTE FOR BRAIN: Full verbatim output is preserved on disk. "
+                f"To inspect complete output, use execute_bash ('head -n 50 /app/workspace/{rel_path}') or analyze_files.]"
+            )
+            msg_copy = copy.copy(msg)
+            msg_copy["content"] = compacted_body
+            new_messages.append(msg_copy)
+            continue
+            
         new_messages.append(msg)
         
+    if manifest_updated:
+        try:
+            with open(manifest_path, "w", encoding="utf-8") as mf:
+                json.dump(manifest, mf, indent=2)
+        except Exception:
+            pass
+            
     return new_messages
+
     
 def estimate_tokens(messages):
     """Uses tiktoken for highly accurate estimation when the API receipt is voided."""
@@ -485,7 +546,7 @@ async def run_chat():
                     "--memory=16g",           # Limit to 16 GB of RAM
                     "--shm-size=2g",          # Provides ample shared memory for Chromium & heavy compilers
                     "--pids-limit=1000",      # Neutralizes bash fork bombs
-                    "--userns=keep-id",
+                    "--userns=keep-id:uid=1000,gid=1000",
                     "--tz=local",             # Synchronizes container logs and file timestamps with host clock
                     "--device=nvidia.com/gpu=all", # GPU Passthrough!
 #                    "--storage-opt", "size=10G", # Limits the container's scratch space, does not work on WSL2
@@ -660,7 +721,7 @@ async def run_chat():
                                 messages = [msg for msg in messages if not (msg.get("role") == "user" and ("[SYSTEM CLOCK:" in str(msg.get("content")) or "[SYSTEM WARNING: Your context window is at" in str(msg.get("content"))))]
 
                                 # --- 2. HISTORICAL TOOL OUTPUT AGING (H3) ---
-                                messages = compact_historical_tool_outputs(messages, protect_recent=20)
+                                messages = compact_historical_tool_outputs(messages)
 
                                 # --- 3. TOKEN WARNING INJECTION (H1 Calibrated) ---
                                 payload_tokens = estimate_tokens(messages)
@@ -1134,11 +1195,12 @@ async def run_chat():
                                     if name == "compress_and_store_context":
                                         print(f"\n{COLOR_ORANGE}[SYSTEM] Memory compression cycle complete. Waking up with pristine context...{COLOR_RESET}")
                                         messages = load_history()
-                                        messages.append({
-                                            "role": "user",
-                                            "content": output
-                                        })
-                                        save_history(messages)
+                                        if len(messages) <= 1:
+                                            messages.append({
+                                                "role": "user",
+                                                "content": output
+                                            })
+                                            save_history(messages)
                                         last_actual_prompt_tokens = 0
                                         last_history_len = 0
                                         consecutive_tool_chains = 0
@@ -1231,9 +1293,26 @@ async def run_chat():
                                 
         # 3. CATCH DEAD CONTAINERS AND RESTART
         except (KeyboardInterrupt, asyncio.CancelledError):
-            print(f"\n{COLOR_YELLOW}[SYSTEM] Hard interrupt detected. Resetting sandbox...{COLOR_RESET}")
-            await asyncio.sleep(1)
+            print(f"\n{COLOR_YELLOW}[SYSTEM] Process interrupted by user. Shutting down sandbox cleanly...{COLOR_RESET}")
+            quit_app = True
+            break
         except Exception as e:
+            # Check if this exception was caused by a user interrupt or broken pipe during cancellation
+            is_interrupt = False
+            if type(e).__name__ in ["BaseExceptionGroup", "ExceptionGroup"] and hasattr(e, "exceptions"):
+                is_interrupt = any(
+                    isinstance(sub, (KeyboardInterrupt, asyncio.CancelledError)) or
+                    type(sub).__name__ in ["KeyboardInterrupt", "CancelledError", "BrokenResourceError", "ClosedResourceError"]
+                    for sub in e.exceptions
+                )
+            elif type(e).__name__ in ["BrokenResourceError", "ClosedResourceError"]:
+                is_interrupt = True
+
+            if is_interrupt:
+                print(f"\n{COLOR_YELLOW}[SYSTEM] Process interrupted by user. Shutting down sandbox cleanly...{COLOR_RESET}")
+                quit_app = True
+                break
+
             # Unwraps ExceptionGroups to print the real underlying API/network failures
             if type(e).__name__ in ["BaseExceptionGroup", "ExceptionGroup"] and hasattr(e, "exceptions"):
                 print(f"\n{COLOR_RED}[CRASH DETECTED] Wrapped Exception Group Context Triggered:{COLOR_RESET}")

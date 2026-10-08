@@ -18,6 +18,10 @@ MAX_PLUGIN_RETRIES = 3
 # --- MEMORY SETTINGS ---
 MAX_CONTEXT_TOKENS = 120000 # The max tokens you want the active history to reach - there is hard limit on OpenAI call, we have to prevent hitting that!
 
+# --- TOOL OUTPUT PRUNING SETTINGS ---
+TOOL_PRUNE_PROTECT_RECENT_CALLS = 20  # Keep the N most recent tool calls 100% intact
+TOOL_PRUNE_MIN_CHARS = 500            # Only prune tool outputs exceeding this character length
+
 # --- SESSION MANAGEMENT ---
 # Set to None for a fresh, empty session every time. 
 # Set to a string (e.g., "my_project") to load/resume an isolated environment.
@@ -309,6 +313,13 @@ description: A clear, 1-2 sentence explanation of what this skill does and when 
         "[SYSTEM LOOP ADVISORY: You have executed '{tool_name}' {count} times consecutively with the exact same arguments. "
         "Please verify that this repeated execution is making meaningful progress. "
         "If you are stuck in an unintended loop, adjust your strategy or proceed to your next step.]"
+    ),
+    "handoff_wake_up_directive": (
+        "[SYSTEM TRANSITION HANDOFF: Context has been compacted and archived to disk. "
+        "Memory compression is COMPLETE (do NOT call compress_and_store_context again). "
+        "Revisit your plan: "
+        "- If any tasks still need to be done, proceed with them. "
+        "- If everything is already finished, output your final summary to conclude.]"
     ),
 }
 
