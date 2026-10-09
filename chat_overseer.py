@@ -248,9 +248,9 @@ def compact_historical_tool_outputs(messages, protect_recent: int = None, min_ch
     Saves full output to disk and records metadata in manifest.json before compacting to guarantee zero data loss.
     Replaces pruned in-memory content with a lean pointer containing file path, character count, and preview."""
     if protect_recent is None:
-        protect_recent = getattr(config, "TOOL_PRUNE_PROTECT_RECENT_CALLS", 20)
+        protect_recent = config.TOOL_PRUNE_PROTECT_RECENT_CALLS
     if min_chars is None:
-        min_chars = getattr(config, "TOOL_PRUNE_MIN_CHARS", 500)
+        min_chars = config.TOOL_PRUNE_MIN_CHARS
 
     # 1. Identify all tool output messages by role
     tool_indices = [idx for idx, msg in enumerate(messages) if msg.get("role") == "tool"]
@@ -473,6 +473,7 @@ async def run_chat():
         f"Adviser:    {config.LLM_PROFILES[config.ACTIVE_ADVISER_PROFILE]['name']}\n"
         f"Analyst:    {config.LLM_PROFILES[config.ACTIVE_ANALYST_PROFILE]['name']}\n"
         f"Architect:  {config.LLM_PROFILES[config.ACTIVE_ARCHITECT_PROFILE]['name']}\n"
+        f"Decider:    {config.DECIDER_CONFIG['name']}\n"
         f"Log saved to: {LOG_FILE}\n"
         f"Accumulated Session Tokens: {grand['total']} ({grand['prompt']} in, {grand['completion']} out, {grand['thinking']} thinking)"
     )
@@ -771,8 +772,8 @@ async def run_chat():
                                 api_args["stream"] = True
                                 api_args["stream_options"] = {"include_usage": True}
                                 
-                                if "seed" in api_args:
-                                    api_args["seed"] = api_args.get("seed") or 42
+                                if api_args.get("seed") is None:
+                                    api_args.pop("seed", None)
 
                                 if config.VERBOSITY_MODE != "silent":
                                     calib_note = f" (calibrated x{token_calibration_ratio:.2f})" if abs(token_calibration_ratio - 1.0) > 0.04 else ""
@@ -1047,6 +1048,8 @@ async def run_chat():
                                             print(f"\n{COLOR_ORANGE}▶ Triggering Memory Manager Pipeline... Awaiting response...{COLOR_RESET}")
                                         elif name == "consult_adviser":
                                             print(f"\n{COLOR_ORANGE}▶ Consulting Senior Adviser... Awaiting strategic report...{COLOR_RESET}")
+                                        elif name == "fast_decision":
+                                            print(f"\n{COLOR_ORANGE}▶ Routing to The Decider for rapid ruling...{COLOR_RESET}")
                                         elif name == "query_universal_llm":
                                             print(f"\n{COLOR_ORANGE}▶ Spawning Sub-Agent... Awaiting response...{COLOR_RESET}")
                                         elif name == "analyze_files":
@@ -1156,6 +1159,7 @@ async def run_chat():
                                         ("ANALYST", r"<___ANALYST_THOUGHTS___>(.*?)</___ANALYST_THOUGHTS___>", r"<___ANALYST_REPORT___>(.*?)</___ANALYST_REPORT___>", "ANALYST REPORT"),
                                         ("ARCHITECT", r"<___ARCHITECT_THOUGHTS___>(.*?)</___ARCHITECT_THOUGHTS___>", r"<___ARCHITECT_SKILL___>(.*?)</___ARCHITECT_SKILL___>", "GENERATED SKILL"),
                                         ("SUMMARIZER", r"<___SUMMARIZER_THOUGHTS___>(.*?)</___SUMMARIZER_THOUGHTS___>", r"<___SUMMARIZER_OUTPUT___>(.*?)</___SUMMARIZER_OUTPUT___>", "SUMMARIZER OUTPUT"),
+                                        ("DECIDER", None, r"<___DECIDER_RULING___>(.*?)</___DECIDER_RULING___>", "RULING"),
                                         ("UNIVERSAL SUB-AGENT", r"<___UNIVERSAL_THOUGHTS___>(.*?)</___UNIVERSAL_THOUGHTS___>", r"<___UNIVERSAL_OUTPUT___(?:\s+model=\"([^\"]*)\")?>(.*?)</___UNIVERSAL_OUTPUT___>", "RAW OUTPUT"),
                                     ]
 
@@ -1203,14 +1207,14 @@ async def run_chat():
                                             with open(LOG_FILE, "a", encoding="utf-8") as f:
                                                 f.write(log_text)
 
-                                    out_color = COLOR_ORANGE if name in ["forge_and_register_plugin", "compress_and_store_context", "commission_architect", "consult_adviser", "query_universal_llm", "analyze_files"] else COLOR_DARK_GREEN
+                                    out_color = COLOR_ORANGE if name in ["forge_and_register_plugin", "compress_and_store_context", "commission_architect", "consult_adviser", "fast_decision", "query_universal_llm", "analyze_files"] else COLOR_DARK_GREEN
                                     
                                     # Hide massive output dumps from console if in minimal/standard
                                     hide_output = config.VERBOSITY_MODE in ["minimal", "standard"]
                                     log_event(f"TOOL RESULT ({time.time() - start:.2f}s)", output, text_color=out_color, hide_console=hide_output)
                                     
                                     if hide_output and config.VERBOSITY_MODE != "silent":
-                                        if name in ["commission_architect", "consult_adviser", "query_universal_llm", "analyze_files", "forge_and_register_plugin"]:
+                                        if name in ["commission_architect", "consult_adviser", "fast_decision", "query_universal_llm", "analyze_files", "forge_and_register_plugin"]:
                                             print(f"{out_color}{output}{COLOR_RESET}")
                                         else:
                                             print(f"{COLOR_DARK_GREEN}✓ Tool '{name}' completed ({time.time() - start:.2f}s).{COLOR_RESET}")

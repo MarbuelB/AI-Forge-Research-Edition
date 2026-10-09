@@ -20,12 +20,12 @@ Profiles can be addressed from:
 #   [6] Qwen 3.6 35B test (Container)
 #   [7] Gemini 3.5 Flash (Host)      | [8] Gemini 3.5 Flash (Container)
 #   [9] Laguna S 2.1 vLLM (Host)     | [10] Laguna S 2.1 vLLM (Container)
-ACTIVE_BRAIN_PROFILE = 4
+ACTIVE_BRAIN_PROFILE = 2
 ACTIVE_CODER_PROFILE = 5  # must be reachable from Podman container
-ACTIVE_SUMMARIZER_PROFILE = 5  # can be the same as coder, or a cheaper fast model
+ACTIVE_SUMMARIZER_PROFILE = 3  # can be the same as coder, or a cheaper fast model
 ACTIVE_ADVISER_PROFILE = 5
-ACTIVE_ANALYST_PROFILE = 5  # point this to your vision model
-ACTIVE_ARCHITECT_PROFILE = 5
+ACTIVE_ANALYST_PROFILE = 3  # point this to your vision model
+ACTIVE_ARCHITECT_PROFILE = 3
 
 # --- EMBEDDING CONFIGURATION ---
 # Hardcoded to prevent dimension mismatch in the vector database.
@@ -44,6 +44,16 @@ UNIVERSAL_LLM_CONFIG = {
     "api_key": "Ollama",
     "timeout": 300.0,
 }
+
+# --- DECIDER (DECISION MODEL) CONFIGURATION ---
+# Dedicated endpoint for non-autoregressive decision models (e.g. clef-flash) via Ollama /v1/systemone
+DECIDER_CONFIG = {
+    "name": "Clef Flash 9B",
+    "base_url": "http://host.containers.internal:64165",  # Ollama base endpoint
+    "model": "clef-flash:9b",
+    "timeout": 60.0,
+}
+
 
 # --- LLM PARAMETERS ---
 LLM_PROFILES = [
@@ -81,14 +91,13 @@ LLM_PROFILES = [
     },
     # [2] Local Model - vLLM - from WSL2
     {
-        "name": "Qwen3.8 27B - vLLM",
+        "name": "Qwen3.6 35B-A3B - vLLM",
         "base_url": "http://localhost:4000/v1",
         "api_key": "sk-sandbox-fake-key",
-        "model": "Qwen/Qwen3.8-27B-FP8",
+        "model": "Qwen/Qwen3.6-35B-A3B-FP8",
         "api_params": {
             "temperature": 1.0,
             "top_p": 0.95,
-            "reasoning_effort": "low",
             "presence_penalty": 0.0,
             "frequency_penalty": 0.0,
             "timeout": 1800.0,
@@ -105,14 +114,13 @@ LLM_PROFILES = [
     },
     # [3] Local Model - vLLM - from Podman
     {
-        "name": "Qwen3.8 27B - vLLM",
+        "name": "Qwen3.6 35B-A3B - vLLM",
         "base_url": "http://host.containers.internal:4000/v1",
         "api_key": "sk-sandbox-fake-key",
-        "model": "Qwen/Qwen3.8-27B-FP8",
+        "model": "Qwen/Qwen3.6-35B-A3B-FP8",
         "api_params": {
             "temperature": 1.0,
             "top_p": 0.95,
-            "reasoning_effort": "low",
             "presence_penalty": 0.0,
             "frequency_penalty": 0.0,
             "timeout": 1800.0,

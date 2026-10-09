@@ -15,6 +15,8 @@ import sqlite_vec
 import array
 import base64
 import urllib.parse
+import urllib.request
+import urllib.error
 import mimetypes
 import socket
 import ipaddress
@@ -132,6 +134,9 @@ embedding_client = AsyncOpenAI(
     api_key=emb_config["api_key"], 
     timeout=emb_config["timeout"]
 )
+
+# --- Initialize Decider Config ---
+decider_config = config.DECIDER_CONFIG
 
 # --- HELPER FUNCTIONS ---
 def extract_thinking_and_content(message) -> tuple[str, str]:
@@ -542,7 +547,7 @@ async def consult_adviser(current_plan: str, encountered_problems: str, context_
     ]
     
     # --- DYNAMIC PAYLOAD CHECKER ---
-    max_context = adviser_profile.get("context_window", adviser_profile.get("max_context_tokens", config.MAX_CONTEXT_TOKENS))
+    max_context = adviser_profile.get("context_window", config.MAX_CONTEXT_TOKENS)
     safe_budget = int(max_context * 0.90)
     
     payload_tokens = get_payload_tokens(api_args["messages"])
@@ -608,6 +613,194 @@ async def consult_adviser(current_plan: str, encountered_problems: str, context_
         })
         trace_note = f"\n[SYSTEM: Failure trace saved to '{trace_file}']" if trace_file else ""
         return f"Failed to consult the adviser. Error: {str(e)}{trace_note}"
+
+
+@mcp.tool()
+async def fast_decision(
+    instructions: str,
+    decision_type: str = "choice",
+    options: list[str] | dict[str, str] | None = None,
+    state_text: str = "",
+    context_filepaths: list[str] | None = None,
+    image_filepaths: list[str] | None = None,
+    custom_questions: dict[str, Any] | None = None
+) -> str:
+    """Queries The Decider (clef-flash decision model via Ollama /v1/systemone) for rapid non-autoregressive rulings.
+    Use this tool when you need an immediate single-step judgment, branch routing, hypothesis check, or safety gate without multi-turn generation lag.
+
+    Parameters:
+    - instructions: The question or directive to evaluate (e.g. 'Which library is best suited for columnar data?', 'Is this bash execution safe?').
+    - decision_type: 'choice' (categorical selection), 'boolean' (yes/no true/false check), or 'score' (ordinal rating/severity scale).
+    - options:
+        * For 'choice': list of option names ['A', 'B', 'C'] or dict of option names to descriptions {'opt_a': 'desc a', 'opt_b': 'desc b'}.
+        * For 'boolean': optional dict mapping {'true': 'description', 'false': 'description'} or 2-item list.
+        * For 'score': list of level descriptions from lowest to highest, e.g. ['Low', 'Medium', 'High', 'Critical'].
+    - state_text: Immediate text, code, traceback, or situation to judge.
+    - context_filepaths: Optional list of file paths to load into state via pointers without bloating chat history.
+    - image_filepaths: Optional list of image paths to base64-encode and evaluate jointly with text.
+    - custom_questions: Optional raw questions schema matching Ollama /v1/systemone for multi-question queries.
+    """
+    # 1. Assemble state context
+    gathered_context = ""
+    if context_filepaths:
+        gathered_context = gather_agent_context(context_filepaths)
+
+    state_parts = []
+    if state_text and str(state_text).strip():
+        state_parts.append(str(state_text).strip())
+    if gathered_context and gathered_context.strip():
+        state_parts.append(f"=== ATTACHED ENVIRONMENT / FILE CONTEXT ===\n{gathered_context.strip()}")
+
+    final_state = "\n\n".join(state_parts)
+    if not final_state.strip():
+        final_state = instructions
+
+    # 2. Process images if any
+    images_payload = []
+    if image_filepaths:
+        for img_path in image_filepaths:
+            clean_path = os.path.abspath(str(img_path).strip())
+            if os.path.exists(clean_path):
+                try:
+                    with open(clean_path, "rb") as img_f:
+                        images_payload.append(base64.b64encode(img_f.read()).decode("utf-8"))
+                except Exception as img_err:
+                    logger.warning(f"Failed to read image {clean_path}: {img_err}")
+
+    # 3. Formulate questions payload
+    if custom_questions and isinstance(custom_questions, dict):
+        questions_payload = custom_questions
+    else:
+        q_type = str(decision_type).lower().strip()
+        if q_type in ["boolean", "bool", "noul"]:
+            q_obj: dict[str, Any] = {"type": "noul", "instructions": instructions}
+            if isinstance(options, dict) and ("true" in options or "false" in options):
+                q_obj["criteria"] = {str(k): str(v) for k, v in options.items()}
+            elif isinstance(options, list) and len(options) == 2:
+                q_obj["criteria"] = {"true": str(options[0]), "false": str(options[1])}
+            questions_payload = {"decision": q_obj}
+        elif q_type in ["score", "rating"]:
+            if isinstance(options, list) and options:
+                criteria = [str(x) for x in options]
+            elif isinstance(options, dict) and options:
+                criteria = [str(v) for _, v in sorted(options.items())]
+            else:
+                criteria = ["Very Low", "Low", "Medium", "High", "Critical"]
+            questions_payload = {
+                "decision": {
+                    "type": "score",
+                    "instructions": instructions,
+                    "criteria": criteria
+                }
+            }
+        else:  # 'choice'
+            if isinstance(options, list) and options:
+                criteria = {str(opt): None for opt in options}
+            elif isinstance(options, dict) and options:
+                criteria = {str(k): (str(v) if v is not None else None) for k, v in options.items()}
+            else:
+                criteria = {"yes": None, "no": None}
+            questions_payload = {
+                "decision": {
+                    "type": "choice",
+                    "instructions": instructions,
+                    "criteria": criteria
+                }
+            }
+
+    # 4. Determine endpoint and model from config
+    base_url = decider_config["base_url"].rstrip("/")
+    endpoint = f"{base_url}/systemone" if base_url.endswith("/v1") else f"{base_url}/v1/systemone"
+    model_name = decider_config["model"]
+    timeout = decider_config["timeout"]
+
+    req_body: dict[str, Any] = {
+        "model": model_name,
+        "state": final_state,
+        "questions": questions_payload,
+    }
+    if images_payload:
+        req_body["images"] = images_payload
+
+    # 5. Dispatch HTTP request
+    def _post_systemone(url: str, body: dict, to_sec: float) -> dict:
+        req_data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=req_data,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=to_sec) as resp:
+            resp_bytes = resp.read()
+            return json.loads(resp_bytes.decode("utf-8"))
+
+    try:
+        resp_json = await asyncio.to_thread(_post_systemone, endpoint, req_body, timeout)
+    except urllib.error.HTTPError as he:
+        err_detail = he.read().decode("utf-8", errors="replace") if hasattr(he, "read") else str(he)
+        raise RuntimeError(f"HTTP {he.code}: {err_detail}") from he
+    except Exception as exc:
+        trace_file = save_failure_trace("decider", {
+            "subagent": "decider",
+            "endpoint": endpoint,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+            "payload_summary": {
+                "model": req_body.get("model"),
+                "state_length": len(final_state),
+                "questions": questions_payload
+            }
+        })
+        trace_note = f" (failure trace saved to '{trace_file}')" if trace_file else ""
+        return f"SYSTEM ERROR: The Decider failed to evaluate decision: {str(exc)}{trace_note}\nCheck that Ollama is running at '{base_url}' with '{model_name}'."
+
+    # 6. Parse and log usage
+    usage = resp_json.get("usage", {})
+    in_tokens = usage.get("input_tokens", 0)
+    out_tokens = usage.get("output_tokens", 0)
+    if in_tokens > 0 or out_tokens > 0:
+        config.log_token_usage(STATE_DIR, "decider", in_tokens, out_tokens, 0)
+    logger.info(f"[fast_decision] Evaluated {len(questions_payload)} question(s) via '{model_name}' ({in_tokens} in, {out_tokens} out)")
+
+    # 7. Format clean report for the Brain and subagent logger
+    active_model = resp_json.get("model", model_name)
+    answers = resp_json.get("answers", {})
+    output_lines = []
+
+    for q_name, q_res in answers.items():
+        ans_type = q_res.get("type", "")
+        if ans_type == "choice":
+            choice_val = q_res.get("choice", "N/A")
+            conf = q_res.get("confidence", 0.0)
+            probs = q_res.get("probabilities", {})
+            output_lines.append(f"- **Question [{q_name}] Verdict:** `{choice_val}` (Confidence: {conf:.1%})")
+            if probs:
+                prob_parts = [f"`{k}`: {v:.1%}" for k, v in probs.items()]
+                output_lines.append(f"  *Probabilities:* {', '.join(prob_parts)}")
+        elif ans_type == "noul":
+            prob_true = q_res.get("noul", 0.0)
+            verdict = "TRUE" if prob_true >= 0.5 else "FALSE"
+            output_lines.append(f"- **Question [{q_name}] Verdict:** `{verdict}` (Probability True: {prob_true:.1%})")
+        elif ans_type == "score":
+            score_val = q_res.get("score", 0.0)
+            conf = q_res.get("confidence", 0.0)
+            legend = q_res.get("legend", {})
+            probs = q_res.get("probabilities", {})
+            output_lines.append(f"- **Question [{q_name}] Rating:** `{score_val:.2f}` (Confidence: {conf:.1%})")
+            if legend and probs:
+                prob_parts = [f"Level {lvl} ({legend.get(lvl, lvl)}): {prob:.1%}" for lvl, prob in probs.items()]
+                output_lines.append(f"  *Levels:* {', '.join(prob_parts)}")
+        else:
+            output_lines.append(f"- **Question [{q_name}]:** {json.dumps(q_res)}")
+
+    if in_tokens or out_tokens:
+        output_lines.append(f"\n*(Tokens: {in_tokens} input, {out_tokens} output)*")
+
+    report_content = "\n".join(output_lines)
+    result_msg = f"The Decider completed ruling:\n{report_content}"
+    result_msg += f"\n<___DECIDER_RULING___>\n{report_content}\n</___DECIDER_RULING___>"
+    return result_msg
 
 
 @mcp.tool()
@@ -1202,14 +1395,7 @@ async def compress_and_store_context() -> str:
         backup_file = os.path.join(HISTORIES_DIR, f"backup_history_{datetime.now().strftime('%Y%m%d%H%M%S')}.json")
         save_json(backup_file, current_history)
 
-        handoff_directive = config.PROMPTS.get(
-            "handoff_wake_up_directive",
-            "[SYSTEM TRANSITION HANDOFF: Context has been compacted and archived to disk. "
-            "Memory compression is COMPLETE (do NOT call compress_and_store_context again). "
-            "Revisit your plan: "
-            "- If any tasks still need to be done, proceed with them. "
-            "- If everything is already finished, output your final summary to conclude.]"
-        )
+        handoff_directive = config.PROMPTS["handoff_wake_up_directive"]
 
         handoff_full_text = (
             f"=== SESSION TRANSITION HANDOFF ===\n\n"
@@ -2298,7 +2484,7 @@ async def analyze_files(
             return f"SYSTEM NOTICE: Target file(s) [{file_names}] are currently 0 bytes (empty). No content or tracebacks exist to analyze."
 
         # Dynamically scale the per-file ingestion budget based on Analyst profile capacity (80% safe ceiling)
-        max_context = analyst_profile.get("context_window", analyst_profile.get("max_context_tokens", config.MAX_CONTEXT_TOKENS))
+        max_context = analyst_profile.get("context_window", config.MAX_CONTEXT_TOKENS)
         safe_budget = int(max_context * 0.80)  # Conservative 80% ceiling to account for tokenizer variance & report response room
         
         available_text_tokens = max(10000, safe_budget - 5000)
