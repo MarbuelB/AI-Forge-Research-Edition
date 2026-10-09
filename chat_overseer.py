@@ -66,6 +66,7 @@ def robust_model_validate_json(cls, json_data: str | bytes, *args, **kwargs):
 JSONRPCMessage.model_validate_json = robust_model_validate_json
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.key_binding import KeyBindings
 from contextlib import nullcontext
 
 from rich.console import Console, Group
@@ -667,7 +668,16 @@ async def run_chat():
                                 # 3. Normal interactive mode
                                 # Only initialize the prompter if we actually need human input!
                                 if prompt_session is None:
-                                    prompt_session = PromptSession()
+                                    prompt_kb = KeyBindings()
+
+                                    @prompt_kb.add("escape", "enter")
+                                    @prompt_kb.add("escape", "c-m")
+                                    @prompt_kb.add("c-o")
+                                    def _insert_newline(event):
+                                        """Inserts a newline in interactive prompt on Alt+Enter, Esc+Enter, or Ctrl+O."""
+                                        event.current_buffer.insert_text("\n")
+
+                                    prompt_session = PromptSession(key_bindings=prompt_kb)
 
                                 prompt_text = ANSI(f"\n{COLOR_RED}YOU: {COLOR_RESET}")
                                 user_input = await prompt_session.prompt_async(prompt_text)

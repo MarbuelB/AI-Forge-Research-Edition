@@ -20,7 +20,7 @@ Profiles can be addressed from:
 #   [6] Qwen 3.6 35B test (Container)
 #   [7] Gemini 3.5 Flash (Host)      | [8] Gemini 3.5 Flash (Container)
 #   [9] Laguna S 2.1 vLLM (Host)     | [10] Laguna S 2.1 vLLM (Container)
-ACTIVE_BRAIN_PROFILE = 2
+ACTIVE_BRAIN_PROFILE = 4
 ACTIVE_CODER_PROFILE = 5  # must be reachable from Podman container
 ACTIVE_SUMMARIZER_PROFILE = 3  # can be the same as coder, or a cheaper fast model
 ACTIVE_ADVISER_PROFILE = 5
@@ -48,9 +48,9 @@ UNIVERSAL_LLM_CONFIG = {
 # --- DECIDER (DECISION MODEL) CONFIGURATION ---
 # Dedicated endpoint for non-autoregressive decision models (e.g. clef-flash) via Ollama /v1/systemone
 DECIDER_CONFIG = {
-    "name": "Clef Flash 9B",
+    "name": "Clef 27B", #"Clef Flash 9B",
     "base_url": "http://host.containers.internal:64165",  # Ollama base endpoint
-    "model": "clef-flash:9b",
+    "model": "clef:27b", #"clef-flash:9b",
     "timeout": 60.0,
 }
 
