@@ -156,8 +156,9 @@ SESSION_DIR = os.path.realpath(os.path.abspath(f"./sessions/{active_session}"))
 is_resuming = os.path.exists(SESSION_DIR)
 
 # Build the isolated folder structure
-for folder in ["logs", "plugins", "histories", "memories", "state", "sandbox", "outputs", "archive", "skills"]:
+for folder in ["logs", "plugins", "histories", "memories", "state", "sandbox", "outputs", "archive", "skills", "custom_packages"]:
     os.makedirs(f"{SESSION_DIR}/{folder}", exist_ok=True)
+os.makedirs(f"{SESSION_DIR}/state/rest_calls", exist_ok=True)
 
 # Build the isolated folder structure for input/output folders
 os.makedirs(config.HOST_INPUT_DIR, exist_ok=True)
@@ -604,8 +605,14 @@ async def run_chat():
                     "-v", f"{SESSION_DIR}:/app/workspace:Z,nosuid,nodev",
                     "-v", f"{os.path.abspath('./config.py')}:/app/config.py:ro,Z",
                     "-v", f"{os.path.abspath('./llm_config.py')}:/app/llm_config.py:ro,Z",
+                    "-v", f"{os.path.abspath('./mcp_config.py')}:/app/mcp_config.py:ro,Z",
                     "-v", f"{os.path.abspath('./god_tools.py')}:/app/god_tools.py:ro,Z",
                     "-v", f"{os.path.abspath('./chat_overseer.py')}:/app/chat_overseer.py:ro,Z", # it can read own code
+                    "-v", f"{os.path.abspath('./chimerax_mcp_server.py')}:/app/chimerax_mcp_server.py:ro,Z",
+                    "-v", f"{os.path.abspath('./mock_mcp_server.py')}:/app/mock_mcp_server.py:ro,Z",
+                    "-v", f"{os.path.abspath('./readme.md')}:/app/readme.md:ro,Z",
+                    "-v", f"{os.path.abspath('./Containerfile')}:/app/Containerfile:ro,Z",
+                    "-v", f"{os.path.abspath('./setup_wsl2.sh')}:/app/setup_wsl2.sh:ro,Z",
                     "-v", f"{config.HOST_INPUT_DIR}:/app/host_input:ro,Z,nosuid,nodev", # same for all sessions, read only
                     
                     "ai-forge",
@@ -620,8 +627,8 @@ async def run_chat():
 
                     git config --global init.defaultBranch main
 
-                    # 2. Ensure the persistent custom packages folder exists
-                    mkdir -p /app/workspace/custom_packages
+                    # 2. Ensure all isolated workspace subfolders exist
+                    mkdir -p /app/workspace/logs /app/workspace/plugins /app/workspace/histories /app/workspace/memories /app/workspace/state /app/workspace/state/rest_calls /app/workspace/sandbox /app/workspace/outputs /app/workspace/archive /app/workspace/skills /app/workspace/custom_packages
 
                     # 3. Setup or detect an active Git repository in the workspace
                     if [ ! -d "/app/workspace/.git" ]; then
@@ -1554,7 +1561,13 @@ async def run_chat():
                                         elif name == "fast_decision":
                                             print(f"\n{COLOR_ORANGE}▶ Routing to The Decider for rapid ruling...{COLOR_RESET}")
                                         elif name == "query_universal_llm":
-                                            print(f"\n{COLOR_ORANGE}▶ Spawning Sub-Agent... Awaiting response...{COLOR_RESET}")
+                                            target_model = args.get("model", "")
+                                            target_ep = args.get("endpoint", "")
+                                            ep_str = f" ({target_model}" + (f" on {target_ep}" if target_ep else "") + ")" if target_model else ""
+                                            print(f"\n{COLOR_ORANGE}▶ Spawning Universal Sub-Agent{ep_str}... Awaiting response...{COLOR_RESET}")
+                                        elif name == "execute_rest_call":
+                                            target_url = args.get("url", "")
+                                            print(f"\n{COLOR_ORANGE}▶ Dispatching REST call ({target_url})...{COLOR_RESET}")
                                         elif name == "analyze_files":
                                             print(f"\n{COLOR_ORANGE}▶ Passing files to The Analyst... Awaiting report...{COLOR_RESET}")
                                         elif name == "commission_architect":
@@ -1749,14 +1762,14 @@ async def run_chat():
                                             with open(LOG_FILE, "a", encoding="utf-8") as f:
                                                 f.write(log_text)
 
-                                    out_color = COLOR_ORANGE if name in ["forge_and_register_plugin", "compress_and_store_context", "commission_architect", "consult_adviser", "fast_decision", "query_universal_llm", "analyze_files"] else COLOR_DARK_GREEN
+                                    out_color = COLOR_ORANGE if name in ["forge_and_register_plugin", "compress_and_store_context", "commission_architect", "consult_adviser", "fast_decision", "query_universal_llm", "analyze_files", "execute_rest_call"] else COLOR_DARK_GREEN
                                     
                                     # Hide massive output dumps from console if in minimal/standard
                                     hide_output = config.VERBOSITY_MODE in ["minimal", "standard"]
                                     log_event(f"TOOL RESULT ({time.time() - start:.2f}s)", output, text_color=out_color, hide_console=hide_output)
                                     
                                     if hide_output and config.VERBOSITY_MODE != "silent":
-                                        if name in ["commission_architect", "consult_adviser", "fast_decision", "query_universal_llm", "analyze_files", "forge_and_register_plugin"]:
+                                        if name in ["commission_architect", "consult_adviser", "fast_decision", "query_universal_llm", "analyze_files", "forge_and_register_plugin", "execute_rest_call"]:
                                             print(f"{out_color}{output}{COLOR_RESET}")
                                         else:
                                             print(f"{COLOR_DARK_GREEN}✓ Tool '{name}' completed ({time.time() - start:.2f}s).{COLOR_RESET}")

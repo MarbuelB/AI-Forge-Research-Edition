@@ -20,7 +20,8 @@ import urllib.error
 import mimetypes
 import socket
 import ipaddress
-from typing import Any
+import time
+import httpx
 from datetime import datetime
 from openai import AsyncOpenAI
 from playwright.async_api import async_playwright
@@ -805,40 +806,140 @@ async def fast_decision(
     return result_msg
 
 
+def resolve_universal_endpoint(endpoint_name_or_url: str = None, api_key: str = None, timeout_seconds: float = 300.0) -> tuple[str, str, float]:
+    """Resolves an endpoint name or URL to a concrete base_url, API key, and clamped timeout."""
+    presets = getattr(config, "UNIVERSAL_ENDPOINTS", {})
+    default_cfg = getattr(config, "UNIVERSAL_LLM_CONFIG", {})
+    
+    target_url = None
+    target_key = api_key
+    
+    if not endpoint_name_or_url:
+        default_name = default_cfg.get("default_endpoint", "ollama")
+        if default_name in presets:
+            preset = presets[default_name]
+            target_url = preset.get("url")
+            if not target_key:
+                target_key = preset.get("default_api_key")
+        if not target_url:
+            target_url = default_cfg.get("base_url", "http://host.containers.internal:64165/v1")
+        if not target_key:
+            target_key = default_cfg.get("api_key", "Ollama")
+    elif endpoint_name_or_url in presets:
+        preset = presets[endpoint_name_or_url]
+        target_url = preset.get("url")
+        if not target_key:
+            target_key = preset.get("default_api_key") or default_cfg.get("api_key", "sk-sandbox-fake-key")
+    else:
+        # Treat as custom URL
+        raw_url = endpoint_name_or_url.strip()
+        try:
+            parsed = urllib.parse.urlparse(raw_url)
+            netloc = parsed.netloc
+            if netloc.startswith("localhost:") or netloc == "localhost":
+                netloc = netloc.replace("localhost", "host.containers.internal", 1)
+            elif netloc.startswith("127.0.0.1:") or netloc == "127.0.0.1":
+                netloc = netloc.replace("127.0.0.1", "host.containers.internal", 1)
+            target_url = urllib.parse.urlunparse(parsed._replace(netloc=netloc))
+        except Exception:
+            target_url = raw_url
+        if not target_key:
+            target_key = default_cfg.get("api_key", "sk-sandbox-fake-key")
+            
+    # Clamp timeout between 1.0 second and 3600.0 seconds (up to 1 hour)
+    try:
+        t_val = float(timeout_seconds) if timeout_seconds is not None else 300.0
+    except (ValueError, TypeError):
+        t_val = 300.0
+    timeout_val = min(max(1.0, t_val), 3600.0)
+    
+    return target_url, target_key or "sk-sandbox-fake-key", timeout_val
+
+
 @mcp.tool()
 async def query_universal_llm(
     action: str,
+    endpoint: str = None,
     model: str = None,
     system_prompt: str = "You are a helpful AI assistant.",
     user_prompt: str = "",
+    api_key: str = None,
     temperature: float = 0.7,
     top_p: float = 1.0,
     max_tokens: int = 32768,
+    timeout_seconds: float = 300.0,
     reasoning_effort: str = None,
-    context_filepaths: list[str] = None  # ◄--- Added parameter
+    response_format: str = None,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    stop: list[str] = None,
+    seed: int = None,
+    extra_body: dict = None,
+    extra_headers: dict = None,
+    context_filepaths: list[str] = None
 ) -> str:
-    """Queries an available LLM endpoint to run experiments or delegate sub-tasks.
-    'action' must be either 'list_models' or 'chat'.
-    If action is 'list_models', it returns the names of all available models. No other arguments are needed.
-    If action is 'chat', you MUST provide 'model' and 'user_prompt'. 
-    You may optionally tune 'system_prompt', 'temperature' (0.0 - 2.0), 'top_p', 'max_tokens', and 'reasoning_effort' ('low', 'medium', 'high' for supported reasoning models).
-    Use this only if the Analyst or the Adviser fail to answer questions or run out of ideas.
-    'context_filepaths' allows passing a list of absolute paths to files this sub-agent should read before executing instructions.
-    """
+    """Queries an available LLM endpoint to run experiments, delegate sub-tasks, or obtain second opinions.
     
-    if action == "list_models":
+    Actions:
+    - 'list_endpoints': Returns all pre-configured endpoint presets and their URLs from llm_config.
+    - 'list_models': Queries an endpoint to list all available models. Defaults to 'ollama' or uses 'endpoint'.
+    - 'chat': Sends a prompt to the specified 'model' on 'endpoint' with fully tunable parameters.
+    
+    Parameters:
+    - endpoint: Preset name ('ollama', 'ollama_default', 'litellm_proxy', 'vllm', 'openrouter', 'openai', 'deepseek', 'groq')
+                or any custom URL (e.g. 'http://host.containers.internal:8000/v1' or 'https://api.openai.com/v1').
+                Defaults to 'ollama' from llm_config.
+    - model: Model identifier (required for 'chat', e.g. from 'list_models').
+    - system_prompt: Custom system instructions/persona (defaults to 'You are a helpful AI assistant.').
+    - user_prompt: Main instruction or query payload (required for 'chat').
+    - api_key: Custom API key. If omitted, uses the endpoint's configured default or environment key.
+    - temperature: Sampling temperature (0.0 to 2.0, default 0.7).
+    - top_p: Nucleus sampling probability threshold (0.0 to 1.0, default 1.0).
+    - max_tokens: Maximum completion length (default 32768).
+    - timeout_seconds: Maximum request timeout in seconds (default 300, up to 3600 for 1 hour).
+    - reasoning_effort: Reasoning tier ('low', 'medium', 'high') for supported reasoning models.
+    - response_format: Set to 'json_object' to enforce strict JSON output from supported models.
+    - presence_penalty: Penalize new tokens based on presence in text (-2.0 to 2.0).
+    - frequency_penalty: Penalize new tokens based on frequency in text (-2.0 to 2.0).
+    - stop: Custom stop strings to halt generation.
+    - seed: Integer random seed for deterministic generations.
+    - extra_body: Custom dictionary passed to the request body (e.g. top_k, repetition_penalty, chat_template_kwargs).
+    - extra_headers: Custom HTTP headers (e.g. OpenRouter HTTP-Referer).
+    - context_filepaths: List of absolute or workspace filepaths to inject silently into context.
+    """
+    if action == "list_endpoints":
+        presets = getattr(config, "UNIVERSAL_ENDPOINTS", {})
+        default_cfg = getattr(config, "UNIVERSAL_LLM_CONFIG", {})
+        default_name = default_cfg.get("default_endpoint", "ollama")
+        lines = ["--- PRE-CONFIGURED UNIVERSAL LLM ENDPOINTS ---"]
+        for ep_name, ep_data in presets.items():
+            mark = " (DEFAULT)" if ep_name == default_name else ""
+            lines.append(f"• '{ep_name}'{mark}: {ep_data.get('url')} - {ep_data.get('description', '')}")
+        lines.append("\nTip: Pass any preset name (or custom URL) to 'endpoint' in query_universal_llm.")
+        return "\n".join(lines)
+
+    elif action == "list_models":
+        target_url, target_key, timeout_val = resolve_universal_endpoint(endpoint, api_key, timeout_seconds)
         try:
-            models_response = await universal_client.models.list()
+            client = AsyncOpenAI(base_url=target_url, api_key=target_key, timeout=timeout_val)
+            models_response = await client.models.list()
             model_names = [m.id for m in models_response.data]
-            return "--- AVAILABLE MODELS ---\n" + "\n".join(model_names)
+            return f"--- AVAILABLE MODELS AT '{target_url}' ---\n" + "\n".join(model_names)
         except Exception as e:
-            return f"Failed to fetch model list. Error: {str(e)}"
-            
+            presets = getattr(config, "UNIVERSAL_ENDPOINTS", {})
+            available_presets = ", ".join(presets.keys())
+            return (
+                f"Failed to fetch model list from '{target_url}'. Error: {str(e)}\n"
+                f"Available endpoint presets: {available_presets}. Use action='list_endpoints' for details."
+            )
+
     elif action == "chat":
         if not model or not user_prompt:
             return "Error: You must provide a 'model' name and a 'user_prompt' to use the chat action."
-            
-        # ◄--- Extract background context files quietly ---
+
+        target_url, target_key, timeout_val = resolve_universal_endpoint(endpoint, api_key, timeout_seconds)
+
+        # Extract background context files quietly
         file_environmental_context = gather_agent_context(context_filepaths)
         final_user_payload = f"{file_environmental_context}{user_prompt}"
 
@@ -848,29 +949,53 @@ async def query_universal_llm(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": final_user_payload}
             ],
-            "temperature": temperature,
-            "top_p": top_p,
-            "max_tokens": max_tokens
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "max_tokens": int(max_tokens)
         }
-        
+
+        if presence_penalty != 0.0:
+            api_args["presence_penalty"] = float(presence_penalty)
+        if frequency_penalty != 0.0:
+            api_args["frequency_penalty"] = float(frequency_penalty)
+        if stop:
+            api_args["stop"] = stop
+        if seed is not None:
+            api_args["seed"] = int(seed)
+
+        if response_format:
+            if isinstance(response_format, str) and response_format.lower() in ["json", "json_object"]:
+                api_args["response_format"] = {"type": "json_object"}
+            elif isinstance(response_format, dict):
+                api_args["response_format"] = response_format
+
+        body_kwargs = {}
+        if reasoning_effort:
+            body_kwargs["reasoning_effort"] = reasoning_effort
+        if extra_body and isinstance(extra_body, dict):
+            body_kwargs.update(extra_body)
+        if body_kwargs:
+            api_args["extra_body"] = body_kwargs
+
+        if extra_headers and isinstance(extra_headers, dict):
+            api_args["extra_headers"] = extra_headers
+
         safe_budget = int(config.MAX_CONTEXT_TOKENS * 0.90) 
         payload_tokens = get_payload_tokens(api_args["messages"])
-        
+
         if payload_tokens > safe_budget:
             return (f"SYSTEM ERROR: The prompt and attached context files sent to the Universal Sub-Agent are too massive! "
                     f"Your payload is {payload_tokens} tokens, but the safety limit is {safe_budget}. "
                     f"Please refine your 'context_filepaths' selection.")
-                    
-        if reasoning_effort:
-            api_args["extra_body"] = {"reasoning_effort": reasoning_effort}
-            
+
         if config.VERBOSITY_MODE != "silent":
-            sys.stderr.write(f"\n\033[93m[System: Sending prompt to Universal Sub-Agent ({model}) (~{payload_tokens} estimated tokens)...\033[0m\n")
-            
+            sys.stderr.write(f"\n\033[93m[System: Sending prompt to Universal Sub-Agent ({model} at {target_url}) (~{payload_tokens} estimated tokens, timeout: {timeout_val:.0f}s)...\033[0m\n")
+
         try:
-            response = await universal_client.chat.completions.create(**api_args)
+            client = AsyncOpenAI(base_url=target_url, api_key=target_key, timeout=timeout_val)
+            response = await client.chat.completions.create(**api_args)
             thinking, content = extract_thinking_and_content(response.choices[0].message)
-            
+
             # Log token usage with fallback
             tokens_in = response.usage.prompt_tokens if (response.usage and response.usage.prompt_tokens) else get_payload_tokens(api_args["messages"])
             tokens_out = response.usage.completion_tokens if (response.usage and response.usage.completion_tokens) else (len(tokenizer.encode(content)) if tokenizer else len(content) // 4)
@@ -878,37 +1003,247 @@ async def query_universal_llm(
             if thinking_tokens == 0 and thinking:
                 thinking_tokens = len(thinking) // 4
             config.log_token_usage(STATE_DIR, "universal", tokens_in, tokens_out, thinking_tokens)
-            
+
             finish_reason = response.choices[0].finish_reason or "unknown"
-            
-            result_str = f"--- RESPONSE FROM {model} ---\n"
+
+            result_str = f"--- RESPONSE FROM {model} ({target_url}) ---\n"
             if thinking:
                 result_str += f"<thinking>\n{thinking}\n</thinking>\n\n"
             result_str += content
-            
+
             if not content.strip() and not thinking:
                 result_str += f"\n[SYSTEM WARNING: Empty response. Finish Reason: '{finish_reason}']"
-            
+
             if thinking:
                 result_str += f"\n<___UNIVERSAL_THOUGHTS___>\n{thinking}\n</___UNIVERSAL_THOUGHTS___>"
             if content:
                 result_str += f"\n<___UNIVERSAL_OUTPUT___ model=\"{model}\">\n{content}\n</___UNIVERSAL_OUTPUT___>"
-            
+
             return result_str
-            
+
         except Exception as e:
             trace_file = save_failure_trace("universal", {
                 "subagent": "universal",
+                "endpoint": target_url,
                 "model": model,
                 "error": str(e),
                 "traceback": traceback.format_exc(),
                 "messages": api_args.get("messages", []) if 'api_args' in locals() else []
             })
             trace_note = f"\n[SYSTEM: Failure trace saved to '{trace_file}']" if trace_file else ""
-            return f"LLM Query Failed. Error: {str(e)}{trace_note}"
-                        
+            return f"LLM Query Failed on '{target_url}'. Error: {str(e)}{trace_note}"
+
     else:
-        return "Error: Invalid action. Must be 'list_models' or 'chat'."
+        return "Error: Invalid action. Must be 'list_endpoints', 'list_models', or 'chat'."
+
+
+@mcp.tool()
+async def execute_rest_call(
+    url: str,
+    method: str = "POST",
+    request_filepath: str = None,
+    payload_json: dict = None,
+    response_filepath: str = None,
+    headers: dict = None,
+    extract_field: str = None,
+    timeout_seconds: int = 180
+) -> str:
+    """Dispatches an arbitrary HTTP REST call to any local or remote model or web service.
+    
+    Arguments:
+    - url: The destination endpoint URL (e.g. 'http://host.containers.internal:11434/v1/chat/completions' or 'https://api.openai.com/v1/chat/completions').
+           Note: 'localhost' or '127.0.0.1' is automatically mapped to 'host.containers.internal' to reach services running on the host machine.
+    - method: HTTP method ('POST', 'GET', 'PUT', 'DELETE', 'PATCH'). Defaults to 'POST'.
+    - request_filepath: Absolute or workspace path to a JSON file to use as the request body. If specified, this is read from disk.
+    - payload_json: Dictionary to use as the request body if 'request_filepath' is not provided.
+    - response_filepath: Path where the full raw JSON response should be written. If omitted, automatically archived to state/rest_calls/resp_<timestamp>.json.
+    - headers: Optional dictionary of HTTP headers (e.g. {"Authorization": "Bearer ...", "x-api-key": "..."}).
+    - extract_field: Optional dot-notation path to extract from the response JSON (e.g. 'choices.0.message.content', 'response', or 'content.0.text'). If omitted, common LLM response fields are auto-detected.
+    - timeout_seconds: Request timeout in seconds (default 180).
+    
+    Returns an audit summary with HTTP status, duration, file paths, and extracted content preview.
+    """
+    if not url or not isinstance(url, str):
+        return "SYSTEM ERROR: The 'url' parameter must be a non-empty string."
+
+    method = method.strip().upper() if method and isinstance(method, str) else "POST"
+    
+    # Auto-resolve localhost/127.0.0.1 to host.containers.internal for Podman container networking
+    try:
+        parsed_url = urllib.parse.urlparse(url.strip())
+        netloc = parsed_url.netloc
+        if netloc.startswith("localhost:") or netloc == "localhost":
+            netloc = netloc.replace("localhost", "host.containers.internal", 1)
+        elif netloc.startswith("127.0.0.1:") or netloc == "127.0.0.1":
+            netloc = netloc.replace("127.0.0.1", "host.containers.internal", 1)
+        clean_url = urllib.parse.urlunparse(parsed_url._replace(netloc=netloc))
+    except Exception:
+        clean_url = url.strip()
+
+    rest_calls_dir = os.path.join(STATE_DIR, "rest_calls")
+    os.makedirs(rest_calls_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    req_archive_path = os.path.join(rest_calls_dir, f"req_{timestamp}.json")
+
+    data_payload = None
+    if request_filepath:
+        resolved_req = os.path.abspath(request_filepath)
+        if not os.path.exists(resolved_req):
+            alt_path = os.path.abspath(os.path.join(WORKSPACE_DIR, request_filepath.lstrip("/")))
+            if os.path.exists(alt_path):
+                resolved_req = alt_path
+            else:
+                return f"SYSTEM ERROR: Request file '{request_filepath}' not found on disk."
+        try:
+            with open(resolved_req, "r", encoding="utf-8") as f:
+                file_content = f.read()
+            try:
+                data_payload = json.loads(file_content)
+            except Exception:
+                data_payload = file_content
+            with open(req_archive_path, "w", encoding="utf-8") as f:
+                f.write(file_content if isinstance(data_payload, str) else json.dumps(data_payload, indent=2))
+        except Exception as e:
+            return f"SYSTEM ERROR: Failed reading request file '{request_filepath}': {str(e)}"
+    elif payload_json is not None:
+        data_payload = payload_json
+        try:
+            with open(req_archive_path, "w", encoding="utf-8") as f:
+                json.dump(data_payload, f, indent=2)
+        except Exception:
+            pass
+    elif method in ["POST", "PUT", "PATCH"]:
+        return f"SYSTEM ERROR: HTTP {method} requires either 'request_filepath' or 'payload_json'."
+
+    req_headers = {"User-Agent": "AI-Forge-Overseer/1.0"}
+    if data_payload is not None:
+        req_headers["Content-Type"] = "application/json"
+    if headers and isinstance(headers, dict):
+        req_headers.update(headers)
+
+    if response_filepath:
+        resp_dest_path = os.path.abspath(response_filepath)
+        if not resp_dest_path.startswith(WORKSPACE_DIR):
+            resp_dest_path = os.path.abspath(os.path.join(WORKSPACE_DIR, response_filepath.lstrip("/")))
+        os.makedirs(os.path.dirname(resp_dest_path), exist_ok=True)
+    else:
+        resp_dest_path = os.path.join(rest_calls_dir, f"resp_{timestamp}.json")
+    latest_resp_path = os.path.join(rest_calls_dir, "latest_response.json")
+
+    timeout_val = float(timeout_seconds) if timeout_seconds else 180.0
+    start_time = time.perf_counter()
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout_val, follow_redirects=True) as client:
+            req_kwargs = {"headers": req_headers}
+            if data_payload is not None:
+                if isinstance(data_payload, (dict, list)):
+                    req_kwargs["json"] = data_payload
+                else:
+                    req_kwargs["content"] = str(data_payload).encode("utf-8")
+
+            response = await client.request(method, clean_url, **req_kwargs)
+            elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+    except httpx.TimeoutException:
+        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        return f"SYSTEM ERROR: REST request to '{clean_url}' timed out after {elapsed_ms}ms (limit: {timeout_val}s)."
+    except httpx.ConnectError as ce:
+        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        return (
+            f"SYSTEM ERROR: Connection to '{clean_url}' failed after {elapsed_ms}ms ({str(ce)}).\n"
+            f"Tip: If connecting to a service on the host machine, verify the port is open and reachable via host.containers.internal."
+        )
+    except Exception as req_err:
+        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        return f"SYSTEM ERROR: REST request to '{clean_url}' failed after {elapsed_ms}ms: {str(req_err)}"
+
+    status_code = response.status_code
+    reason_phrase = response.reason_phrase or "OK"
+    resp_text = response.text
+
+    is_json = False
+    resp_json = None
+    try:
+        resp_json = response.json()
+        is_json = True
+    except Exception:
+        pass
+
+    try:
+        with open(resp_dest_path, "w", encoding="utf-8") as f:
+            if is_json:
+                json.dump(resp_json, f, indent=2)
+            else:
+                f.write(resp_text)
+        with open(latest_resp_path, "w", encoding="utf-8") as f:
+            if is_json:
+                json.dump(resp_json, f, indent=2)
+            else:
+                f.write(resp_text)
+    except Exception as save_err:
+        logger.warning(f"[execute_rest_call] Failed saving response file: {save_err}")
+
+    extracted_content = ""
+    extracted_thinking = ""
+    token_info = ""
+
+    if is_json and isinstance(resp_json, dict):
+        if extract_field:
+            cur = resp_json
+            for key in extract_field.strip().split("."):
+                if isinstance(cur, list) and key.isdigit():
+                    idx = int(key)
+                    cur = cur[idx] if idx < len(cur) else None
+                elif isinstance(cur, dict):
+                    cur = cur.get(key)
+                else:
+                    cur = None
+                    break
+            if cur is not None:
+                extracted_content = str(cur) if not isinstance(cur, str) else cur
+
+        if not extracted_content:
+            if "choices" in resp_json and isinstance(resp_json["choices"], list) and len(resp_json["choices"]) > 0:
+                msg = resp_json["choices"][0].get("message", {})
+                extracted_content = msg.get("content", "")
+                extracted_thinking = msg.get("reasoning_content") or ""
+            elif "response" in resp_json:
+                extracted_content = str(resp_json["response"])
+            elif "message" in resp_json and isinstance(resp_json["message"], dict):
+                extracted_content = resp_json["message"].get("content", "")
+            elif "content" in resp_json and isinstance(resp_json["content"], list) and len(resp_json["content"]) > 0:
+                extracted_content = resp_json["content"][0].get("text", "")
+            elif "candidates" in resp_json and isinstance(resp_json["candidates"], list) and len(resp_json["candidates"]) > 0:
+                cand = resp_json["candidates"][0]
+                parts = cand.get("content", {}).get("parts", [])
+                if parts and isinstance(parts, list):
+                    extracted_content = parts[0].get("text", "")
+
+        usage = resp_json.get("usage") or {}
+        t_in = usage.get("prompt_tokens") or resp_json.get("prompt_eval_count") or 0
+        t_out = usage.get("completion_tokens") or resp_json.get("eval_count") or 0
+        t_think = getattr(usage, "completion_tokens_details", {}).get("reasoning_tokens", 0) if isinstance(usage, dict) else 0
+        if t_in > 0 or t_out > 0:
+            config.log_token_usage(STATE_DIR, "rest_call", t_in, t_out, t_think)
+            token_info = f"\nTokens: {t_in} prompt, {t_out} completion"
+            if t_think:
+                token_info += f", {t_think} reasoning"
+
+    res_str = (
+        f"=== REST CALL: {status_code} {reason_phrase} ({elapsed_ms}ms) ===\n"
+        f"URL: {clean_url}\n"
+        f"Request File: {req_archive_path}\n"
+        f"Response File: {resp_dest_path} ({len(resp_text)} bytes){token_info}\n"
+    )
+    if extracted_thinking:
+        res_str += f"\n<thinking>\n{extracted_thinking}\n</thinking>\n"
+    if extracted_content:
+        res_str += f"\n--- EXTRACTED CONTENT ---\n{extracted_content}\n"
+    else:
+        preview = resp_text[:1500] + ("\n... [truncated, full response saved to file]" if len(resp_text) > 1500 else "")
+        res_str += f"\n--- RESPONSE BODY PREVIEW ---\n{preview}\n"
+    return res_str
+
 
 @mcp.tool()
 async def execute_bash(command: str, timeout_seconds: int = 180) -> str:

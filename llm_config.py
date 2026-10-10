@@ -37,12 +37,63 @@ EMBEDDING_CONFIG = {
     "timeout": 120.0,
 }
 
-# --- UNIVERSAL LLM SANDBOX ---
-# This defines the endpoint the Brain can query to experiment with other models.
+# --- UNIVERSAL LLM SANDBOX & ENDPOINT PRESETS ---
+# Pre-configured endpoints that the Universal LLM tool can target.
+# The Brain can select presets by alias (e.g. 'ollama', 'vllm', 'litellm_proxy') or pass an arbitrary custom URL.
+UNIVERSAL_ENDPOINTS = {
+    "ollama": {
+        "url": "http://host.containers.internal:64165/v1",
+        "default_api_key": "Ollama",
+        "description": "Dedicated local Ollama server (port 64165)",
+    },
+    "ollama_default": {
+        "url": "http://host.containers.internal:11434/v1",
+        "default_api_key": "ollama",
+        "description": "Standard local Ollama instance (default port 11434)",
+    },
+    "litellm_proxy": {
+        "url": "http://host.containers.internal:4000/v1",
+        "default_api_key": "sk-sandbox-fake-key",
+        "description": "Host LiteLLM zero-trust proxy gateway (port 4000 from container)",
+    },
+    "litellm_host": {
+        "url": "http://localhost:4000/v1",
+        "default_api_key": "sk-sandbox-fake-key",
+        "description": "Host LiteLLM proxy gateway (port 4000 from host)",
+    },
+    "vllm": {
+        "url": "http://host.containers.internal:8000/v1",
+        "default_api_key": "EMPTY",
+        "description": "Direct local vLLM high-throughput engine (port 8000)",
+    },
+    "openrouter": {
+        "url": "https://openrouter.ai/api/v1",
+        "default_api_key": "sk-sandbox-fake-key",
+        "description": "OpenRouter unified cloud gateway (Gemini, Claude, Llama, etc.)",
+    },
+    "openai": {
+        "url": "https://api.openai.com/v1",
+        "default_api_key": "",
+        "description": "Official OpenAI REST endpoint (GPT-4o, o1, o3, etc.)",
+    },
+    "deepseek": {
+        "url": "https://api.deepseek.com/v1",
+        "default_api_key": "",
+        "description": "Official DeepSeek reasoning & chat API (V3, R1)",
+    },
+    "groq": {
+        "url": "https://api.groq.com/openai/v1",
+        "default_api_key": "",
+        "description": "Groq LPU ultra-low latency cloud API",
+    },
+}
+
 UNIVERSAL_LLM_CONFIG = {
-    "base_url": "http://host.containers.internal:64165/v1",  # Points to your local Ollama server directly or LiteLLM proxy
+    "default_endpoint": "ollama",
+    "base_url": "http://host.containers.internal:64165/v1",  # Points to local Ollama server directly or LiteLLM proxy
     "api_key": "Ollama",
     "timeout": 300.0,
+    "endpoints": UNIVERSAL_ENDPOINTS,
 }
 
 # --- DECIDER (DECISION MODEL) CONFIGURATION ---
