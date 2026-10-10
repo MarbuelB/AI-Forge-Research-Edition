@@ -92,26 +92,24 @@ EXTERNAL_MCP_SERVERS: Dict[str, Dict[str, Any]] = {
     # --------------------------------------------------------------------------
     # Example 1: UCSF ChimeraX Molecular Visualization & Structural Biology
     # --------------------------------------------------------------------------
-    # HOW CHIMERAX MCP IS SET UP ON THE HOST:
-    # Option A (Community Server - dovas-net/chimeraX-mcp):
-    #   1. Clone repository on host: git clone https://github.com/dovas-net/chimeraX-mcp.git
-    #   2. Install and launch: chimerax-mcp or python -m chimerax_mcp
-    #   3. Exposes tools via SSE or REST bridge on port 21049.
-    #
-    # Option B (Built-in ChimeraX REST Remote Control):
-    #   1. In ChimeraX GUI console, run: remotecontrol rest start port 21049
-    #   2. Run a lightweight FastMCP SSE bridge listening on port 21049 that
-    #      relays tool calls to ChimeraX's http://localhost:21049/run endpoint.
+    # HOW CHIMERAX MCP WORKS IN THIS WORKSPACE:
+    # 1. On Windows 11 host: In ChimeraX GUI console, start the REST server:
+    #      remotecontrol rest start port 21049
+    # 2. In WSL2: Start the included FastMCP bridge in a separate terminal:
+    #      pixi run python chimerax_mcp_server.py
+    #    (Listens on port 21050 and proxies commands to ChimeraX on Windows).
+    # 3. In the chat overseer, connect via:
+    #      /mcp on chimerax
     # --------------------------------------------------------------------------
     "chimerax": {
         "name": "UCSF ChimeraX",
-        "description": "Molecular visualization, PDB rendering, and structural biology analysis",
+        "description": "Molecular visualization, PDB rendering, and structural biology analysis (chimerax_mcp_server.py)",
         "transport": "sse",
-        "url": f"http://{HOST_IP}:21049/sse",
+        "url": "http://127.0.0.1:21050/sse",
         "enabled": False,              # Off by default - toggle with --mcp chimerax or /mcp on chimerax
-        "optional": True,              # Never crashes if ChimeraX isn't currently running
-        "tool_prefix": "cx_",          # Namespaces tools: cx_open_pdb, cx_run_command, cx_save_image
-        "require_confirmation": False, # Set True if you want a y/n confirmation before each render/command
+        "optional": True,              # Never crashes if ChimeraX bridge isn't currently running
+        "tool_prefix": "cx_",          # Namespaces tools: cx_run_command, cx_open_structure, cx_save_image
+        "require_confirmation": False, # Set True if you want a y/n confirmation before each command
     },
 
     # --------------------------------------------------------------------------
