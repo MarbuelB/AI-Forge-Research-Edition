@@ -48,9 +48,9 @@ UNIVERSAL_LLM_CONFIG = {
 # --- DECIDER (DECISION MODEL) CONFIGURATION ---
 # Dedicated endpoint for non-autoregressive decision models (e.g. clef-flash) via Ollama /v1/systemone
 DECIDER_CONFIG = {
-    "name": "Clef 27B", #"Clef Flash 9B",
+    "name": "Clef Flash 9B", #"Clef 27B"
     "base_url": "http://host.containers.internal:64165",  # Ollama base endpoint
-    "model": "clef:27b", #"clef-flash:9b",
+    "model": "clef-flash:9b", #"clef:27b"
     "timeout": 60.0,
 }
 

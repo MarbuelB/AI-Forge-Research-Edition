@@ -285,7 +285,7 @@ def get_payload_tokens(messages):
     # Add a safe buffer for images (Most vision models charge ~1000 tokens per image)
     image_tokens = image_count * 1000 
     
-    return text_tokens + image_tokens
+    return text_tokens + image_tokens + (len(messages) * 4)
 
 
 def read_file_slice(
@@ -923,13 +923,13 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
     # 2. Block Destructive Commands (rm as an executed command, not an argument inside quotes/grep)
     if re.search(r'\bgit\s+rm\s+--cached\b', command.lower()):
         pass  # Explicitly permit non-destructive git index untracking
-    elif re.search(r'(?:^|[;&|\n]|\bxargs\b)\s*rm\s+', command.strip().lower()):
+    elif re.search(r'(?:^|[;&|\n]|\bxargs\b)\s*(?:/bin/|/usr/bin/)?(?:rm|unlink)\s+', command.strip().lower()) or re.search(r'\s+-delete\b', command.strip().lower()):
         first_token = command.strip().split()[0].lower() if command.strip().split() else ""
         if first_token in ("grep", "egrep", "fgrep", "rg", "echo", "printf", "sed", "awk"):
             pass
         else:
-            logger.warning(f"[execute_bash] Security block: destructive rm command rejected: {command[:200]}")
-            return "SYSTEM ERROR: Destructive commands (rm) are blocked. Use the archive folder instead."
+            logger.warning(f"[execute_bash] Security block: destructive rm/unlink/-delete command rejected: {command[:200]}")
+            return "SYSTEM ERROR: Destructive commands (rm, unlink, -delete) are blocked. Use the archive folder instead."
 
     try:
         if not command.strip():
@@ -1871,6 +1871,28 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
             if not s_block:
                 logger.warning(f"[surgical_code_edit] Edit #{idx} in '{filepath}' provided empty search_string")
                 return f"SYSTEM ERROR: Edit #{idx} provided an empty search_string. Aborting modifications for safety."
+            match_count = working_code.count(s_block)
+            if match_count > 1:
+                logger.warning(f"[surgical_code_edit] Non-unique search string in '{filepath}' on edit #{idx} ({match_count} occurrences)")
+                trace_file = save_failure_trace("coder_surgical_duplicate", {
+                    "subagent": "coder",
+                    "action": "surgical_code_edit",
+                    "filepath": filepath,
+                    "objective": edit_objective,
+                    "edit_index": idx,
+                    "search_string": s_block,
+                    "match_count": match_count,
+                    "coder_thinking": coder_thinking,
+                })
+                fail_msg = (
+                    f"SYSTEM ERROR: Edit #{idx} 'search_string' matches {match_count} times in '{filepath}'. "
+                    f"It must match uniquely (exactly 1 time). Include more surrounding context lines in 'search_string' to make it unique. "
+                    f"Aborting all modifications for safety."
+                )
+                if trace_file: fail_msg += f"\n[SYSTEM: Failure trace saved to '{trace_file}']"
+                if coder_thinking: fail_msg += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
+                fail_msg += f"\n<___CODER_CODE___>\n{raw_json_str}\n</___CODER_CODE___>"
+                return fail_msg
             if s_block not in working_code:
                 logger.warning(f"[surgical_code_edit] Search string mismatch in '{filepath}' on edit #{idx}")
                 # Provide diagnostic near-match context so the Coder can self-correct indentation/spacing immediately

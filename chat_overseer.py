@@ -152,7 +152,7 @@ if config.SESSION_ID:
 else:
     active_session = f"Session_ID_{timestamp}"
 
-SESSION_DIR = os.path.abspath(f"./sessions/{active_session}")
+SESSION_DIR = os.path.realpath(os.path.abspath(f"./sessions/{active_session}"))
 is_resuming = os.path.exists(SESSION_DIR)
 
 # Build the isolated folder structure
@@ -356,14 +356,20 @@ def estimate_tokens(messages):
     """Uses tiktoken for highly accurate estimation when the API receipt is voided."""
     total_text = ""
     for msg in messages:
-        total_text += str(msg.get("content", ""))
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    total_text += part.get("text", "")
+        else:
+            total_text += str(content or "")
         # Also count tool arguments if they exist
-        if "tool_calls" in msg:
+        if "tool_calls" in msg and msg["tool_calls"]:
             for tc in msg["tool_calls"]:
                 total_text += str(tc.get("function", {}).get("arguments", ""))
                 
-    # Returns the actual token count instead of a character guess
-    return len(tokenizer.encode(total_text))
+    # Returns the actual token count with OpenAI structural message framing padding (4 tokens per turn)
+    return len(tokenizer.encode(total_text)) + (len(messages) * 4)
 
 
 def detect_text_loop(text: str, min_loop_length: int = 120, required_repeats: int = 3) -> tuple[bool, int]:
@@ -710,16 +716,27 @@ async def run_chat():
                             if ready_queue.empty():
                                 ready_queue.put_nowait({"error": str(e)})
                         finally:
+                            while not cmd_queue.empty():
+                                try:
+                                    pending_cmd = cmd_queue.get_nowait()
+                                    if isinstance(pending_cmd, dict) and "future" in pending_cmd and not pending_cmd["future"].done():
+                                        pending_cmd["future"].set_exception(RuntimeError(f"MCP server '{server_id}' disconnected unexpectedly."))
+                                except Exception:
+                                    break
                             try:
                                 await stack.aclose()
                             except Exception:
                                 pass
 
                     async def call_external_tool(target, orig_name, args):
+                        srv_id = target.get("server_id", "")
+                        srv_info = active_ext_servers.get(srv_id)
+                        if srv_info and srv_info.get("task") and srv_info["task"].done():
+                            raise RuntimeError(f"MCP server '{srv_id}' worker task has terminated unexpectedly.")
                         loop = asyncio.get_running_loop()
                         fut = loop.create_future()
                         await target["cmd_queue"].put({"action": "call_tool", "name": orig_name, "args": args, "future": fut})
-                        return await fut
+                        return await asyncio.wait_for(fut, timeout=60.0)
 
                     async def connect_external_mcp(server_id, cfg, verbose=True):
                         cmd_queue = asyncio.Queue()
