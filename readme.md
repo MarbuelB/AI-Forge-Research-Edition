@@ -142,6 +142,14 @@ Standard agents crash silently when background dependencies or subprocesses fail
 ### 13. Dynamic UI & Verbosity Control
 The Overseer natively decouples **Format** (how it looks) from **Verbosity** (how much it tells you). You can run it in `markdown` mode for a rich, color-coded terminal dashboard, or `text` mode for raw streaming. Furthermore, you have total runtime control: you can instantly change the UI by typing slash commands (`/silent`, `/minimal`, `/standard`, `/detailed`, `/text`, `/markdown`) directly into the chat prompt. This allows you to jump from a highly detailed matrix-style debugging view to a minimal, clean UI on the fly without ever restarting your container or dropping your session state!
 
+### 14. External & Host MCP Servers (Intentional Tool Bridging)
+While untrusted code forging and execution remain strictly quarantined inside the rootless Podman sandbox, the Overseer Brain can intentionally connect to external Model Context Protocol (MCP) servers outside the container (running on the host machine, in WSL2, or across local networks):
+* **Decoupled Configuration (`mcp_config.py`):** External endpoints are registered cleanly in `mcp_config.py` with automatic host IP resolution (`resolve_host_ip()`), transport options (`sse` or `stdio`), and custom tool prefixes.
+* **Zero-Trust by Default:** All external servers are disabled by default (`enabled: False`) and strictly optional (`optional: True`). If an external server is enabled but offline or unreachable, the harness gracefully skips it with a warning notice and continues without crashing.
+* **Example: UCSF ChimeraX:** Structural biology and molecular modeling applications running on the host (with live GPU viewports) can expose tools (e.g. `cx_open_structure`, `cx_run_command`, `cx_save_image`) via `dovas-net/chimeraX-mcp` or ChimeraX's REST remote control. The Brain can compute a structure in the sandbox, instruct ChimeraX on the host to render it, and delegate the snapshot back to the Analyst vision agent for inspection.
+* **Security Gate & Interactive Confirmation:** External servers configured with `require_confirmation: True` pause execution and require explicit user confirmation (`[y/N]`) in the terminal before running. In unattended batch mode (`-x`), dangerous host tools are automatically denied to protect unattended runs.
+* **Dynamic On-the-Fly Toggling:** In addition to startup CLI flags (`--mcp <name>`, `--all-mcp`), you can activate or deactivate external tool suites live during a chat using in-chat slash commands (`/mcp`, `/mcp on <name>`, `/mcp off <name>`).
+
 ---
 
 ## 🛡️ Sandboxing & Workspace Structure (Podman)
@@ -351,6 +359,7 @@ Save the core scripts into the root of your `ai_workspace` folder:
 2. `config.py` (Core system prompts, memory limits, and runtime settings).
 3. `god_tools.py` (The FastMCP server handling tool forging, subagent execution, and native tools like `fast_decision`).
 4. `chat_overseer.py` (The main interactive async loop).
+5. `mcp_config.py` (External and host MCP server registrations, host IP discovery, and security gates).
 
 ### Step 6: Build the Hardened Podman Container
 Create a file named `Containerfile` in your workspace root. Notice that it contains no secrets, environment variables, or python files. 
@@ -430,10 +439,21 @@ You can override configurations, pipe in files, and trigger headless background 
 * `-s`, `--session`: Override the `SESSION_ID` to load or create a specific workspace (e.g., `-s "Project_X"`).
 * `-x`, `--exit`: Auto-exit back to your bash terminal when the AI finishes its tasks (perfect for single-shot scripts).
 * `--brain`, `--coder`, `--summarizer`, `--adviser`, `--analyst`, `--architect`: Pass the index number of your LLM profiles to override the active models dynamically.
+* `--mcp`: Pass a comma-separated list of external MCP servers to activate on startup (e.g., `--mcp chimerax`).
+* `--all-mcp`: Activate all external MCP servers configured in `mcp_config.py`.
+
+**Interactive Slash Commands:**
+During a live chat, you can dynamically configure the session without restarting:
+* **Session Lifecycle:** `/exit` or `/quit` to terminate the session and tear down the container.
+* **UI Format:** `/markdown` (rich panels) or `/text` (raw streaming).
+* **Verbosity:** `/silent`, `/minimal`, `/standard`, or `/detailed`.
+* **MCP Management:** `/mcp` (list status of all configured servers), `/mcp on <name>` (connect server and inject tools), `/mcp off <name>` (disconnect server).
 
 **Advanced Usage Examples:**
 * **Rich Interactive Mode with Specific Models:**
   `pixi run python chat_overseer.py -f markdown -v standard -s "Test_2" --brain 2 --coder 3`
+* **Connecting Host Tools on Boot (e.g. ChimeraX):**
+  `pixi run python chat_overseer.py -f markdown -v detailed --mcp chimerax`
 * **Headless Background Task (Auto-Exits when done):**
   `pixi run python chat_overseer.py -v silent -s "Research" -x -p "Scrape the latest papers on CRISPR and save to outputs/summary.md"`
 * **Unix Pipeline (Pipe files directly into the AI):**

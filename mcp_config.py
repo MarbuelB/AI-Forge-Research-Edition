@@ -1,0 +1,140 @@
+"""
+mcp_config.py - External & Host MCP Server Configurations
+==========================================================
+Defines external Model Context Protocol (MCP) servers accessible by the
+Overseer Brain outside the default Podman sandbox (e.g. running on the host,
+in WSL2, on a remote server, or another container).
+
+All external servers are strictly OPTIONAL by default:
+- If a server is enabled but offline / unreachable, the harness will log a
+  warning and continue seamlessly without crashing.
+- Servers can be toggled via CLI flags (--mcp <name>) or interactively in-chat
+  via slash commands (/mcp on <name>, /mcp off <name>).
+- Dangerous or host-modifying tools can require interactive user confirmation
+  before execution.
+"""
+
+import os
+import socket
+import subprocess
+from typing import Dict, Any, Optional
+
+
+def resolve_host_ip() -> str:
+    """
+    Dynamically resolves the IP or hostname of the host machine from the
+    current execution environment (WSL2, container, or native Linux).
+    """
+    # 1. Explicit override via environment variable
+    if os.environ.get("HOST_IP"):
+        return os.environ["HOST_IP"]
+
+    # 2. Try standard container/WSL DNS names
+    for host_name in ["host.wsl.internal", "host.containers.internal", "host.docker.internal"]:
+        try:
+            socket.gethostbyname(host_name)
+            return host_name
+        except (socket.gaierror, OSError):
+            pass
+
+    # 3. Detect default gateway from ip route (standard for WSL2 NAT and container bridges)
+    try:
+        route_out = subprocess.check_output(
+            ["ip", "route", "show", "default"],
+            stderr=subprocess.DEVNULL,
+            timeout=1
+        ).decode("utf-8")
+        parts = route_out.split()
+        if "via" in parts:
+            gw_ip = parts[parts.index("via") + 1]
+            return gw_ip
+    except Exception:
+        pass
+
+    # 4. Fallback reading nameserver from /etc/resolv.conf
+    try:
+        if os.path.exists("/etc/resolv.conf"):
+            with open("/etc/resolv.conf", "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("nameserver"):
+                        ns_ip = line.split()[1]
+                        if not ns_ip.startswith("127."):
+                            return ns_ip
+    except Exception:
+        pass
+
+    # 5. Default fallback (e.g. for mirrored networking mode or localhost)
+    return "127.0.0.1"
+
+
+HOST_IP = resolve_host_ip()
+
+# ==============================================================================
+# EXTERNAL MCP SERVER REGISTRY
+# ==============================================================================
+# Configuration keys per server:
+# - name: Friendly display name.
+# - description: Purpose of this MCP server.
+# - transport: 'sse' (HTTP Server-Sent Events) or 'stdio' (subprocess command).
+# - url: Required for 'sse' transport.
+# - command / args: Required for 'stdio' transport.
+# - enabled: Default boot status (False = off by default for zero-trust security).
+# - optional: If True, connection failures are caught gracefully and will NEVER
+#             crash the harness.
+# - tool_prefix: Optional prefix attached to tool names to prevent collisions
+#                with native sandbox tools (e.g. 'cx_run_command').
+# - require_confirmation: If True, the Overseer pauses and interactively prompts
+#                         the user (y/n) before executing any tool from this MCP.
+# ==============================================================================
+
+EXTERNAL_MCP_SERVERS: Dict[str, Dict[str, Any]] = {
+    # --------------------------------------------------------------------------
+    # Example 1: UCSF ChimeraX Molecular Visualization & Structural Biology
+    # --------------------------------------------------------------------------
+    # HOW CHIMERAX MCP IS SET UP ON THE HOST:
+    # Option A (Community Server - dovas-net/chimeraX-mcp):
+    #   1. Clone repository on host: git clone https://github.com/dovas-net/chimeraX-mcp.git
+    #   2. Install and launch: chimerax-mcp or python -m chimerax_mcp
+    #   3. Exposes tools via SSE or REST bridge on port 21049.
+    #
+    # Option B (Built-in ChimeraX REST Remote Control):
+    #   1. In ChimeraX GUI console, run: remotecontrol rest start port 21049
+    #   2. Run a lightweight FastMCP SSE bridge listening on port 21049 that
+    #      relays tool calls to ChimeraX's http://localhost:21049/run endpoint.
+    # --------------------------------------------------------------------------
+    "chimerax": {
+        "name": "UCSF ChimeraX",
+        "description": "Molecular visualization, PDB rendering, and structural biology analysis",
+        "transport": "sse",
+        "url": f"http://{HOST_IP}:21049/sse",
+        "enabled": False,              # Off by default - toggle with --mcp chimerax or /mcp on chimerax
+        "optional": True,              # Never crashes if ChimeraX isn't currently running
+        "tool_prefix": "cx_",          # Namespaces tools: cx_open_pdb, cx_run_command, cx_save_image
+        "require_confirmation": False, # Set True if you want a y/n confirmation before each render/command
+    },
+
+    # --------------------------------------------------------------------------
+    # Example 2: Generic Host Tools / Script Runner (Example with Security Gate)
+    # --------------------------------------------------------------------------
+    "host_tools": {
+        "name": "Host System Tools",
+        "description": "Host-level automation and notifications outside container",
+        "transport": "sse",
+        "url": f"http://{HOST_IP}:8080/sse",
+        "enabled": False,
+        "optional": True,
+        "tool_prefix": "host_",
+        "require_confirmation": True,  # Extra security gate: always asks user before executing!
+    },
+}
+
+
+def get_server_config(server_id: str) -> Optional[Dict[str, Any]]:
+    """Returns the configuration dict for a specific server_id."""
+    return EXTERNAL_MCP_SERVERS.get(server_id)
+
+
+def list_configured_servers() -> Dict[str, Dict[str, Any]]:
+    """Returns the full external server registry."""
+    return EXTERNAL_MCP_SERVERS

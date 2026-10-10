@@ -18,6 +18,8 @@ from openai import AsyncOpenAI
 import tiktoken
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.sse import sse_client
+import mcp_config
 
 # Ensure stdout uses line-buffering so redirected logs remain sequentially ordered
 if hasattr(sys.stdout, "reconfigure"):
@@ -67,7 +69,7 @@ JSONRPCMessage.model_validate_json = robust_model_validate_json
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.key_binding import KeyBindings
-from contextlib import nullcontext
+from contextlib import AsyncExitStack, nullcontext
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -93,6 +95,8 @@ parser.add_argument("--summarizer", type=int, help="Summarizer LLM profile index
 parser.add_argument("--adviser", type=int, help="Adviser LLM profile index")
 parser.add_argument("--analyst", type=int, help="Analyst LLM profile index")
 parser.add_argument("--architect", type=int, help="Architect LLM profile index")
+parser.add_argument("--mcp", type=str, help="Comma-separated external MCP servers to enable (e.g. --mcp chimerax)")
+parser.add_argument("--all-mcp", action="store_true", help="Enable all configured external MCP servers")
 
 cli_args = parser.parse_args()
 
@@ -488,7 +492,7 @@ async def run_chat():
     last_history_len = 0
     tool_schemas_overhead = 0 # Estimate of token cost for registered tool schemas
     
-    help_text = "Commands: '/exit' or '/quit' to quit | UI: '/text', '/markdown' | Verbosity: '/silent', '/minimal', '/standard', '/detailed'"
+    help_text = "Commands: '/exit' or '/quit' to quit | UI: '/text', '/markdown' | Verbosity: '/silent', '/minimal', '/standard', '/detailed' | MCP: '/mcp'"
     
     if is_resuming:
         log_event("SYSTEM", f"Successfully restored '{active_session}'. Your forged tools are loaded.\n{help_text}")
@@ -633,7 +637,7 @@ async def run_chat():
                     await session.initialize()
                     
                     mcp_tools = await session.list_tools()
-                    openai_tools = [
+                    sandbox_openai_tools = [
                         {
                             "type": "function", 
                             "function": {
@@ -644,6 +648,100 @@ async def run_chat():
                         } 
                         for t in mcp_tools.tools
                     ]
+
+                    # --- EXTERNAL & HOST MCP REGISTRY STATE ---
+                    active_ext_servers = {}
+                    ext_tool_router = {}
+
+                    async def connect_external_mcp(server_id, cfg, verbose=True):
+                        stack = AsyncExitStack()
+                        try:
+                            if cfg.get("transport") == "sse":
+                                sse_ctx = sse_client(cfg["url"])
+                                read, write = await asyncio.wait_for(
+                                    stack.enter_async_context(sse_ctx),
+                                    timeout=5.0
+                                )
+                            elif cfg.get("transport") == "stdio":
+                                params = StdioServerParameters(command=cfg["command"], args=cfg.get("args", []))
+                                read, write = await asyncio.wait_for(
+                                    stack.enter_async_context(stdio_client(params)),
+                                    timeout=5.0
+                                )
+                            else:
+                                return None
+
+                            ext_sess = await stack.enter_async_context(ClientSession(read, write))
+                            await ext_sess.initialize()
+                            tools_res = await ext_sess.list_tools()
+                            prefix = cfg.get("tool_prefix", "")
+                            registered = []
+                            for t in tools_res.tools:
+                                q_name = f"{prefix}{t.name}" if prefix else t.name
+                                ext_tool_router[q_name] = {
+                                    "session": ext_sess,
+                                    "original_name": t.name,
+                                    "server_id": server_id,
+                                    "require_confirmation": cfg.get("require_confirmation", False),
+                                }
+                                registered.append({
+                                    "type": "function",
+                                    "function": {
+                                        "name": q_name,
+                                        "description": f"[{cfg.get('name', server_id)}] {t.description or ''}",
+                                        "parameters": t.inputSchema,
+                                    }
+                                })
+                            active_ext_servers[server_id] = {
+                                "stack": stack,
+                                "session": ext_sess,
+                                "cfg": cfg,
+                                "tools": registered,
+                            }
+                            if verbose and config.VERBOSITY_MODE != "silent":
+                                tool_names = ", ".join(t["function"]["name"] for t in registered)
+                                print(f"\n{COLOR_BRIGHT_GREEN}[MCP SYSTEM: Connected to '{cfg.get('name', server_id)}' ({len(registered)} tools: {tool_names})]{COLOR_RESET}")
+                                log_event("SYSTEM", f"Connected external MCP '{server_id}' with tools: {tool_names}")
+                            return registered
+                        except Exception as e:
+                            await stack.aclose()
+                            if cfg.get("optional", True):
+                                if verbose and config.VERBOSITY_MODE != "silent":
+                                    print(f"\n{COLOR_YELLOW}[MCP NOTICE: External server '{server_id}' ({cfg.get('url', cfg.get('command', ''))}) is offline/unreachable: {e}. Skipping.]{COLOR_RESET}")
+                                    log_event("SYSTEM", f"External MCP '{server_id}' unavailable (skipped): {e}")
+                                return None
+                            else:
+                                raise e
+
+                    async def disconnect_external_mcp(server_id, verbose=True):
+                        if server_id in active_ext_servers:
+                            entry = active_ext_servers.pop(server_id)
+                            for q_name in list(ext_tool_router.keys()):
+                                if ext_tool_router[q_name]["server_id"] == server_id:
+                                    del ext_tool_router[q_name]
+                            await entry["stack"].aclose()
+                            if verbose and config.VERBOSITY_MODE != "silent":
+                                print(f"\n{COLOR_YELLOW}[MCP SYSTEM: Disconnected external server '{server_id}']{COLOR_RESET}")
+                                log_event("SYSTEM", f"Disconnected external MCP '{server_id}'")
+
+                    def rebuild_openai_tools():
+                        combined = list(sandbox_openai_tools)
+                        for s_data in active_ext_servers.values():
+                            combined.extend(s_data["tools"])
+                        return combined
+
+                    # Connect initial external MCP servers enabled via CLI or config
+                    cli_mcp_targets = set()
+                    if getattr(cli_args, "all_mcp", False):
+                        cli_mcp_targets = set(mcp_config.EXTERNAL_MCP_SERVERS.keys())
+                    elif getattr(cli_args, "mcp", None):
+                        cli_mcp_targets = {s.strip().lower() for s in cli_args.mcp.split(",") if s.strip()}
+
+                    for s_id, s_cfg in mcp_config.EXTERNAL_MCP_SERVERS.items():
+                        if s_id in cli_mcp_targets or (not getattr(cli_args, "mcp", None) and s_cfg.get("enabled", False)):
+                            await connect_external_mcp(s_id, s_cfg, verbose=True)
+
+                    openai_tools = rebuild_openai_tools()
                     
                     # Calculate token overhead of the registered tool schemas
                     tool_schemas_overhead = len(tokenizer.encode(json.dumps(openai_tools)))
@@ -714,7 +812,59 @@ async def run_chat():
                             print(f"\n{COLOR_BRIGHT_GREEN}[SYSTEM: Console format instantly changed to '{new_format}']{COLOR_RESET}")
                             continue
 
-                        # --- 4. EMPTY INPUT CHECK ---
+                        # --- 4. DYNAMIC MCP COMMANDS ---
+                        if user_input.lower().startswith('/mcp'):
+                            parts = user_input.strip().split()
+                            if len(parts) == 1 or parts[1].lower() in ['list', 'status', 'help']:
+                                print(f"\n{COLOR_CYAN}=== EXTERNAL MCP REGISTRY ==={COLOR_RESET}")
+                                for s_id, s_cfg in mcp_config.EXTERNAL_MCP_SERVERS.items():
+                                    is_active = s_id in active_ext_servers
+                                    status_tag = f"{COLOR_BRIGHT_GREEN}[ACTIVE]{COLOR_RESET}" if is_active else f"{COLOR_DIM}[OFF]{COLOR_RESET}"
+                                    confirm_tag = " (requires confirmation)" if s_cfg.get("require_confirmation") else ""
+                                    tools_cnt = f" ({len(active_ext_servers[s_id]['tools'])} tools)" if is_active else ""
+                                    print(f"  {status_tag} {s_id} - {s_cfg.get('name', s_id)} ({s_cfg.get('url', s_cfg.get('command', ''))}){tools_cnt}{confirm_tag}")
+                                print(f"{COLOR_DIM}Commands: /mcp on <name> | /mcp off <name>{COLOR_RESET}\n")
+                                continue
+                            elif parts[1].lower() in ['on', 'enable'] and len(parts) > 2:
+                                target_name = parts[2].lower()
+                                if target_name not in mcp_config.EXTERNAL_MCP_SERVERS:
+                                    print(f"\n{COLOR_RED}[MCP ERROR: Unknown server '{target_name}'. Run '/mcp' to see available servers.]{COLOR_RESET}")
+                                    continue
+                                if target_name in active_ext_servers:
+                                    print(f"\n{COLOR_YELLOW}[MCP NOTICE: '{target_name}' is already active.]{COLOR_RESET}")
+                                    continue
+                                cfg = mcp_config.EXTERNAL_MCP_SERVERS[target_name]
+                                tools_added = await connect_external_mcp(target_name, cfg, verbose=True)
+                                if tools_added:
+                                    openai_tools = rebuild_openai_tools()
+                                    tool_schemas_overhead = len(tokenizer.encode(json.dumps(openai_tools)))
+                                    inject_note = f"[SYSTEM NOTICE: External tool suite '{cfg.get('name', target_name)}' is now connected. Available tools: {', '.join(t['function']['name'] for t in tools_added)}]"
+                                    messages = load_history()
+                                    messages.append({"role": "user", "content": inject_note})
+                                    save_history(messages)
+                                    if config.VERBOSITY_MODE != "silent":
+                                        print(f"{COLOR_YELLOW}{inject_note}{COLOR_RESET}")
+                                    log_event("SYSTEM", inject_note)
+                                continue
+                            elif parts[1].lower() in ['off', 'disable'] and len(parts) > 2:
+                                target_name = parts[2].lower()
+                                if target_name not in active_ext_servers:
+                                    print(f"\n{COLOR_YELLOW}[MCP NOTICE: '{target_name}' is not currently active.]{COLOR_RESET}")
+                                    continue
+                                cfg = active_ext_servers[target_name]["cfg"]
+                                await disconnect_external_mcp(target_name, verbose=True)
+                                openai_tools = rebuild_openai_tools()
+                                tool_schemas_overhead = len(tokenizer.encode(json.dumps(openai_tools)))
+                                inject_note = f"[SYSTEM NOTICE: External tool suite '{cfg.get('name', target_name)}' has been disconnected. Its tools are no longer available.]"
+                                messages = load_history()
+                                messages.append({"role": "user", "content": inject_note})
+                                save_history(messages)
+                                if config.VERBOSITY_MODE != "silent":
+                                    print(f"{COLOR_YELLOW}{inject_note}{COLOR_RESET}")
+                                log_event("SYSTEM", inject_note)
+                                continue
+
+                        # --- 5. EMPTY INPUT CHECK ---
                         if not user_input: continue
                             
                         log_event("USER", user_input)
@@ -1066,6 +1216,9 @@ async def run_chat():
                                             print(f"\n{COLOR_ORANGE}▶ Passing files to The Analyst... Awaiting report...{COLOR_RESET}")
                                         elif name == "commission_architect":
                                             print(f"\n{COLOR_ORANGE}▶ Waking up the Architect to draft skill...{COLOR_RESET}")
+                                        elif name in ext_tool_router:
+                                            srv_id = ext_tool_router[name]["server_id"]
+                                            print(f"\n{COLOR_CYAN}▶ Routing to external host MCP '{srv_id}': {name}...{COLOR_RESET}")
                                         elif hide_args:
                                             # If we hid the JSON args, print a clean 1-liner so the user knows it's doing something!
                                             print(f"{COLOR_ORANGE}▶ Running tool: {name}...{COLOR_RESET}")
@@ -1075,13 +1228,42 @@ async def run_chat():
                                     totals_before = config.get_token_totals(state_dir)
                                     
                                     try:
-                                        result = await session.call_tool(name, args)
-                                        if result.content and len(result.content) > 0 and hasattr(result.content[0], "text"):
-                                            output = result.content[0].text
-                                        elif result.content and len(result.content) > 0:
-                                            output = str(result.content[0])
+                                        if name in ext_tool_router:
+                                            target = ext_tool_router[name]
+                                            srv_id = target["server_id"]
+                                            orig_name = target["original_name"]
+                                            if target.get("require_confirmation", False):
+                                                if cli_args.exit:
+                                                    output = f"SYSTEM ERROR: Tool '{name}' requires human confirmation, but running in unattended batch mode (-x). Execution stopped/denied."
+                                                    print(f"\n{COLOR_RED}[SECURITY GATE] {output}{COLOR_RESET}")
+                                                    log_event("SYSTEM", output)
+                                                    result = None
+                                                else:
+                                                    print(f"\n{COLOR_RED}[SECURITY GATE] The Brain requests to execute external tool '{name}' on '{srv_id}'.{COLOR_RESET}")
+                                                    print(f"{COLOR_YELLOW}Arguments: {json.dumps(args, indent=2)}{COLOR_RESET}")
+                                                    try:
+                                                        confirm = await asyncio.to_thread(input, f"{COLOR_CYAN}Allow execution on host? [y/N]: {COLOR_RESET}")
+                                                    except (EOFError, KeyboardInterrupt):
+                                                        confirm = "n"
+                                                    if confirm.strip().lower() not in ["y", "yes"]:
+                                                        output = f"SYSTEM NOTICE: Execution of external tool '{name}' was DENIED by the user for security reasons."
+                                                        print(f"{COLOR_YELLOW}{output}{COLOR_RESET}")
+                                                        log_event("SYSTEM", output)
+                                                        result = None
+                                                    else:
+                                                        result = await target["session"].call_tool(orig_name, args)
+                                            else:
+                                                result = await target["session"].call_tool(orig_name, args)
                                         else:
-                                            output = "SUCCESS: Tool executed with no output."
+                                            result = await session.call_tool(name, args)
+
+                                        if result is not None:
+                                            if result.content and len(result.content) > 0 and hasattr(result.content[0], "text"):
+                                                output = result.content[0].text
+                                            elif result.content and len(result.content) > 0:
+                                                output = str(result.content[0])
+                                            else:
+                                                output = "SUCCESS: Tool executed with no output."
                                     except Exception as tool_err:
                                         output = f"SYSTEM ERROR: Tool execution failed: {str(tool_err)}"
                                     
@@ -1327,6 +1509,15 @@ async def run_chat():
                                     grand_str += f" ({grand['thinking']} thinking)"
                                 totals_parts.append(grand_str)
                                 print(f"\n{COLOR_YELLOW}[Session Totals: {' | '.join(totals_parts)}]{COLOR_RESET}")
+                                
+                    # Clean up any active external MCP sessions
+                    for s_data in list(active_ext_servers.values()):
+                        try:
+                            await s_data["stack"].aclose()
+                        except Exception:
+                            pass
+                    active_ext_servers.clear()
+                    ext_tool_router.clear()
                                 
         # 3. CATCH DEAD CONTAINERS AND RESTART
         except (KeyboardInterrupt, asyncio.CancelledError):
