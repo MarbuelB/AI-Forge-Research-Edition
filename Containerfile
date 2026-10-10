@@ -37,7 +37,7 @@ RUN pixi init && \
     pixi project channel add bioconda && \
     pixi add python pip openai mcp fastmcp \
     pandas numpy scipy matplotlib pyarrow \
-    requests beautifulsoup4 lxml \
+    requests beautifulsoup4 lxml httpx \
     pypdf2 python-docx pillow tiktoken \
     biopython rdkit sqlalchemy networkx \
     scikit-learn seaborn statsmodels openpyxl \
