@@ -179,7 +179,7 @@ def build_skills_menu():
         skill_path = os.path.join(skills_dir, item, "SKILL.md")
         # HOST PROTECTION: Reject symlinks pointing outside SESSION_DIR
         try:
-            if not os.path.commonpath([os.path.realpath(skill_path), SESSION_DIR]) == SESSION_DIR:
+            if os.path.commonpath([os.path.realpath(skill_path), SESSION_DIR]) != SESSION_DIR:
                 continue
         except Exception:
             continue
@@ -208,7 +208,7 @@ def load_history():
     
     # HOST PROTECTION: Reject if CURRENT_HISTORY_FILE points outside SESSION_DIR
     try:
-        if not os.path.commonpath([os.path.realpath(CURRENT_HISTORY_FILE), SESSION_DIR]) == SESSION_DIR:
+        if os.path.commonpath([os.path.realpath(CURRENT_HISTORY_FILE), SESSION_DIR]) != SESSION_DIR:
             init_state = [{"role": "system", "content": system_prompt}]
             save_history(init_state)
             return init_state
@@ -666,7 +666,7 @@ async def run_chat():
                             "function": {
                                 "name": t.name, 
                                 "description": t.description, 
-                                "parameters": t.inputSchema
+                                "parameters": t.inputSchema or {"type": "object", "properties": {}}
                             }
                         } 
                         for t in mcp_tools.tools
@@ -760,7 +760,7 @@ async def run_chat():
                                 "function": {
                                     "name": q_name,
                                     "description": f"[{cfg.get('name', server_id)}] {t.description or ''}",
-                                    "parameters": t.inputSchema,
+                                    "parameters": t.inputSchema or {"type": "object", "properties": {}},
                                 }
                             })
                         active_ext_servers[server_id] = {

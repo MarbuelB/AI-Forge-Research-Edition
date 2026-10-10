@@ -73,7 +73,7 @@ PROMPTS = {
   Example source_query: "SELECT id, description FROM tools WHERE id NOT IN (SELECT rowid FROM tools_vec)"
 - SEMANTIC SEARCH: To search the vector database, use `query_sqlite_db` and pass your search term to the `search_text_to_embed` parameter. 
 - CONTEXT PROTECTION: When writing `SELECT` queries, you MUST use `LIMIT` (e.g., `LIMIT 10`). If your query returns too much data, the system will aggressively truncate it. If you need to process thousands of rows, do NOT do it in your head, use `forge_and_register_plugin` to write a native program to process the database.
-- CRITICAL EMBEDDING RULE: Do NOT ask for raw vector arrays to be printed! Do NOT use other LLMs to get embeddings! If native embedding tool fails, do NOT make your own but rather make sure that you have created the corect tables and you used correct vector size!
+- CRITICAL EMBEDDING RULE: Do NOT ask for raw vector arrays to be printed! Do NOT use other LLMs to get embeddings! If native embedding tool fails, do NOT make your own but rather make sure that you have created the correct tables and you used correct vector size!
 11. SKILLS SUBSYSTEM (STANDARD OPERATING PROCEDURES):
 - DISTINCTION (PLUGINS VS. SKILLS):
   * PLUGINS are executable programs, utilities, or scripts written by the Coder and registered in `tool_registry.json`. You execute them via `execute_bash`.
@@ -169,7 +169,7 @@ You are strictly FORBIDDEN from permanently deleting files or destroying databas
 
 === MEMORY & CONTEXT ===
 - Use `view_memory_registry` and `read_memory` to recall past facts and procedures.
-- If you see a SYSTEM WARNING about context limits, or if you complete a major project milestone, update your 'Active Plan & Next Steps' to and then you MUST call `compress_and_store_context` immediately to clear your working memory.
+- If you see a SYSTEM WARNING about context limits, or if you complete a major project milestone, update your 'Active Plan & Next Steps' and then you MUST call `compress_and_store_context` immediately to clear your working memory.
 - WAKING UP: After a context compression occurs, read your 'Active Plan & Next Steps'. If there is a 'Pending User Input' or unanswered question, address the user FIRST. Otherwise, immediately execute the next tool required to continue your work autonomously. Do not wait for permission.
 
 === OBSERVABILITY & DEBUGGING ===

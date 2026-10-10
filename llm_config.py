@@ -15,17 +15,17 @@ Profiles can be addressed from:
 # --- ROLE ASSIGNMENTS ---
 # Quick Profile Index Reference (see LLM_PROFILES below):
 #   [0] Default Model (WSL2 Host)    | [1] Default Model (Podman Container)
-#   [2] Qwen 3.8 27B vLLM (Host)     | [3] Qwen 3.8 27B vLLM (Container)
+#   [2] Qwen 3.6 35B vLLM (Host)     | [3] Qwen 3.6 35B vLLM (Container)
 #   [4] Qwen 3.8 Flash Next (Host)   | [5] Qwen 3.8 Flash Next (Container)
 #   [6] Qwen 3.6 35B test (Container)
 #   [7] Gemini 3.5 Flash (Host)      | [8] Gemini 3.5 Flash (Container)
 #   [9] Laguna S 2.1 vLLM (Host)     | [10] Laguna S 2.1 vLLM (Container)
-ACTIVE_BRAIN_PROFILE = 2
+ACTIVE_BRAIN_PROFILE = 4
 ACTIVE_CODER_PROFILE = 5  # must be reachable from Podman container
-ACTIVE_SUMMARIZER_PROFILE = 3  # can be the same as coder, or a cheaper fast model
+ACTIVE_SUMMARIZER_PROFILE = 5  # can be the same as coder, or a cheaper fast model
 ACTIVE_ADVISER_PROFILE = 5
-ACTIVE_ANALYST_PROFILE = 3  # point this to your vision model
-ACTIVE_ARCHITECT_PROFILE = 3
+ACTIVE_ANALYST_PROFILE = 5  # point this to your vision model
+ACTIVE_ARCHITECT_PROFILE = 5
 
 # --- EMBEDDING CONFIGURATION ---
 # Hardcoded to prevent dimension mismatch in the vector database.

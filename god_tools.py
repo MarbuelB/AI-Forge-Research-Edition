@@ -511,6 +511,7 @@ def manage_plan(action: str, content: str = None) -> str:
                     return "SUCCESS: Master Plan is already up to date (no changes detected)."
             except Exception:
                 pass
+        os.makedirs(STATE_DIR, exist_ok=True)
         with open(plan_path, "w", encoding="utf-8") as f:
             f.write(content)
         return "SUCCESS: Master Plan has been updated and saved to disk."
@@ -736,10 +737,11 @@ async def fast_decision(
             return json.loads(resp_bytes.decode("utf-8"))
 
     try:
-        resp_json = await asyncio.to_thread(_post_systemone, endpoint, req_body, timeout)
-    except urllib.error.HTTPError as he:
-        err_detail = he.read().decode("utf-8", errors="replace") if hasattr(he, "read") else str(he)
-        raise RuntimeError(f"HTTP {he.code}: {err_detail}") from he
+        try:
+            resp_json = await asyncio.to_thread(_post_systemone, endpoint, req_body, timeout)
+        except urllib.error.HTTPError as he:
+            err_detail = he.read().decode("utf-8", errors="replace") if hasattr(he, "read") else str(he)
+            raise RuntimeError(f"HTTP {he.code}: {err_detail}") from he
     except Exception as exc:
         trace_file = save_failure_trace("decider", {
             "subagent": "decider",
@@ -951,7 +953,8 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
 
         try:
             # Await the completion with an async timeout
-            stdout_data, _ = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+            timeout_val = float(timeout_seconds) if timeout_seconds else 180.0
+            stdout_data, _ = await asyncio.wait_for(process.communicate(), timeout=timeout_val)
             
         except (asyncio.TimeoutError, asyncio.CancelledError):
             # If it times out or is cancelled, aggressively kill the entire process group
@@ -1138,6 +1141,7 @@ def store_memory(category: str, category_description: str, title: str, short_des
     filename = f"{timestamp_prefix}_{safe_title}.md"
     filepath = os.path.join(MEMORIES_DIR, filename)
     
+    os.makedirs(MEMORIES_DIR, exist_ok=True)
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(detailed_markdown)
         
@@ -2201,7 +2205,13 @@ async def batch_generate_embeddings(db_path: str, vec_table: str, source_query: 
             for i, rowid in enumerate(chunk_rowids):
                 embedding_vector = response.data[i].embedding
                 vector_blob = array.array('f', embedding_vector).tobytes()
-                cursor.execute(f"INSERT OR REPLACE INTO {vec_table}(rowid, embedding) VALUES (?, ?)", (rowid, vector_blob))
+                try:
+                    cursor.execute(f"INSERT INTO {vec_table}(rowid, embedding) VALUES (?, ?)", (rowid, vector_blob))
+                except (sqlite3.IntegrityError, sqlite3.OperationalError) as insert_err:
+                    if "UNIQUE constraint failed" in str(insert_err):
+                        cursor.execute(f"UPDATE {vec_table} SET embedding = ? WHERE rowid = ?", (vector_blob, rowid))
+                    else:
+                        raise insert_err
                 inserted_count += 1
 
         config.log_token_usage(STATE_DIR, "embedding", total_tokens_in, 0, 0)
@@ -2259,9 +2269,10 @@ async def search_web(query: str, max_results: int = 5) -> str:
             
         formatted_results = f"--- SEARCH RESULTS FOR '{query}' ---\n\n"
         count = 0
+        limit = int(max_results) if max_results is not None else 5
         
         for row in results:
-            if count >= max_results:
+            if count >= limit:
                 break
                 
             title_tag = row.find('a', class_='result__a')
@@ -2469,6 +2480,11 @@ async def analyze_files(
     - tail_mode: If True, reads from the end (tail) of the file up to the character budget. Perfect for inspecting recent errors in large log files!
     - max_chars: Optional manual character limit per file. If omitted, the budget dynamically scales up to 80% of the Analyst's context window (~280,000 characters / ~70,000 tokens for a single file).
     """
+    start_line = int(start_line) if start_line is not None else 1
+    max_lines = int(max_lines) if max_lines is not None else None
+    max_chars = int(max_chars) if max_chars is not None else None
+    context_lines = int(context_lines) if context_lines is not None else 2
+
     api_args = analyst_profile["api_params"].copy()
     api_args["model"] = analyst_profile["model"]
     
