@@ -127,6 +127,24 @@ EXTERNAL_MCP_SERVERS: Dict[str, Dict[str, Any]] = {
         "tool_prefix": "host_",
         "require_confirmation": True,  # Extra security gate: always asks user before executing!
     },
+
+    # --------------------------------------------------------------------------
+    # Example 3: Mock Test Server (Included Harness Verification Asset)
+    # --------------------------------------------------------------------------
+    # HOW TO START: In a separate terminal run:
+    #   pixi run python mock_mcp_server.py
+    # Exposes: mock_get_host_time, mock_multiply_numbers on port 8888.
+    # --------------------------------------------------------------------------
+    "mock": {
+        "name": "Mock Test Server",
+        "description": "Local test MCP server with time and math tools (mock_mcp_server.py)",
+        "transport": "sse",
+        "url": "http://127.0.0.1:8888/sse",
+        "enabled": False,              # Off by default - toggle with --mcp mock or /mcp on mock
+        "optional": True,              # Never crashes if mock server isn't running
+        "tool_prefix": "mock_",        # Namespaces tools: mock_get_host_time, mock_multiply_numbers
+        "require_confirmation": False, # Direct execution without user confirmation gate
+    },
 }
 
 

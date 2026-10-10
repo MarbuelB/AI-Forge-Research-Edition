@@ -653,65 +653,104 @@ async def run_chat():
                     active_ext_servers = {}
                     ext_tool_router = {}
 
-                    async def connect_external_mcp(server_id, cfg, verbose=True):
+                    async def mcp_worker(server_id, cfg, cmd_queue, ready_queue):
                         stack = AsyncExitStack()
                         try:
                             if cfg.get("transport") == "sse":
-                                sse_ctx = sse_client(cfg["url"])
-                                read, write = await asyncio.wait_for(
-                                    stack.enter_async_context(sse_ctx),
-                                    timeout=5.0
-                                )
+                                sse_ctx = sse_client(cfg["url"], timeout=5.0)
+                                read, write = await stack.enter_async_context(sse_ctx)
                             elif cfg.get("transport") == "stdio":
                                 params = StdioServerParameters(command=cfg["command"], args=cfg.get("args", []), env=cfg.get("env"))
-                                read, write = await asyncio.wait_for(
-                                    stack.enter_async_context(stdio_client(params)),
-                                    timeout=5.0
-                                )
+                                read, write = await stack.enter_async_context(stdio_client(params))
                             else:
-                                return None
+                                ready_queue.put_nowait({"error": "Unknown transport protocol"})
+                                return
 
-                            ext_sess = await stack.enter_async_context(ClientSession(read, write))
-                            await ext_sess.initialize()
-                            tools_res = await ext_sess.list_tools()
-                            prefix = cfg.get("tool_prefix", "")
-                            registered = []
-                            for t in tools_res.tools:
-                                q_name = f"{prefix}{t.name}" if prefix else t.name
-                                ext_tool_router[q_name] = {
-                                    "session": ext_sess,
-                                    "original_name": t.name,
-                                    "server_id": server_id,
-                                    "require_confirmation": cfg.get("require_confirmation", False),
-                                }
-                                registered.append({
-                                    "type": "function",
-                                    "function": {
-                                        "name": q_name,
-                                        "description": f"[{cfg.get('name', server_id)}] {t.description or ''}",
-                                        "parameters": t.inputSchema,
-                                    }
-                                })
-                            active_ext_servers[server_id] = {
-                                "stack": stack,
-                                "session": ext_sess,
-                                "cfg": cfg,
-                                "tools": registered,
-                            }
-                            if verbose and config.VERBOSITY_MODE != "silent":
-                                tool_names = ", ".join(t["function"]["name"] for t in registered)
-                                print(f"\n{COLOR_BRIGHT_GREEN}[MCP SYSTEM: Connected to '{cfg.get('name', server_id)}' ({len(registered)} tools: {tool_names})]{COLOR_RESET}")
-                                log_event("SYSTEM", f"Connected external MCP '{server_id}' with tools: {tool_names}")
-                            return registered
+                            session = await stack.enter_async_context(ClientSession(read, write))
+                            await session.initialize()
+                            tools_res = await session.list_tools()
+                            ready_queue.put_nowait({"tools": tools_res.tools})
+
+                            while True:
+                                cmd = await cmd_queue.get()
+                                if cmd is None or cmd.get("action") == "close":
+                                    break
+                                if cmd.get("action") == "call_tool":
+                                    try:
+                                        res = await session.call_tool(cmd["name"], cmd["args"])
+                                        if not cmd["future"].done():
+                                            cmd["future"].set_result(res)
+                                    except Exception as call_err:
+                                        if not cmd["future"].done():
+                                            cmd["future"].set_exception(call_err)
                         except Exception as e:
-                            await stack.aclose()
+                            if ready_queue.empty():
+                                ready_queue.put_nowait({"error": str(e)})
+                        finally:
+                            try:
+                                await stack.aclose()
+                            except Exception:
+                                pass
+
+                    async def call_external_tool(target, orig_name, args):
+                        loop = asyncio.get_running_loop()
+                        fut = loop.create_future()
+                        await target["cmd_queue"].put({"action": "call_tool", "name": orig_name, "args": args, "future": fut})
+                        return await fut
+
+                    async def connect_external_mcp(server_id, cfg, verbose=True):
+                        cmd_queue = asyncio.Queue()
+                        ready_queue = asyncio.Queue()
+                        task = asyncio.create_task(mcp_worker(server_id, cfg, cmd_queue, ready_queue))
+
+                        try:
+                            ready_res = await asyncio.wait_for(ready_queue.get(), timeout=6.0)
+                        except Exception as e:
+                            ready_res = {"error": f"Connection timed out: {e}"}
+
+                        if "error" in ready_res:
+                            try:
+                                await cmd_queue.put({"action": "close"})
+                                await asyncio.wait_for(task, timeout=1.0)
+                            except Exception:
+                                pass
                             if cfg.get("optional", True):
                                 if verbose and config.VERBOSITY_MODE != "silent":
-                                    print(f"\n{COLOR_YELLOW}[MCP NOTICE: External server '{server_id}' ({cfg.get('url', cfg.get('command', ''))}) is offline/unreachable: {e}. Skipping.]{COLOR_RESET}")
-                                    log_event("SYSTEM", f"External MCP '{server_id}' unavailable (skipped): {e}")
+                                    print(f"\n{COLOR_YELLOW}[MCP NOTICE: External server '{server_id}' ({cfg.get('url', cfg.get('command', ''))}) is offline/unreachable: {ready_res['error']}. Skipping.]{COLOR_RESET}")
+                                    log_event("SYSTEM", f"External MCP '{server_id}' unavailable (skipped): {ready_res['error']}")
                                 return None
                             else:
-                                raise e
+                                raise RuntimeError(ready_res["error"])
+
+                        prefix = cfg.get("tool_prefix", "")
+                        registered = []
+                        for t in ready_res["tools"]:
+                            q_name = f"{prefix}{t.name}" if prefix else t.name
+                            ext_tool_router[q_name] = {
+                                "cmd_queue": cmd_queue,
+                                "original_name": t.name,
+                                "server_id": server_id,
+                                "require_confirmation": cfg.get("require_confirmation", False),
+                            }
+                            registered.append({
+                                "type": "function",
+                                "function": {
+                                    "name": q_name,
+                                    "description": f"[{cfg.get('name', server_id)}] {t.description or ''}",
+                                    "parameters": t.inputSchema,
+                                }
+                            })
+                        active_ext_servers[server_id] = {
+                            "task": task,
+                            "cmd_queue": cmd_queue,
+                            "cfg": cfg,
+                            "tools": registered,
+                        }
+                        if verbose and config.VERBOSITY_MODE != "silent":
+                            tool_names = ", ".join(t["function"]["name"] for t in registered)
+                            print(f"\n{COLOR_BRIGHT_GREEN}[MCP SYSTEM: Connected to '{cfg.get('name', server_id)}' ({len(registered)} tools: {tool_names})]{COLOR_RESET}")
+                            log_event("SYSTEM", f"Connected external MCP '{server_id}' with tools: {tool_names}")
+                        return registered
 
                     async def disconnect_external_mcp(server_id, verbose=True):
                         if server_id in active_ext_servers:
@@ -719,7 +758,11 @@ async def run_chat():
                             for q_name in list(ext_tool_router.keys()):
                                 if ext_tool_router[q_name]["server_id"] == server_id:
                                     del ext_tool_router[q_name]
-                            await entry["stack"].aclose()
+                            try:
+                                await entry["cmd_queue"].put({"action": "close"})
+                                await asyncio.wait_for(entry["task"], timeout=3.0)
+                            except Exception:
+                                pass
                             if verbose and config.VERBOSITY_MODE != "silent":
                                 print(f"\n{COLOR_YELLOW}[MCP SYSTEM: Disconnected external server '{server_id}']{COLOR_RESET}")
                                 log_event("SYSTEM", f"Disconnected external MCP '{server_id}'")
@@ -1481,9 +1524,9 @@ async def run_chat():
                                                         log_event("SYSTEM", output)
                                                         result = None
                                                     else:
-                                                        result = await target["session"].call_tool(orig_name, args)
+                                                        result = await call_external_tool(target, orig_name, args)
                                             else:
-                                                result = await target["session"].call_tool(orig_name, args)
+                                                result = await call_external_tool(target, orig_name, args)
                                         else:
                                             result = await session.call_tool(name, args)
 
@@ -1743,7 +1786,8 @@ async def run_chat():
                     # Clean up any active external MCP sessions
                     for s_data in list(active_ext_servers.values()):
                         try:
-                            await s_data["stack"].aclose()
+                            await s_data["cmd_queue"].put({"action": "close"})
+                            await asyncio.wait_for(s_data["task"], timeout=2.0)
                         except Exception:
                             pass
                     active_ext_servers.clear()
