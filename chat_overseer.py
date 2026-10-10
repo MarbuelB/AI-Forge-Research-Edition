@@ -663,7 +663,7 @@ async def run_chat():
                                     timeout=5.0
                                 )
                             elif cfg.get("transport") == "stdio":
-                                params = StdioServerParameters(command=cfg["command"], args=cfg.get("args", []))
+                                params = StdioServerParameters(command=cfg["command"], args=cfg.get("args", []), env=cfg.get("env"))
                                 read, write = await asyncio.wait_for(
                                     stack.enter_async_context(stdio_client(params)),
                                     timeout=5.0
@@ -724,11 +724,212 @@ async def run_chat():
                                 print(f"\n{COLOR_YELLOW}[MCP SYSTEM: Disconnected external server '{server_id}']{COLOR_RESET}")
                                 log_event("SYSTEM", f"Disconnected external MCP '{server_id}'")
 
+                    MANAGE_EXTERNAL_MCP_TOOL = {
+                        "type": "function",
+                        "function": {
+                            "name": "manage_external_mcp",
+                            "description": "Meta-tool to inspect, connect, or disconnect external Model Context Protocol (MCP) tool suites outside the sandbox (e.g. ChimeraX for 3D molecular visualization, host tools, or any universal custom MCP server). When connected, its tools are registered directly into your toolset for all subsequent turns in this session until disconnected.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "action": {
+                                        "type": "string",
+                                        "enum": ["list", "connect", "disconnect"],
+                                        "description": "'list' to view configured and active servers; 'connect' to attach a server; 'disconnect' to detach a server."
+                                    },
+                                    "server_name": {
+                                        "type": "string",
+                                        "description": "Identifier for the server. Can be a known name from mcp_config (e.g. 'chimerax') or a new custom name for a universal MCP."
+                                    },
+                                    "address": {
+                                        "type": "string",
+                                        "description": "For universal custom SSE MCPs: the URL (e.g. 'http://host:9000/sse'). 'host' or '{HOST_IP}' is automatically resolved to the host IP. Optional if server_name is already in mcp_config."
+                                    },
+                                    "command": {
+                                        "type": "string",
+                                        "description": "For universal custom stdio MCPs: command to execute (e.g. 'npx', 'python', 'uvx')."
+                                    },
+                                    "args": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "For universal custom stdio MCPs: list of command arguments (e.g. ['-y', '@modelcontextprotocol/server-memory'])."
+                                    },
+                                    "prefix": {
+                                        "type": "string",
+                                        "description": "Tool prefix to namespace the imported tools and avoid collisions (e.g. 'cx_', 'custom_'). Defaults to '{server_name}_'."
+                                    },
+                                    "transport": {
+                                        "type": "string",
+                                        "enum": ["sse", "stdio"],
+                                        "description": "Transport protocol for universal custom MCPs. Defaults to 'sse' (or 'stdio' if command is provided)."
+                                    }
+                                },
+                                "required": ["action"]
+                            }
+                        }
+                    }
+
+                    def save_active_mcp_state():
+                        state_dir = os.path.join(SESSION_DIR, "state")
+                        os.makedirs(state_dir, exist_ok=True)
+                        state_file = os.path.join(state_dir, "active_mcp_servers.json")
+                        saved_data = {}
+                        for s_id, s_data in active_ext_servers.items():
+                            saved_data[s_id] = s_data["cfg"]
+                        try:
+                            with open(state_file, "w", encoding="utf-8") as f:
+                                json.dump(saved_data, f, indent=2)
+                        except Exception:
+                            pass
+
+                    def load_saved_mcp_state():
+                        state_file = os.path.join(SESSION_DIR, "state", "active_mcp_servers.json")
+                        if os.path.exists(state_file):
+                            try:
+                                with open(state_file, "r", encoding="utf-8") as f:
+                                    return json.load(f)
+                            except Exception:
+                                return {}
+                        return {}
+
                     def rebuild_openai_tools():
-                        combined = list(sandbox_openai_tools)
+                        combined = [MANAGE_EXTERNAL_MCP_TOOL] + list(sandbox_openai_tools)
                         for s_data in active_ext_servers.values():
                             combined.extend(s_data["tools"])
                         return combined
+
+                    async def handle_manage_external_mcp(m_args):
+                        nonlocal openai_tools, tool_schemas_overhead
+                        action = (m_args.get("action") or "").lower().strip()
+                        server_name = (m_args.get("server_name") or "").lower().strip()
+
+                        if action == "list":
+                            lines = ["=== MCP SERVER REGISTRY ==="]
+                            lines.append("Pre-Configured Servers (from mcp_config):")
+                            for s_id, s_cfg in mcp_config.EXTERNAL_MCP_SERVERS.items():
+                                status = "[CONNECTED]" if s_id in active_ext_servers else "[DISCONNECTED]"
+                                lines.append(f"  - {s_id}: {s_cfg.get('name', s_id)} ({s_cfg.get('url', s_cfg.get('command', ''))}) {status}")
+                            lines.append("\nActive Dynamic Servers:")
+                            dynamic_found = False
+                            for s_id, s_data in active_ext_servers.items():
+                                if s_id not in mcp_config.EXTERNAL_MCP_SERVERS:
+                                    dynamic_found = True
+                                    lines.append(f"  - {s_id}: {s_data['cfg'].get('url', s_data['cfg'].get('command', ''))} [CONNECTED - {len(s_data['tools'])} tools]")
+                            if not dynamic_found:
+                                lines.append("  (none)")
+                            lines.append("\nUsage: Call manage_external_mcp with action='connect' and server_name (and optional address/prefix for universal custom servers).")
+                            return "\n".join(lines)
+
+                        elif action == "connect":
+                            if not server_name:
+                                return "SYSTEM ERROR: You must provide 'server_name' to connect an MCP server."
+
+                            if server_name in active_ext_servers:
+                                return f"NOTICE: Server '{server_name}' is already connected."
+
+                            if server_name in mcp_config.EXTERNAL_MCP_SERVERS:
+                                cfg = copy.deepcopy(mcp_config.EXTERNAL_MCP_SERVERS[server_name])
+                                if m_args.get("address"):
+                                    raw_addr = m_args["address"]
+                                    for h_alias in ["host.wsl.internal", "host.containers.internal", "host.docker.internal", "host"]:
+                                        raw_addr = raw_addr.replace(h_alias, mcp_config.HOST_IP)
+                                    cfg["url"] = raw_addr
+                                if m_args.get("prefix"):
+                                    cfg["tool_prefix"] = m_args["prefix"]
+                            else:
+                                # Universal Custom MCP Server
+                                address = m_args.get("address")
+                                command = m_args.get("command")
+                                transport = (m_args.get("transport") or "").lower().strip()
+                                if command and not transport:
+                                    transport = "stdio"
+                                elif not transport:
+                                    transport = "sse"
+
+                                prefix = m_args.get("prefix") or f"{server_name}_"
+
+                                if transport == "stdio":
+                                    cmd = command or address
+                                    if not cmd:
+                                        return f"SYSTEM ERROR: Unknown server '{server_name}'. For stdio MCPs, provide 'command' (e.g. 'npx') and optional 'args' (e.g. ['-y', '@modelcontextprotocol/server-memory'])."
+                                    args_list = m_args.get("args") or []
+                                    if isinstance(args_list, str):
+                                        args_list = args_list.split()
+                                    cfg = {
+                                        "name": server_name,
+                                        "description": f"Universal stdio MCP server ({server_name}): {cmd}",
+                                        "transport": "stdio",
+                                        "command": cmd,
+                                        "args": args_list,
+                                        "tool_prefix": prefix,
+                                        "optional": True,
+                                        "require_confirmation": True,
+                                    }
+                                else:
+                                    if not address:
+                                        return f"SYSTEM ERROR: Unknown server '{server_name}' in mcp_config. To connect a universal custom SSE MCP, provide 'address' (e.g. 'http://host:9000/sse')."
+                                    raw_addr = address
+                                    for h_alias in ["host.wsl.internal", "host.containers.internal", "host.docker.internal", "host"]:
+                                        raw_addr = raw_addr.replace(h_alias, mcp_config.HOST_IP)
+                                    cfg = {
+                                        "name": server_name,
+                                        "description": f"Universal MCP server ({server_name}) at {raw_addr}",
+                                        "transport": "sse",
+                                        "url": raw_addr,
+                                        "tool_prefix": prefix,
+                                        "optional": True,
+                                        "require_confirmation": True,
+                                    }
+
+                            # Security confirmation check
+                            if cfg.get("require_confirmation", False):
+                                if cli_args.exit:
+                                    deny_msg = f"SECURITY ALERT: Connecting to external MCP '{server_name}' ({cfg.get('url', cfg.get('command', ''))}) requires human confirmation, but running in unattended batch mode (-x). Connection DENIED."
+                                    print(f"\n{COLOR_RED}[SECURITY GATE] {deny_msg}{COLOR_RESET}")
+                                    log_event("SYSTEM", deny_msg)
+                                    return f"SYSTEM ERROR: {deny_msg}"
+                                else:
+                                    target_loc = cfg.get('url', cfg.get('command', ''))
+                                    print(f"\n{COLOR_RED}[SECURITY GATE] The Brain requests to connect to external MCP server '{server_name}' at '{target_loc}'.{COLOR_RESET}")
+                                    try:
+                                        confirm = await asyncio.to_thread(input, f"{COLOR_CYAN}Allow connection? [y/N]: {COLOR_RESET}")
+                                    except (EOFError, KeyboardInterrupt):
+                                        confirm = "n"
+                                    if confirm.strip().lower() not in ["y", "yes"]:
+                                        msg = f"SYSTEM NOTICE: Connection to external MCP '{server_name}' was DENIED by the user for security reasons."
+                                        print(f"{COLOR_YELLOW}{msg}{COLOR_RESET}")
+                                        log_event("SYSTEM", msg)
+                                        return msg
+
+                            tools_added = await connect_external_mcp(server_name, cfg, verbose=True)
+                            if tools_added:
+                                openai_tools = rebuild_openai_tools()
+                                tool_schemas_overhead = len(tokenizer.encode(json.dumps(openai_tools)))
+                                save_active_mcp_state()
+                                tool_names = [t["function"]["name"] for t in tools_added]
+                                return f"SUCCESS: Connected to '{cfg.get('name', server_name)}'. Registered {len(tool_names)} tools: {', '.join(tool_names)}. These tools are now permanently available in your toolset for all subsequent turns in this session until you disconnect them."
+                            else:
+                                return f"SYSTEM ERROR: Could not connect to '{server_name}' at {cfg.get('url', cfg.get('command', ''))}. The server appears to be offline or unreachable."
+
+                        elif action == "disconnect":
+                            if not server_name:
+                                return "SYSTEM ERROR: You must provide 'server_name' to disconnect an MCP server."
+                            if server_name not in active_ext_servers:
+                                return f"NOTICE: Server '{server_name}' is not currently connected."
+                            await disconnect_external_mcp(server_name, verbose=True)
+                            openai_tools = rebuild_openai_tools()
+                            tool_schemas_overhead = len(tokenizer.encode(json.dumps(openai_tools)))
+                            save_active_mcp_state()
+                            return f"SUCCESS: Disconnected from '{server_name}'. Its tools have been removed from your toolset."
+
+                        else:
+                            return f"SYSTEM ERROR: Unknown action '{action}'. Valid actions are 'list', 'connect', 'disconnect'."
+
+                    # Reconnect saved active servers from session state
+                    saved_servers = load_saved_mcp_state()
+                    for s_id, s_cfg in saved_servers.items():
+                        if s_id not in active_ext_servers:
+                            await connect_external_mcp(s_id, s_cfg, verbose=True)
 
                     # Connect initial external MCP servers enabled via CLI or config
                     cli_mcp_targets = set()
@@ -738,9 +939,10 @@ async def run_chat():
                         cli_mcp_targets = {s.strip().lower() for s in cli_args.mcp.split(",") if s.strip()}
 
                     for s_id, s_cfg in mcp_config.EXTERNAL_MCP_SERVERS.items():
-                        if s_id in cli_mcp_targets or (not getattr(cli_args, "mcp", None) and s_cfg.get("enabled", False)):
+                        if s_id not in active_ext_servers and (s_id in cli_mcp_targets or (not getattr(cli_args, "mcp", None) and s_cfg.get("enabled", False))):
                             await connect_external_mcp(s_id, s_cfg, verbose=True)
 
+                    save_active_mcp_state()
                     openai_tools = rebuild_openai_tools()
                     
                     # Calculate token overhead of the registered tool schemas
@@ -827,17 +1029,37 @@ async def run_chat():
                                 continue
                             elif parts[1].lower() in ['on', 'enable'] and len(parts) > 2:
                                 target_name = parts[2].lower()
-                                if target_name not in mcp_config.EXTERNAL_MCP_SERVERS:
-                                    print(f"\n{COLOR_RED}[MCP ERROR: Unknown server '{target_name}'. Run '/mcp' to see available servers.]{COLOR_RESET}")
-                                    continue
                                 if target_name in active_ext_servers:
                                     print(f"\n{COLOR_YELLOW}[MCP NOTICE: '{target_name}' is already active.]{COLOR_RESET}")
                                     continue
-                                cfg = mcp_config.EXTERNAL_MCP_SERVERS[target_name]
+                                if target_name in mcp_config.EXTERNAL_MCP_SERVERS:
+                                    cfg = copy.deepcopy(mcp_config.EXTERNAL_MCP_SERVERS[target_name])
+                                    if len(parts) > 3:
+                                        raw_addr = parts[3]
+                                        for h_alias in ["host.wsl.internal", "host.containers.internal", "host.docker.internal", "host"]:
+                                            raw_addr = raw_addr.replace(h_alias, mcp_config.HOST_IP)
+                                        cfg["url"] = raw_addr
+                                elif len(parts) > 3:
+                                    raw_addr = parts[3]
+                                    for h_alias in ["host.wsl.internal", "host.containers.internal", "host.docker.internal", "host"]:
+                                        raw_addr = raw_addr.replace(h_alias, mcp_config.HOST_IP)
+                                    cfg = {
+                                        "name": target_name,
+                                        "description": f"Universal MCP server at {raw_addr}",
+                                        "transport": "sse",
+                                        "url": raw_addr,
+                                        "tool_prefix": f"{target_name}_",
+                                        "optional": True,
+                                        "require_confirmation": True,
+                                    }
+                                else:
+                                    print(f"\n{COLOR_RED}[MCP ERROR: Unknown server '{target_name}'. To connect a custom MCP, provide the URL: /mcp on {target_name} http://host:port/sse]{COLOR_RESET}")
+                                    continue
                                 tools_added = await connect_external_mcp(target_name, cfg, verbose=True)
                                 if tools_added:
                                     openai_tools = rebuild_openai_tools()
                                     tool_schemas_overhead = len(tokenizer.encode(json.dumps(openai_tools)))
+                                    save_active_mcp_state()
                                     inject_note = f"[SYSTEM NOTICE: External tool suite '{cfg.get('name', target_name)}' is now connected. Available tools: {', '.join(t['function']['name'] for t in tools_added)}]"
                                     messages = load_history()
                                     messages.append({"role": "user", "content": inject_note})
@@ -855,6 +1077,7 @@ async def run_chat():
                                 await disconnect_external_mcp(target_name, verbose=True)
                                 openai_tools = rebuild_openai_tools()
                                 tool_schemas_overhead = len(tokenizer.encode(json.dumps(openai_tools)))
+                                save_active_mcp_state()
                                 inject_note = f"[SYSTEM NOTICE: External tool suite '{cfg.get('name', target_name)}' has been disconnected. Its tools are no longer available.]"
                                 messages = load_history()
                                 messages.append({"role": "user", "content": inject_note})
@@ -1216,6 +1439,10 @@ async def run_chat():
                                             print(f"\n{COLOR_ORANGE}▶ Passing files to The Analyst... Awaiting report...{COLOR_RESET}")
                                         elif name == "commission_architect":
                                             print(f"\n{COLOR_ORANGE}▶ Waking up the Architect to draft skill...{COLOR_RESET}")
+                                        elif name == "manage_external_mcp":
+                                            action_tag = args.get("action", "")
+                                            srv_tag = args.get("server_name", "")
+                                            print(f"\n{COLOR_CYAN}▶ Managing external MCP tool suites ({action_tag} {srv_tag})...{COLOR_RESET}")
                                         elif name in ext_tool_router:
                                             srv_id = ext_tool_router[name]["server_id"]
                                             print(f"\n{COLOR_CYAN}▶ Routing to external host MCP '{srv_id}': {name}...{COLOR_RESET}")
@@ -1228,7 +1455,10 @@ async def run_chat():
                                     totals_before = config.get_token_totals(state_dir)
                                     
                                     try:
-                                        if name in ext_tool_router:
+                                        if name == "manage_external_mcp":
+                                            output = await handle_manage_external_mcp(args)
+                                            result = None
+                                        elif name in ext_tool_router:
                                             target = ext_tool_router[name]
                                             srv_id = target["server_id"]
                                             orig_name = target["original_name"]
