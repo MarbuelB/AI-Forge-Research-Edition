@@ -1120,7 +1120,10 @@ async def run_chat():
                                         print(f"  {COLOR_BRIGHT_GREEN}[ACTIVE]{COLOR_RESET} {s_id} - {s_data['cfg'].get('name', s_id)} ({url_or_cmd}){tools_cnt} (dynamic)")
                                 print(f"{COLOR_DIM}Commands: /mcp on <name> | /mcp off <name>{COLOR_RESET}\n")
                                 continue
-                            elif parts[1].lower() in ['on', 'enable'] and len(parts) > 2:
+                            elif parts[1].lower() in ['on', 'enable']:
+                                if len(parts) < 3:
+                                    print(f"\n{COLOR_RED}[MCP ERROR: Missing server name. Usage: /mcp on <name> [<url>] (e.g. /mcp on mock)]{COLOR_RESET}")
+                                    continue
                                 target_name = parts[2].lower()
                                 if target_name in active_ext_servers:
                                     print(f"\n{COLOR_YELLOW}[MCP NOTICE: '{target_name}' is already active.]{COLOR_RESET}")
@@ -1159,7 +1162,10 @@ async def run_chat():
                                     save_history(messages)
                                     log_event("INJECTED CONTEXT TO BRAIN", inject_note)
                                 continue
-                            elif parts[1].lower() in ['off', 'disable'] and len(parts) > 2:
+                            elif parts[1].lower() in ['off', 'disable']:
+                                if len(parts) < 3:
+                                    print(f"\n{COLOR_RED}[MCP ERROR: Missing server name. Usage: /mcp off <name> (e.g. /mcp off mock)]{COLOR_RESET}")
+                                    continue
                                 target_name = parts[2].lower()
                                 if target_name not in active_ext_servers:
                                     print(f"\n{COLOR_YELLOW}[MCP NOTICE: '{target_name}' is not currently active.]{COLOR_RESET}")
@@ -1174,6 +1180,9 @@ async def run_chat():
                                 messages.append({"role": "user", "content": inject_note})
                                 save_history(messages)
                                 log_event("INJECTED CONTEXT TO BRAIN", inject_note)
+                                continue
+                            else:
+                                print(f"\n{COLOR_RED}[MCP ERROR: Unknown command '{user_input}'. Usage: /mcp list | /mcp on <name> [<url>] | /mcp off <name>]{COLOR_RESET}")
                                 continue
 
                         # --- 5. EMPTY INPUT CHECK ---
@@ -1227,11 +1236,13 @@ async def run_chat():
                                         log_event("SYSTEM", warn_msg)
 
                                 # --- 4. TIME INJECTION (Appended at end to preserve prefix caching) ---
-                                live_time = datetime.now().strftime("%A, %B %d, %Y %H:%M:%S")
-                                messages.append({
-                                    "role": "user", 
-                                    "content": f"[SYSTEM CLOCK: It is currently {live_time}]"
-                                })
+                                # Only inject ambient system clock if at the start of a user turn (not immediately following a tool output)
+                                if not (messages and messages[-1].get("role") == "tool"):
+                                    live_time = datetime.now().strftime("%A, %B %d, %Y %H:%M:%S")
+                                    messages.append({
+                                        "role": "user", 
+                                        "content": f"[SYSTEM CLOCK: It is currently {live_time}. (Ambient system timestamp: do not acknowledge or comment on this clock notice unless the user's prompt explicitly asks for the time.)]"
+                                    })
 
                                 # --- 4. SAVE THE PURIST HISTORY BEFORE API CALL ---
                                 save_history(messages)
