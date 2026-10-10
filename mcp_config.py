@@ -100,6 +100,19 @@ EXTERNAL_MCP_SERVERS: Dict[str, Dict[str, Any]] = {
     #    (Listens on port 21050 and proxies commands to ChimeraX on Windows).
     # 3. In the chat overseer, connect via:
     #      /mcp on chimerax
+    #
+    # SECURITY & HARDENING ARCHITECTURE:
+    # - ChimeraX's native REST API accepts raw commands with full user privileges.
+    #   To protect the host, the included chimerax_mcp_server.py acts as a strict
+    #   firewall between the AI sandbox container and Windows 11:
+    #     * Raw Python execution ('run_python') is NEVER exposed to the AI.
+    #     * Strict verb whitelist: Only safe structural commands are permitted
+    #       (open, color, label, surface, hide, show, view, matchmaker, save, etc.).
+    #     * Command chaining (';', '&', '|', newlines) and scripts are BLOCKED.
+    # - When finished modeling, stop the REST listener in ChimeraX:
+    #     remotecontrol rest stop
+    # - For maximum zero-trust oversight, set 'require_confirmation: True' below
+    #   to prompt [y/N] before executing each ChimeraX action.
     # --------------------------------------------------------------------------
     "chimerax": {
         "name": "UCSF ChimeraX",
@@ -109,7 +122,7 @@ EXTERNAL_MCP_SERVERS: Dict[str, Dict[str, Any]] = {
         "enabled": False,              # Off by default - toggle with --mcp chimerax or /mcp on chimerax
         "optional": True,              # Never crashes if ChimeraX bridge isn't currently running
         "tool_prefix": "cx_",          # Namespaces tools: cx_run_command, cx_open_structure, cx_save_image
-        "require_confirmation": False, # Set True if you want a y/n confirmation before each command
+        "require_confirmation": False, # Set True for interactive [y/N] approval before each host command
     },
 
     # --------------------------------------------------------------------------
