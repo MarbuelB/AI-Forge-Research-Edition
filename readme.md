@@ -152,9 +152,28 @@ While untrusted code forging and execution remain strictly quarantined inside th
 * **Isolated Worker Concurrency Architecture:** External MCP connections run in dedicated, decoupled asyncio background tasks (`mcp_worker`). This isolates AnyIO cancel scopes, completely preventing concurrency conflicts or stream teardown issues with the main sandbox container's stdio stream.
 * **Included Test Server (`mock_mcp_server.py`):** A lightweight FastMCP SSE server included directly in the workspace for instant end-to-end testing. Run `pixi run python mock_mcp_server.py` in a separate terminal (listens on port 8888), then connect via `--mcp mock` or `/mcp on mock` to verify external tool routing (`mock_get_host_time`, `mock_multiply_numbers`) without requiring external software like ChimeraX.
 * **Included ChimeraX FastMCP Bridge (`chimerax_mcp_server.py`) & Security Firewall:** A lightweight FastMCP SSE server running directly in WSL2 that bridges the AI-Forge Brain to UCSF ChimeraX on the Windows 11 host (`remotecontrol rest start port 21049`).
-  * **Host Protection Firewall:** ChimeraX's raw REST API inherently permits arbitrary Python execution on the host. The included FastMCP bridge protects your Windows machine by acting as a strict security barrier: raw Python execution (`run_python`) is never exposed to the AI, command chaining (`;`, `&`, `|`, newlines) is strictly blocked, dangerous keywords/extensions are rejected, and all commands are validated against a structural biology whitelist (`open`, `color`, `label`, `surface`, `hide`, `show`, `view`, `matchmaker`, `save`, `close`, `set`, `style`, `coulombic`, `alphafold`, `size`, `transparency`, `lighting`, `camera`, `info`, `select`, `sym`).
-  * **Exposed Safe Tools:** `cx_run_command`, `cx_open_structure`, `cx_save_image` (renders snapshots directly into the shared host input directory `my_host_input`), `cx_close_models`, `cx_get_status`.
-  * **Usage:** Run `pixi run python chimerax_mcp_server.py` in a separate terminal (listens on port 21050), then connect in chat via `/mcp on chimerax`. When done, stop the ChimeraX REST server with `remotecontrol rest stop`.
+  * **Host Protection Firewall:** ChimeraX's raw REST API inherently permits arbitrary Python execution on the host (`runscript` / `open script.py`). The included FastMCP bridge protects your Windows machine by acting as a strict security barrier:
+    * Raw Python execution (`run_python`) is never exposed to the AI.
+    * Command chaining (`;`, `&`, `|`, `` ` ``, `$`, newlines) is strictly blocked.
+    * Dangerous keywords and execution terms (`python`, `runscript`, `system`, `powershell`, `cmd`, `bash`, `exec`, `eval`, `subprocess`, `os.`, `sys.`) are blocked via regex.
+    * Executable script extensions (`.py`, `.exe`, `.bat`, `.cmd`, `.ps1`, `.sh`) on file targets are rejected.
+    * All commands are strictly validated against a structural biology verb whitelist: `open`, `color`, `label`, `surface`, `hide`, `show`, `view`, `matchmaker`, `align`, `save`, `close`, `set`, `style`, `coulombic`, `alphafold`, `size`, `transparency`, `lighting`, `camera`, `info`, `select`, `sym`.
+  * **Exposed Safe Tools:** `cx_run_command`, `cx_open_structure`, `cx_save_image` (renders snapshots directly into the shared host input directory `my_host_input` with automated base64 network bridge fallback), `cx_close_models`, `cx_get_status`.
+  * **Security Boundary & Direct REST Bypass Mitigation:**
+    * *The Threat Model:* ChimeraX's native REST API has **zero authentication** (no tokens, passwords, or origin verification). If the containerized Brain or a compromised script can send HTTP requests directly to port 21049 on the host, it could theoretically bypass the MCP whitelist by instructing ChimeraX to execute a script written to the shared WSL2 directory (`\\wsl.localhost\Ubuntu-26.04\...`).
+    * *Defense-in-Depth Protections:*
+      1. **Keep ChimeraX on Localhost:** Always leave ChimeraX bound to `127.0.0.1`. Never bind it to `0.0.0.0` or create external `netsh portproxy` rules that expose port 21049 across external interfaces.
+      2. **Container Egress Filtering (Recommended):** To ensure the sandbox container can never bypass the FastMCP bridge, block container outbound access to port 21049 in WSL2:
+         ```bash
+         sudo iptables -I FORWARD -p tcp --dport 21049 -j DROP
+         ```
+         This ensures only host-level processes (like `chimerax_mcp_server.py`) can reach the ChimeraX REST server.
+      3. **Confirmation Gate:** You can set `"require_confirmation": True` in `mcp_config.py` to require interactive `[y/N]` human approval before any ChimeraX action is dispatched.
+      4. **Mandatory Procedural Stop:** Always stop the REST listener in ChimeraX as soon as your visualization tasks are done:
+         ```
+         remotecontrol rest stop
+         ```
+  * **Usage:** Run `pixi run python chimerax_mcp_server.py` in a separate terminal (listens on port 21050), then connect in chat via `/mcp on chimerax`. File exchanges use `my_host_input` (`\\wsl.localhost\Ubuntu-26.04\home\agent\ai_workspace\my_host_input`).
 * **Security Gate & Interactive Confirmation:** External servers configured with `require_confirmation: True` (and all universal custom MCP connections) pause execution and require explicit user confirmation (`[y/N]`) in the terminal before establishing connections or running tools. In unattended batch mode (`-x`), dangerous actions are automatically denied to protect unattended runs.
 * **Dynamic On-the-Fly Toggling:** In addition to startup CLI flags (`--mcp <name>`, `--all-mcp`), you can activate or deactivate external tool suites live during a chat using in-chat slash commands (`/mcp`, `/mcp on <name> [<url>]`, `/mcp off <name>`).
 * **Full Transparency & Context Injection Logging:** Every external tool suite connection or disconnection displays a clean, non-duplicated status update in the terminal. In standard and detailed verbosity modes, the exact registered tool schemas (function names, signatures, and descriptions) are formatted and rendered in the console. Whenever external MCP state alters the Brain's prompt history, the exact text is rendered under `=== INJECTED CONTEXT TO BRAIN ===` and permanently recorded in the session chat log (`chat_log_*.txt`) alongside full tool schemas in `=== MCP REGISTRY ===`.
