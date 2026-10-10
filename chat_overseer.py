@@ -440,6 +440,14 @@ def log_event(role, content, usage=None, thinking=None, text_color=None, hide_co
             console_header = f"\n{COLOR_BRIGHT_GREEN}[{time_str}] === {role.upper()} ==={COLOR_RESET}"
             actual_color = text_color if text_color else COLOR_DARK_GREEN
             console_content = f"{actual_color}{content}{COLOR_RESET}"
+        elif role.upper() in ["INJECTED CONTEXT TO BRAIN", "BRAIN CONTEXT INJECTION"]:
+            console_header = f"\n{COLOR_YELLOW}[{time_str}] === INJECTED CONTEXT TO BRAIN ==={COLOR_RESET}"
+            actual_color = text_color if text_color else COLOR_YELLOW
+            console_content = f"{actual_color}{content}{COLOR_RESET}"
+        elif role.upper() == "MCP REGISTRY":
+            console_header = f"\n{COLOR_CYAN}[{time_str}] === MCP REGISTRY ==={COLOR_RESET}"
+            actual_color = text_color if text_color else COLOR_CYAN
+            console_content = f"{actual_color}{content}{COLOR_RESET}"
         else:
             console_header = f"\n{COLOR_BLUE}[{time_str}] === {role.upper()} ==={COLOR_RESET}"
             console_content = f"{COLOR_RED}{content}{COLOR_RESET}" if role.upper() in ["USER", "YOU"] else content
@@ -448,6 +456,21 @@ def log_event(role, content, usage=None, thinking=None, text_color=None, hide_co
         if usage and usage.prompt_tokens is not None:
             print(f"{COLOR_YELLOW}[Tokens: {usage.prompt_tokens} in | {usage.completion_tokens} out]{COLOR_RESET}")
             
+
+def format_tool_signature(tool_def):
+    fn = tool_def.get("function", {})
+    name = fn.get("name", "unknown")
+    desc = fn.get("description", "")
+    params = fn.get("parameters", {}) or {}
+    props = params.get("properties", {}) or {}
+    req = set(params.get("required", []) or [])
+    param_strs = []
+    for p_name, p_info in props.items():
+        p_type = p_info.get("type", "any") if isinstance(p_info, dict) else "any"
+        opt = "" if p_name in req else " = None"
+        param_strs.append(f"{p_name}: {p_type}{opt}")
+    sig = f"{name}({', '.join(param_strs)})"
+    return sig, desc
 
 active_container_name = None
 
@@ -717,7 +740,7 @@ async def run_chat():
                             if cfg.get("optional", True):
                                 if verbose and config.VERBOSITY_MODE != "silent":
                                     print(f"\n{COLOR_YELLOW}[MCP NOTICE: External server '{server_id}' ({cfg.get('url', cfg.get('command', ''))}) is offline/unreachable: {ready_res['error']}. Skipping.]{COLOR_RESET}")
-                                    log_event("SYSTEM", f"External MCP '{server_id}' unavailable (skipped): {ready_res['error']}")
+                                log_event("MCP REGISTRY", f"External MCP '{server_id}' unavailable (skipped): {ready_res['error']}", hide_console=True)
                                 return None
                             else:
                                 raise RuntimeError(ready_res["error"])
@@ -746,26 +769,48 @@ async def run_chat():
                             "cfg": cfg,
                             "tools": registered,
                         }
+
+                        # Format registered tool schemas for transparency in log and console
+                        schema_lines = []
+                        for t in registered:
+                            sig, desc = format_tool_signature(t)
+                            schema_lines.append(f"  • {sig}" + (f"\n    {desc}" if desc else ""))
+                        schema_text = "\n".join(schema_lines)
+
+                        srv_display_name = cfg.get('name', server_id)
+                        tool_names = ", ".join(t["function"]["name"] for t in registered)
+                        log_msg = (
+                            f"Connected external MCP '{server_id}' ({srv_display_name})\n"
+                            f"Transport: {cfg.get('transport', 'sse')} | Target: {cfg.get('url', cfg.get('command', ''))}\n"
+                            f"Registered Tools ({len(registered)}):\n{schema_text}"
+                        )
+                        log_event("MCP REGISTRY", log_msg, hide_console=True)
+
                         if verbose and config.VERBOSITY_MODE != "silent":
-                            tool_names = ", ".join(t["function"]["name"] for t in registered)
-                            print(f"\n{COLOR_BRIGHT_GREEN}[MCP SYSTEM: Connected to '{cfg.get('name', server_id)}' ({len(registered)} tools: {tool_names})]{COLOR_RESET}")
-                            log_event("SYSTEM", f"Connected external MCP '{server_id}' with tools: {tool_names}")
+                            print(f"\n{COLOR_BRIGHT_GREEN}[MCP SYSTEM: Connected to '{srv_display_name}' ({len(registered)} tools: {tool_names})]{COLOR_RESET}")
+                            if config.VERBOSITY_MODE in ["standard", "detailed"]:
+                                print(f"{COLOR_CYAN}[Registered External Tool Schemas]:\n{schema_text}{COLOR_RESET}")
                         return registered
 
                     async def disconnect_external_mcp(server_id, verbose=True):
                         if server_id in active_ext_servers:
                             entry = active_ext_servers.pop(server_id)
+                            removed_tools = []
                             for q_name in list(ext_tool_router.keys()):
                                 if ext_tool_router[q_name]["server_id"] == server_id:
+                                    removed_tools.append(q_name)
                                     del ext_tool_router[q_name]
                             try:
                                 await entry["cmd_queue"].put({"action": "close"})
                                 await asyncio.wait_for(entry["task"], timeout=3.0)
                             except Exception:
                                 pass
+                            srv_name = entry["cfg"].get("name", server_id)
+                            tool_list_str = ", ".join(removed_tools) if removed_tools else "none"
+                            log_msg = f"Disconnected external MCP '{server_id}' ({srv_name}). Removed {len(removed_tools)} tools: {tool_list_str}"
+                            log_event("MCP REGISTRY", log_msg, hide_console=True)
                             if verbose and config.VERBOSITY_MODE != "silent":
-                                print(f"\n{COLOR_YELLOW}[MCP SYSTEM: Disconnected external server '{server_id}']{COLOR_RESET}")
-                                log_event("SYSTEM", f"Disconnected external MCP '{server_id}'")
+                                print(f"\n{COLOR_YELLOW}[MCP SYSTEM: Disconnected external server '{srv_name}' ({server_id}). Removed tools: {tool_list_str}]{COLOR_RESET}")
 
                     MANAGE_EXTERNAL_MCP_TOOL = {
                         "type": "function",
@@ -1068,6 +1113,11 @@ async def run_chat():
                                     confirm_tag = " (requires confirmation)" if s_cfg.get("require_confirmation") else ""
                                     tools_cnt = f" ({len(active_ext_servers[s_id]['tools'])} tools)" if is_active else ""
                                     print(f"  {status_tag} {s_id} - {s_cfg.get('name', s_id)} ({s_cfg.get('url', s_cfg.get('command', ''))}){tools_cnt}{confirm_tag}")
+                                for s_id, s_data in active_ext_servers.items():
+                                    if s_id not in mcp_config.EXTERNAL_MCP_SERVERS:
+                                        tools_cnt = f" ({len(s_data['tools'])} tools)"
+                                        url_or_cmd = s_data['cfg'].get('url', s_data['cfg'].get('command', ''))
+                                        print(f"  {COLOR_BRIGHT_GREEN}[ACTIVE]{COLOR_RESET} {s_id} - {s_data['cfg'].get('name', s_id)} ({url_or_cmd}){tools_cnt} (dynamic)")
                                 print(f"{COLOR_DIM}Commands: /mcp on <name> | /mcp off <name>{COLOR_RESET}\n")
                                 continue
                             elif parts[1].lower() in ['on', 'enable'] and len(parts) > 2:
@@ -1107,9 +1157,7 @@ async def run_chat():
                                     messages = load_history()
                                     messages.append({"role": "user", "content": inject_note})
                                     save_history(messages)
-                                    if config.VERBOSITY_MODE != "silent":
-                                        print(f"{COLOR_YELLOW}{inject_note}{COLOR_RESET}")
-                                    log_event("SYSTEM", inject_note)
+                                    log_event("INJECTED CONTEXT TO BRAIN", inject_note)
                                 continue
                             elif parts[1].lower() in ['off', 'disable'] and len(parts) > 2:
                                 target_name = parts[2].lower()
@@ -1125,9 +1173,7 @@ async def run_chat():
                                 messages = load_history()
                                 messages.append({"role": "user", "content": inject_note})
                                 save_history(messages)
-                                if config.VERBOSITY_MODE != "silent":
-                                    print(f"{COLOR_YELLOW}{inject_note}{COLOR_RESET}")
-                                log_event("SYSTEM", inject_note)
+                                log_event("INJECTED CONTEXT TO BRAIN", inject_note)
                                 continue
 
                         # --- 5. EMPTY INPUT CHECK ---
@@ -1204,6 +1250,9 @@ async def run_chat():
                                 if config.VERBOSITY_MODE != "silent":
                                     calib_note = f" (calibrated x{token_calibration_ratio:.2f})" if abs(token_calibration_ratio - 1.0) > 0.04 else ""
                                     print(f"\n{COLOR_YELLOW}[System: Brain payload is ~{payload_tokens} estimated tokens{calib_note} (Estimated total context window: ~{current_token_estimate})]{COLOR_RESET}", flush=True)
+                                    if config.VERBOSITY_MODE in ["standard", "detailed"] and active_ext_servers:
+                                        ext_tool_names = list(ext_tool_router.keys())
+                                        print(f"{COLOR_CYAN}[Active External MCP Tools in Brain Context: {', '.join(ext_tool_names)}]{COLOR_RESET}", flush=True)
 
                                 response_stream = await brain_client.chat.completions.create(**api_args)
                                 
