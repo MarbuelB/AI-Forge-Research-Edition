@@ -265,14 +265,15 @@ def compact_historical_tool_outputs(messages, protect_recent: int = None, min_ch
     tool_indices = [idx for idx, msg in enumerate(messages) if msg.get("role") == "tool"]
     
     if len(tool_indices) <= protect_recent:
-        return messages
+        return messages, 0
     
     # 2. Protect the most recent N tool calls; all older tool calls are pruning candidates
-    protected_tool_indices = set(tool_indices[-protect_recent:])
+    protected_tool_indices = set(tool_indices[-protect_recent:]) if protect_recent > 0 else set()
     
     manifest_path = os.path.join(SESSION_DIR, "sandbox/history_tool_outputs/manifest.json")
     manifest = {}
     manifest_updated = False
+    pruned_count = 0
     
     new_messages = []
     for idx, msg in enumerate(messages):
@@ -342,18 +343,21 @@ def compact_historical_tool_outputs(messages, protect_recent: int = None, min_ch
             msg_copy = copy.copy(msg)
             msg_copy["content"] = compacted_body
             new_messages.append(msg_copy)
+            pruned_count += 1
             continue
             
         new_messages.append(msg)
         
     if manifest_updated:
         try:
-            with open(manifest_path, "w", encoding="utf-8") as mf:
+            tmp_manifest = manifest_path + ".tmp"
+            with open(tmp_manifest, "w", encoding="utf-8") as mf:
                 json.dump(manifest, mf, indent=2)
+            os.replace(tmp_manifest, manifest_path)
         except Exception:
             pass
             
-    return new_messages
+    return new_messages, pruned_count
 
     
 def estimate_tokens(messages):
@@ -1256,7 +1260,9 @@ async def run_chat():
                                 messages = [msg for msg in messages if not (msg.get("role") == "user" and ("[SYSTEM CLOCK:" in str(msg.get("content")) or "[SYSTEM WARNING: Your context window is at" in str(msg.get("content"))))]
 
                                 # --- 2. HISTORICAL TOOL OUTPUT AGING (H3) ---
-                                messages = compact_historical_tool_outputs(messages)
+                                messages, pruned_count = compact_historical_tool_outputs(messages)
+                                if pruned_count > 0:
+                                    last_actual_prompt_tokens = 0
 
                                 # --- 3. TOKEN WARNING INJECTION (H1 Calibrated) ---
                                 payload_tokens = estimate_tokens(messages)
@@ -1264,7 +1270,7 @@ async def run_chat():
                                 # Calibrated estimate accounts for real serving tokenizer overhead
                                 calibrated_payload = int(payload_tokens * token_calibration_ratio)
                                 current_token_estimate = calibrated_payload + tool_schemas_overhead + (len(messages) * 4)
-                                if last_actual_prompt_tokens > 0 and len(messages) >= last_history_len:
+                                if last_actual_prompt_tokens > 0 and len(messages) >= last_history_len and (calibrated_payload + tool_schemas_overhead) >= (last_actual_prompt_tokens - 1000):
                                     current_token_estimate = max(current_token_estimate, last_actual_prompt_tokens)
                                 last_history_len = len(messages)
                                 pct = current_token_estimate / config.MAX_CONTEXT_TOKENS

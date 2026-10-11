@@ -575,17 +575,33 @@ def gather_agent_context(filepaths: list[str] = None, max_chars_per_file: int = 
 
 # --- MCP TOOLS ---
 @mcp.tool()
-def view_tool_registry(category: str = None) -> str:
-    """Views the custom forged tools registry. Pass NO arguments to see top-level categories. Pass a category string to see detailed tools inside it."""
+def view_tool_registry(category: str = None, detailed: bool = False) -> str:
+    """Views the custom forged tools registry. 
+    - Pass NO arguments to see top-level categories. 
+    - Pass a category string to see tools in that category (returns path, language, description, and exists status).
+    - Set detailed=True to include the full original authoring objective.
+    """
     registry = load_json(TOOL_REGISTRY_FILE)
     if not registry: return "Tool Registry is empty."
     
     if not category:
         summary = {cat: data.get("category_description", "") for cat, data in registry.items()}
-        return json.dumps({"categories": summary}, indent=2) + "\n\nCall this tool again with a specific category name to see its tools."
+        return json.dumps({"categories": summary}, indent=2) + "\n\nCall this tool again with category='<name>' to view tools inside a category."
     else:
         if category in registry:
-            return json.dumps({category: registry[category]["tools"]}, indent=2)
+            tools_data = registry[category].get("tools", {})
+            if not detailed:
+                compact_tools = {}
+                for t_name, t_info in tools_data.items():
+                    compact_tools[t_name] = {
+                        "path": t_info.get("path"),
+                        "description": t_info.get("description"),
+                        "language": t_info.get("language"),
+                        "exists": os.path.exists(t_info.get("path", "")) if t_info.get("path") else False
+                    }
+                return json.dumps({category: compact_tools}, indent=2)
+            else:
+                return json.dumps({category: tools_data}, indent=2)
         else:
             return f"Category '{category}' not found. Available categories are: {list(registry.keys())}"
 
@@ -1514,6 +1530,8 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
                 f.write(output)
                 
             total_lines = output.count('\n') + 1
+            logger.info(f"[execute_bash] Truncated output ({len(output):,} chars, {total_lines:,} lines) -> saved to '/app/workspace/sandbox/{temp_file_name}'")
+
             head_preview = output[:1500]
             tail_preview = output[-1500:]
             omitted_chars = len(output) - len(head_preview) - len(tail_preview)
@@ -1521,6 +1539,7 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
             tail_lines = tail_preview.count('\n') + 1
             
             return (f"Exit Code: {process.returncode}\n"
+                    f"full_output_filepath: /app/workspace/sandbox/{temp_file_name}\n"
                     f"Output Preview (Head: first 1,500 chars / {head_lines} lines | Tail: last 1,500 chars / {tail_lines} lines of {len(output):,} chars total):\n"
                     f"--- [HEAD PREVIEW (First 1,500 chars)] ---\n{head_preview}\n\n"
                     f"... [SNIP: {omitted_chars:,} characters omitted — complete {len(output):,} chars ({total_lines:,} lines) saved to '/app/workspace/sandbox/{temp_file_name}'] ...\n\n"
@@ -2078,9 +2097,44 @@ async def forge_and_register_plugin(
                 check = await asyncio.to_thread(subprocess.run, ["node", "--check", filename], cwd=PLUGINS_DIR, capture_output=True, text=True)
                 if check.returncode != 0: is_valid = False; err_msg = check.stderr
             elif target_lang == "typescript":
-                # Leverages Node's native type stripping to safely perform syntax parsing on TypeScript files
-                check = await asyncio.to_thread(subprocess.run, ["node", "--experimental-strip-types", "--check", filename], cwd=PLUGINS_DIR, capture_output=True, text=True)
-                if check.returncode != 0: is_valid = False; err_msg = check.stderr
+                # Validates TypeScript syntax via esbuild transpilation over stdin + node --check
+                # This guarantees syntax verification WITHOUT executing top-level code.
+                esbuild_bin = shutil.which("esbuild")
+                if not esbuild_bin:
+                    candidate = "/app/.pixi/envs/default/lib/node_modules/tsx/node_modules/esbuild/bin/esbuild"
+                    if os.path.exists(candidate):
+                        esbuild_bin = candidate
+                if esbuild_bin:
+                    try:
+                        with open(os.path.join(PLUGINS_DIR, filename), "rb") as ts_file:
+                            ts_bytes = ts_file.read()
+                        eb_check = await asyncio.to_thread(
+                            subprocess.run,
+                            [esbuild_bin, "--loader=ts", "--format=esm"],
+                            input=ts_bytes,
+                            capture_output=True,
+                            timeout=10
+                        )
+                        if eb_check.returncode != 0:
+                            is_valid = False
+                            err_msg = eb_check.stderr.decode("utf-8", errors="replace")
+                        else:
+                            node_check = await asyncio.to_thread(
+                                subprocess.run,
+                                ["node", "--check", "--input-type=module"],
+                                input=eb_check.stdout,
+                                capture_output=True,
+                                timeout=10
+                            )
+                            if node_check.returncode != 0:
+                                is_valid = False
+                                err_msg = node_check.stderr.decode("utf-8", errors="replace")
+                    except Exception as ts_err:
+                        is_valid = False
+                        err_msg = f"TypeScript syntax validation exception: {str(ts_err)}"
+                else:
+                    check = await asyncio.to_thread(subprocess.run, ["node", "--check", filename], cwd=PLUGINS_DIR, capture_output=True, text=True)
+                    if check.returncode != 0: is_valid = False; err_msg = check.stderr
             elif target_lang == "rust":
                 # Flawless validation: Provisions an isolated cargo scratchpad project to resolve external crates automatically
                 scratch_dir = "/app/workspace/sandbox/.check_rust"
@@ -2580,7 +2634,13 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, sea
                 parameters = []
             if len(parameters) > 0 and isinstance(parameters[0], list):
                 return "SYSTEM ERROR: You cannot use 'search_text_to_embed' simultaneously with bulk (list of lists) parameters."
-            parameters.append(vector_blob)
+            
+            placeholder_count = query.count('?')
+            if placeholder_count > 0 and len(parameters) == placeholder_count:
+                # The caller provided an explicit binding slot for the embedding; replace the final placeholder
+                parameters[-1] = vector_blob
+            else:
+                parameters.append(vector_blob)
         
         # --- Database Execution ---
         db_dir = os.path.dirname(db_path)
@@ -2669,8 +2729,9 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, sea
         return result_str
 
     except Exception as e:
-        logger.error(f"[query_sqlite_db] Error on '{os.path.basename(db_path)}': {str(e)}")
-        return f"SYSTEM ERROR: Database Exception: {str(e)}"
+        clean_q = query[:120].replace('\n', ' ').strip()
+        logger.error(f"[query_sqlite_db] Error on '{os.path.basename(db_path)}' query [{clean_q}]: {str(e)}")
+        return f"SYSTEM ERROR: Database Exception on query [{clean_q}]: {str(e)}"
     finally:
         if conn:
             conn.close() # GUARANTEES the lock is released!
@@ -3214,12 +3275,13 @@ async def analyze_files(
                             f"INCLUDED IN THIS WINDOW: First {included_matches} matches ({len(content):,} chars, {pct}% coverage). Remaining {total_matches - included_matches} matches were omitted to protect context window limits.\n"
                             f"MANDATORY INSTRUCTION FOR ANALYST:\n"
                             f"- State this filtered coverage explicitly in your executive summary.\n"
+                            f"- CRITICAL EPISTEMIC GUARD: This is a FILTERED SUBSET for '{filter_pattern}'. Unmatched lines are omitted. Do NOT assume that functions, variables, or content absent here do not exist in the full document. State: 'Not found within filtered matches; verify without filters.'\n"
                             f"- Do NOT assume what occurred in the omitted matches.]\n"
                         )
                     else:
                         coverage_header = (
                             f"[FILTERED EXTRACTION FROM PDF: Pattern '{filter_pattern}' matched {total_matches} occurrences across {total_lines:,} total lines (100% of matches included, {len(content):,} chars).\n"
-                            f"Note: Only lines matching the filter and their context (±{context_lines} lines) are displayed. Matching lines are prefixed with '>>>'.]\n"
+                            f"CRITICAL EPISTEMIC GUARD: Only lines matching '{filter_pattern}' and context (±{context_lines} lines) are displayed. Do NOT conclude that symbols absent from this subset do not exist in the full document. Matching lines are prefixed with '>>>'.]\n"
                         )
                     content = coverage_header + content
                     user_content.append({"type": "text", "text": f"\n--- PDF DOCUMENT (FILTERED TEXT): {filename} ---\n{content}\n"})
@@ -3263,13 +3325,15 @@ async def analyze_files(
                             f"INCLUDED IN THIS WINDOW: First {included_matches} matches ({len(content):,} chars, {pct}% coverage). Remaining {total_matches - included_matches} matches were omitted to protect context window limits.\n"
                             f"MANDATORY INSTRUCTION FOR ANALYST:\n"
                             f"- State this filtered coverage explicitly in your executive summary.\n"
+                            f"- CRITICAL EPISTEMIC GUARD: This is a FILTERED WINDOW showing ONLY matches for '{filter_pattern}'. Do NOT assume or report that functions, variables, or errors absent from these matches do not exist in the full file! State: 'Not found within filtered matches; verify by inspecting without filters.'\n"
                             f"- Do NOT assume what occurred in the omitted {total_matches - included_matches} matches.\n"
                             f"- If your analysis requires inspecting the remaining matches or other sections, explicitly advise the Brain in your next steps to narrow the filter pattern or inspect specific line ranges with `start_line`.]\n"
                         )
                     else:
                         coverage_header = (
                             f"[FILTERED EXTRACTION: Pattern '{filter_pattern}' matched {total_matches} occurrences across {total_lines:,} total lines (100% of matches included, {len(content):,} chars).\n"
-                            f"Note: Only lines matching the filter and their context (±{context_lines} lines) are displayed. Matching lines are prefixed with '>>>'.]\n"
+                            f"CRITICAL EPISTEMIC GUARD: Only lines matching '{filter_pattern}' and context (±{context_lines} lines) are displayed. Do NOT conclude that symbols absent from this subset do not exist in the file. Non-matching sections were omitted.\n"
+                            f"Matching lines are prefixed with '>>>'.]\n"
                         )
                     content = coverage_header + content
                     user_content.append({"type": "text", "text": f"\n--- TEXT FILE (FILTERED): {filename} ---\n{content}\n"})
