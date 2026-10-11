@@ -227,8 +227,8 @@ Beyond native sub-agent delegation (`query_universal_llm`), the framework featur
 
 To avoid manually running dozens of terminal commands and editing system files, use the included automated setup script [`setup_wsl2.sh`](file:///home/agent/ai_workspace/setup_wsl2.sh). It provisions any Debian/Ubuntu-based WSL2 environment from start to finish:
 
-1. **System Provisioning (Phase 1 / Root):** Installs system dependencies (`podman`, `catatonit`, `passt`, `slirp4netns`, `uidmap`, `git`, `jq`, `build-essential`), probes for NVIDIA GPU and configures CDI device passthrough, automates rootless `/etc/subuid` and `/etc/subgid` allocations for the execution user (creating dedicated `agent` user only if Option A is selected), enables `loginctl` user lingering, and configures user isolation.
-2. **User-Space Provisioning (Phase 2):** Installs Pixi (`~/.pixi/bin`), installs workspace dependencies via `pixi install`, interactively prompts for your primary LLM endpoint (Name/Alias, Base URL, API Key, Model Name), generates LiteLLM proxy configuration (`~/litellm_proxy/config.yaml`), exports environment variables to `~/.bashrc`, updates [`llm_config.py`](file:///home/agent/ai_workspace/llm_config.py), auto-starts the LiteLLM proxy on port 4000, builds the rootless `ai-forge` Podman container, and runs an automated sandbox verification self-test.
+1. **System Provisioning (Phase 1 / Root):** Installs system dependencies (`podman`, `catatonit`, `passt`, `slirp4netns`, `uidmap`, `git`, `jq`, `build-essential`), probes for NVIDIA GPU and configures CDI device passthrough (gracefully falls back to pure CPU mode on machines without a GPU), automates rootless `/etc/subuid` and `/etc/subgid` allocations for the execution user (defaulting to the dedicated isolated `agent` user), enables `loginctl` user lingering, and configures user isolation.
+2. **User-Space Provisioning (Phase 2):** Installs Pixi (`~/.pixi/bin`), installs workspace dependencies via `pixi install`, interactively prompts for your primary LLM endpoint with provider presets (OpenRouter recommended for CPU machines, OpenAI, Google Gemini, local Ollama, or custom), generates LiteLLM proxy configuration (`~/litellm_proxy/config.yaml`), exports environment variables to `~/.bashrc`, updates [`llm_config.py`](file:///home/agent/ai_workspace/llm_config.py), auto-starts the LiteLLM proxy on port 4000, builds the rootless `ai-forge` Podman container, and runs an automated sandbox verification self-test.
 
 ### WSL2 Prerequisites
 * **WSL2 with systemd enabled (Required):** Rootless Podman, D-Bus session bus, and user cgroups require systemd. Verify or add to `/etc/wsl.conf`:
@@ -241,11 +241,12 @@ To avoid manually running dozens of terminal commands and editing system files, 
   ```bash
   chmod +x setup_wsl2.sh
   ```
+* **Hardware Requirements:** Works on systems **with or without a GPU**. If an NVIDIA GPU is present, GPU passthrough is automatically configured; on systems without a GPU, the framework smoothly operates in CPU mode (ideal when pairing with OpenRouter or cloud LLM providers).
 
 ### Supported Setup Modes
 
-The installer automatically detects your environment and offers two installation paths:
-* **Option A: Dedicated Hardened Environment (Recommended):** Creates an isolated non-sudo `agent` user and hardens `/etc/wsl.conf` (disables Windows interop and automount) for maximum air-gapped sandboxing.
+The installer defaults to the isolated `agent` user and offers two installation paths:
+* **Option A: Dedicated Hardened Environment (Default & Recommended):** Creates an isolated non-sudo `agent` user and hardens `/etc/wsl.conf` (disables Windows interop and automount) for maximum air-gapped sandboxing.
 * **Option B: Existing User Account (Daily Driver):** Installs for your current user account (`ubuntu`, your custom username, etc.), configuring rootless Podman for your account while **preserving your existing `/etc/wsl.conf`, user login, and Windows `/mnt/c/` drives intact**.
 
 ### Running the Automated Setup:

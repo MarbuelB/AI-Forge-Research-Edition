@@ -275,7 +275,7 @@ run_phase1_system() {
         log_info "Detected calling user: '${CALLING_USER}'."
         if [ "$AUTO_CONFIRM" != true ]; then
             echo -e "You can choose your setup mode:"
-            echo -e "  [1] Create a dedicated restricted '${GREEN}agent${RESET}' user (Recommended for maximum sandbox security)"
+            echo -e "  [1] Dedicated '${GREEN}agent${RESET}' user (Default & Recommended for maximum sandbox isolation)"
             echo -e "  [2] Install AI-Forge for your existing account ('${CYAN}${CALLING_USER}${RESET}')"
             local setup_mode="1"
             prompt_input "Select setup mode [1 or 2]" "1" setup_mode
@@ -447,9 +447,26 @@ EOF
         fi
     fi
 
-    # 6. Ensure proper workspace ownership
+    # 6. Ensure proper workspace ownership & traversal permissions
     log_info "Ensuring workspace permissions for ${TARGET_USER}..."
     chown -R "${TARGET_USER}:${TARGET_USER}" "$SCRIPT_DIR" 2>/dev/null || true
+
+    # Ensure parent directories allow traversal (+x) so TARGET_USER can reach SCRIPT_DIR
+    local parent_dir="$(dirname "$SCRIPT_DIR")"
+    while [ -n "$parent_dir" ] && [ "$parent_dir" != "/" ] && [ "$parent_dir" != "." ]; do
+        chmod a+x "$parent_dir" 2>/dev/null || true
+        parent_dir="$(dirname "$parent_dir")"
+    done
+
+    # If TARGET_USER is 'agent' and workspace is outside /home/agent, create a helpful symlink
+    local target_home="$(get_user_home "$TARGET_USER")"
+    if [ "$TARGET_USER" = "agent" ] && [ "$SCRIPT_DIR" != "$target_home"/* ] && [ "$SCRIPT_DIR" != "$target_home" ]; then
+        if [ ! -e "$target_home/ai_workspace" ]; then
+            ln -s "$SCRIPT_DIR" "$target_home/ai_workspace" 2>/dev/null || true
+            chown -h "${TARGET_USER}:${TARGET_USER}" "$target_home/ai_workspace" 2>/dev/null || true
+            log_done "Created convenient symlink $target_home/ai_workspace -> $SCRIPT_DIR"
+        fi
+    fi
 
     log_done "Phase 1 (System Configuration) completed successfully!"
 }
@@ -464,13 +481,19 @@ run_phase2_user() {
         log_warn "Phase 2 is running as root. It is recommended to run user setup as '${TARGET_USER}'."
         if [ "$AUTO_CONFIRM" != true ]; then
             if prompt_yn "Switch to user '${TARGET_USER}' to complete setup?" "Y"; then
-                su - "${TARGET_USER}" -c "bash '$SCRIPT_DIR/setup_wsl2.sh' --user-only"
+                su - "${TARGET_USER}" -c "bash '$SCRIPT_DIR/setup_wsl2.sh' --user-only --user '${TARGET_USER}'"
                 return
             fi
         fi
     fi
 
-    local USER_HOME="$HOME"
+    # When running as a standard non-root user, synchronize target user with current execution user unless overridden
+    if [ "$EUID" -ne 0 ] && [ -z "$CUSTOM_USER" ]; then
+        TARGET_USER="$(whoami)"
+    fi
+
+    local USER_HOME="$(get_user_home "$TARGET_USER")"
+    PROXY_DIR="${USER_HOME}/litellm_proxy"
 
     # 1. Install Pixi package manager
     log_step "Checking Pixi package manager installation..."
@@ -531,10 +554,11 @@ EOF
     log_step "Configuring Default LLM Endpoint (Out-of-the-Box Setup)..."
     echo -e "Configure your primary LLM endpoint so the framework is fully functional out of the box."
 
-    local llm_name="default-llm"
-    local llm_base_url="http://localhost:11434/v1"
-    local llm_api_key="local-key"
-    local llm_model="ollama/qwen2.5:latest"
+    local llm_name="claude-3.5-haiku"
+    local llm_base_url="https://openrouter.ai/api/v1"
+    local llm_api_key=""
+    local llm_model="openrouter/anthropic/claude-3.5-haiku"
+    local provider_choice="1"
     local prompt_user_for_llm=true
 
     if [ "$AUTO_CONFIRM" = true ]; then
@@ -545,12 +569,99 @@ EOF
 
     if [ "$prompt_user_for_llm" = true ]; then
         echo ""
-        echo -e "${BOLD}Please enter your default LLM details:${RESET}"
-        prompt_input "  [1/4] Model Name (for Overseer / config, e.g. qwen3.8, default-llm)" "default-llm" llm_name
-        prompt_input "  [2/4] Base URL (e.g. http://localhost:11434/v1, https://your-platform/v1, https://api.openai.com/v1)" "http://localhost:11434/v1" llm_base_url
-        prompt_input "  [3/4] API Key (enter dummy value like 'local-key' for local Ollama/vLLM)" "local-key" llm_api_key
-        prompt_input "  [4/4] Upstream Model for LiteLLM (with provider prefix, e.g. openai/qwen3.8, ollama/qwen2.5:latest)" "openai/qwen3.8" llm_model
+        echo -e "${BOLD}Select your primary default LLM provider:${RESET}"
+        echo -e "  [1] ${CYAN}OpenRouter${RESET} (Recommended for CPU & multi-model routing: Claude, Llama 3, DeepSeek, etc.)"
+        echo -e "      Default: Anthropic Claude 3.5 Haiku ('openrouter/anthropic/claude-3.5-haiku')"
+        echo -e "  [2] ${CYAN}Direct OpenAI${RESET} (api.openai.com)"
+        echo -e "      Default: GPT-4o Mini ('openai/gpt-4o-mini')"
+        echo -e "  [3] ${CYAN}Direct Google Gemini${RESET} (generativelanguage.googleapis.com)"
+        echo -e "      Default: Gemini 2.5 Flash ('gemini/gemini-2.5-flash')"
+        echo -e "  [4] ${CYAN}Local Ollama / vLLM${RESET} (Self-hosted on localhost)"
+        echo -e "      Default: Qwen 2.5 ('ollama/qwen2.5:latest' on http://localhost:11434/v1)"
+        echo -e "  [5] ${CYAN}Custom Endpoint${RESET} (Custom OpenAI-compatible base URL / model)"
         echo ""
+        prompt_input "Select provider [1-5]" "1" provider_choice
+
+        case "$provider_choice" in
+            1)
+                llm_name="claude-3.5-haiku"
+                llm_base_url="https://openrouter.ai/api/v1"
+                llm_model="openrouter/anthropic/claude-3.5-haiku"
+                echo ""
+                echo -e "${BOLD}Configuring OpenRouter:${RESET}"
+                prompt_input "  [1/3] Overseer Model Alias" "claude-3.5-haiku" llm_name
+                prompt_input "  [2/3] OpenRouter Upstream Model" "openrouter/anthropic/claude-3.5-haiku" llm_model
+                prompt_input "  [3/3] OpenRouter API Key (sk-or-v1-...)" "${OPENROUTER_API_KEY:-sk-or-v1-placeholder}" llm_api_key
+                ;;
+            2)
+                llm_name="gpt-4o-mini"
+                llm_base_url="https://api.openai.com/v1"
+                llm_model="openai/gpt-4o-mini"
+                echo ""
+                echo -e "${BOLD}Configuring Direct OpenAI:${RESET}"
+                prompt_input "  [1/3] Overseer Model Alias" "gpt-4o-mini" llm_name
+                prompt_input "  [2/3] Upstream Model" "openai/gpt-4o-mini" llm_model
+                prompt_input "  [3/3] OpenAI API Key (sk-...)" "${OPENAI_API_KEY:-sk-placeholder}" llm_api_key
+                ;;
+            3)
+                llm_name="gemini-2.5-flash"
+                llm_base_url="https://generativelanguage.googleapis.com/v1beta"
+                llm_model="gemini/gemini-2.5-flash"
+                echo ""
+                echo -e "${BOLD}Configuring Direct Google Gemini:${RESET}"
+                prompt_input "  [1/3] Overseer Model Alias" "gemini-2.5-flash" llm_name
+                prompt_input "  [2/3] Upstream Model" "gemini/gemini-2.5-flash" llm_model
+                prompt_input "  [3/3] Gemini API Key" "${GEMINI_API_KEY:-AIzaSy-placeholder}" llm_api_key
+                ;;
+            4)
+                llm_name="qwen2.5"
+                llm_base_url="http://localhost:11434/v1"
+                llm_api_key="local-key"
+                llm_model="ollama/qwen2.5:latest"
+                echo ""
+                echo -e "${BOLD}Configuring Local Ollama / vLLM:${RESET}"
+                prompt_input "  [1/4] Overseer Model Alias" "qwen2.5" llm_name
+                prompt_input "  [2/4] Base URL" "http://localhost:11434/v1" llm_base_url
+                prompt_input "  [3/4] API Key (dummy value for local)" "local-key" llm_api_key
+                prompt_input "  [4/4] Upstream Model" "ollama/qwen2.5:latest" llm_model
+                ;;
+            *)
+                llm_name="default-llm"
+                llm_base_url="http://localhost:11434/v1"
+                llm_api_key="local-key"
+                llm_model="openai/qwen3.8"
+                echo ""
+                echo -e "${BOLD}Configuring Custom LLM Endpoint:${RESET}"
+                prompt_input "  [1/4] Overseer Model Alias" "default-llm" llm_name
+                prompt_input "  [2/4] Base URL" "http://localhost:11434/v1" llm_base_url
+                prompt_input "  [3/4] API Key" "local-key" llm_api_key
+                prompt_input "  [4/4] Upstream Model (with provider prefix)" "openai/qwen3.8" llm_model
+                ;;
+        esac
+        echo ""
+    else
+        # Unattended / non-interactive defaults: check environment variables
+        if [ -n "$OPENROUTER_API_KEY" ]; then
+            llm_name="claude-3.5-haiku"
+            llm_base_url="https://openrouter.ai/api/v1"
+            llm_api_key="$OPENROUTER_API_KEY"
+            llm_model="openrouter/anthropic/claude-3.5-haiku"
+        elif [ -n "$OPENAI_API_KEY" ]; then
+            llm_name="gpt-4o-mini"
+            llm_base_url="https://api.openai.com/v1"
+            llm_api_key="$OPENAI_API_KEY"
+            llm_model="openai/gpt-4o-mini"
+        elif [ -n "$GEMINI_API_KEY" ]; then
+            llm_name="gemini-2.5-flash"
+            llm_base_url="https://generativelanguage.googleapis.com/v1beta"
+            llm_api_key="$GEMINI_API_KEY"
+            llm_model="gemini/gemini-2.5-flash"
+        else
+            llm_name="claude-3.5-haiku"
+            llm_base_url="https://openrouter.ai/api/v1"
+            llm_api_key="sk-or-v1-placeholder"
+            llm_model="openrouter/anthropic/claude-3.5-haiku"
+        fi
     fi
 
     # Strip provider prefix for Overseer / llm_config.py if user typed one (e.g. 'openai/qwen3.8' -> 'qwen3.8')
@@ -601,6 +712,7 @@ general_settings:
 
 litellm_settings:
   drop_params: true  # Strips unsupported model parameters dynamically
+  check_provider_endpoint: false  # Only return models in config.yaml; prevents dumping 100+ upstream models
 
 model_list:
   # ============================================================================
@@ -614,22 +726,47 @@ model_list:
       api_key: os.environ/DEFAULT_LLM_API_KEY${default_alias_block}
 
   # ============================================================================
-  # [2] Cloud & Provider Wildcards: Route direct to providers or OpenRouter
+  # [2] OpenRouter Universal & Curated Examples
+  #     Routes any 'openrouter/<provider>/<model>' cleanly via OPENROUTER_API_KEY
   # ============================================================================
-  # - model_name: "gemini/*"
-  #   litellm_params:
-  #     model: "gemini/*"
-  #     api_key: os.environ/GEMINI_API_KEY
-  #
-  # - model_name: "openai/*"
-  #   litellm_params:
-  #     model: "openai/*"
-  #     api_key: os.environ/OPENAI_API_KEY
-  #
-  # - model_name: "openrouter/*"
-  #   litellm_params:
-  #     model: "openrouter/*"
-  #     api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: "openrouter/*"
+    litellm_params:
+      model: "openrouter/*"
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # Example curated alias for latest Claude Haiku via OpenRouter:
+  - model_name: "claude-3.5-haiku"
+    litellm_params:
+      model: "openrouter/anthropic/claude-3.5-haiku"
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # ============================================================================
+  # [3] Google Gemini Direct (Google models directly via GEMINI_API_KEY)
+  # ============================================================================
+  - model_name: "gemini/*"
+    litellm_params:
+      model: "gemini/*"
+      api_key: os.environ/GEMINI_API_KEY
+
+  # Example curated alias for latest Google Flash direct:
+  - model_name: "gemini-2.5-flash"
+    litellm_params:
+      model: "gemini/gemini-2.5-flash"
+      api_key: os.environ/GEMINI_API_KEY
+
+  # ============================================================================
+  # [4] OpenAI Direct (OpenAI models directly via OPENAI_API_KEY)
+  # ============================================================================
+  - model_name: "openai/*"
+    litellm_params:
+      model: "openai/*"
+      api_key: os.environ/OPENAI_API_KEY
+
+  # Example curated alias for OpenAI's latest cost-efficient model:
+  - model_name: "gpt-4o-mini"
+    litellm_params:
+      model: "openai/gpt-4o-mini"
+      api_key: os.environ/OPENAI_API_KEY
 EOF
         log_done "Generated $PROXY_DIR/config.yaml with default model '${clean_model_name}' (upstream: '${litellm_upstream_model}')."
     fi
@@ -651,6 +788,28 @@ EOF
         export DEFAULT_LLM_BASE_URL="${llm_base_url}"
         export DEFAULT_LLM_API_KEY="${llm_api_key}"
         export DEFAULT_LLM_MODEL="${litellm_upstream_model}"
+
+        # Export provider keys if configured or provide safe defaults
+        if [[ "$litellm_upstream_model" == openrouter/* ]] || [ "$provider_choice" = "1" ]; then
+            sed -i '/export OPENROUTER_API_KEY=/d' "$USER_HOME/.bashrc" 2>/dev/null || true
+            echo "export OPENROUTER_API_KEY=\"${llm_api_key}\"" >> "$USER_HOME/.bashrc"
+            export OPENROUTER_API_KEY="${llm_api_key}"
+        fi
+        if [[ "$litellm_upstream_model" == openai/* ]] || [ "$provider_choice" = "2" ]; then
+            sed -i '/export OPENAI_API_KEY=/d' "$USER_HOME/.bashrc" 2>/dev/null || true
+            echo "export OPENAI_API_KEY=\"${llm_api_key}\"" >> "$USER_HOME/.bashrc"
+            export OPENAI_API_KEY="${llm_api_key}"
+        fi
+        if [[ "$litellm_upstream_model" == gemini/* ]] || [ "$provider_choice" = "3" ]; then
+            sed -i '/export GEMINI_API_KEY=/d' "$USER_HOME/.bashrc" 2>/dev/null || true
+            echo "export GEMINI_API_KEY=\"${llm_api_key}\"" >> "$USER_HOME/.bashrc"
+            export GEMINI_API_KEY="${llm_api_key}"
+        fi
+
+        # Ensure safe fallback exports so LiteLLM proxy starts without missing env var errors
+        grep -q "OPENROUTER_API_KEY" "$USER_HOME/.bashrc" || echo 'export OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"' >> "$USER_HOME/.bashrc"
+        grep -q "GEMINI_API_KEY" "$USER_HOME/.bashrc" || echo 'export GEMINI_API_KEY="${GEMINI_API_KEY:-}"' >> "$USER_HOME/.bashrc"
+        grep -q "OPENAI_API_KEY" "$USER_HOME/.bashrc" || echo 'export OPENAI_API_KEY="${OPENAI_API_KEY:-}"' >> "$USER_HOME/.bashrc"
         log_done "Exported default LLM environment variables in ~/.bashrc."
     fi
 
@@ -732,7 +891,7 @@ PYEOF
 if [ -d "$HOME/litellm_proxy" ] && [ -f "$HOME/litellm_proxy/config.yaml" ]; then
     if ! pgrep -f "litellm.*--port 4000" > /dev/null; then
         echo "🛡️ Starting Zero-Trust LiteLLM Proxy on port 4000..."
-        (cd "$HOME/litellm_proxy" && nohup "$HOME/.pixi/bin/pixi" run litellm --config config.yaml --port 4000 > proxy.log 2>&1 &)
+        (cd "$HOME/litellm_proxy" && nohup "$HOME/.pixi/bin/pixi" run litellm --config config.yaml --host 0.0.0.0 --port 4000 > proxy.log 2>&1 &)
     fi
 fi
 EOF
@@ -743,7 +902,7 @@ EOF
     log_step "Starting LiteLLM proxy in the background on port 4000..."
     pkill -f "litellm.*--port 4000" 2>/dev/null || true
     sleep 1
-    (cd "$PROXY_DIR" && nohup "$PIXI_BIN" run litellm --config config.yaml --port 4000 > proxy.log 2>&1 &) || true
+    (cd "$PROXY_DIR" && nohup "$PIXI_BIN" run litellm --config config.yaml --host 0.0.0.0 --port 4000 > proxy.log 2>&1 &) || true
     sleep 2
     if pgrep -f "litellm.*--port 4000" > /dev/null; then
         log_done "LiteLLM Proxy is active and listening on port 4000."

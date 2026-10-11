@@ -576,6 +576,19 @@ async def run_chat():
             elif config.VERBOSITY_MODE != "silent":
                 sys.stderr.write("\033[93m[SYSTEM NOTICE: 'catatonit' init binary not found on host; running container without --init. Install with: sudo apt install -y catatonit]\033[0m\n")
 
+            # Check if NVIDIA GPU CDI specification exists on host for GPU passthrough
+            has_gpu_cdi = any(
+                os.path.exists(p) for p in [
+                    "/etc/cdi/nvidia.yaml",
+                    "/var/run/cdi/nvidia.yaml",
+                    os.path.expanduser("~/.config/cdi/nvidia.yaml")
+                ]
+            )
+            if has_gpu_cdi:
+                podman_args.append("--device=nvidia.com/gpu=all")
+            elif config.VERBOSITY_MODE != "silent":
+                sys.stderr.write("\033[94m[SYSTEM INFO: No NVIDIA CDI spec found; running Podman sandbox in CPU-only mode]\033[0m\n")
+
             podman_args.extend([
                 f"--name={active_container_name}", # True unique identifier
                     "--network=slirp4netns:allow_host_loopback=false", # networking mode built specifically for rootless Podman
@@ -592,7 +605,6 @@ async def run_chat():
                     "--pids-limit=1000",      # Neutralizes bash fork bombs
                     "--userns=keep-id:uid=1000,gid=1000",
                     "--tz=local",             # Synchronizes container logs and file timestamps with host clock
-                    "--device=nvidia.com/gpu=all", # GPU Passthrough!
 #                    "--storage-opt", "size=10G", # Limits the container's scratch space, does not work on WSL2
                     "--env", "PYTHONSAFEPATH=1",
                     "--env", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/app/.pixi/envs/default/bin:/home/agent/.cargo/bin",
