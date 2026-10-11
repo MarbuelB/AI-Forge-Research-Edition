@@ -254,18 +254,25 @@ def sqlite_authorizer(action, arg1, arg2, dbname, source):
     return sqlite3.SQLITE_OK
 
 def get_payload_tokens(messages):
-    """Accurately counts text tokens and adds a safe mathematical buffer for images."""
+    """Accurately counts text tokens and adds safe mathematical buffers for images, audio, video, and PDFs."""
     total_text = ""
     image_count = 0
+    audio_count = 0
+    video_count = 0
     
     for msg in messages:
         content = msg.get("content", "")
-        if isinstance(content, list):  # Handle vision/multi-part arrays
+        if isinstance(content, list):  # Handle multimodal/multi-part arrays
             for part in content:
-                if part.get("type") == "text":
+                p_type = part.get("type")
+                if p_type == "text":
                     total_text += part.get("text", "")
-                elif part.get("type") == "image_url":
+                elif p_type == "image_url":
                     image_count += 1
+                elif p_type in ["input_audio", "audio"]:
+                    audio_count += 1
+                elif p_type in ["video", "input_video"]:
+                    video_count += 1
         else:  # Handle standard string content
             total_text += str(content)
             
@@ -277,10 +284,108 @@ def get_payload_tokens(messages):
     # Measure exact text tokens
     text_tokens = len(tokenizer.encode(total_text))
     
-    # Add a safe buffer for images (Most vision models charge ~1000 tokens per image)
-    image_tokens = image_count * 1000 
+    # Add safe buffers for multimodal parts (~1000 tokens per image/pdf, ~2000 per audio, ~3000 per video)
+    image_tokens = image_count * 1000
+    audio_tokens = audio_count * 2000
+    video_tokens = video_count * 3000
     
-    return text_tokens + image_tokens + (len(messages) * 4)
+    return text_tokens + image_tokens + audio_tokens + video_tokens + (len(messages) * 4)
+
+
+def build_multimodal_content(text_content: str, media_filepaths: list[str] = None) -> tuple[Union[list[dict], str], list[str]]:
+    """Encodes attached images, audio, video, and PDF files into standard OpenAI/LiteLLM multipart content blocks.
+    Returns: (content_blocks_or_text, error_warnings)
+    """
+    if not media_filepaths:
+        return text_content, []
+
+    content_blocks = [{"type": "text", "text": text_content}]
+    warnings = []
+
+    for path in media_filepaths:
+        if not path or not isinstance(path, str):
+            continue
+        clean_path = path.strip()
+        if not clean_path:
+            continue
+
+        # Handle remote HTTP(S) URLs directly
+        if clean_path.startswith("http://") or clean_path.startswith("https://"):
+            mime_type, _ = mimetypes.guess_type(clean_path)
+            content_blocks.append({
+                "type": "image_url",
+                "image_url": {"url": clean_path}
+            })
+            continue
+
+        # Local file resolution inside safe boundaries
+        resolved_path = os.path.realpath(clean_path)
+        if not os.path.exists(resolved_path):
+            alt_path = os.path.realpath(os.path.join(WORKSPACE_DIR, clean_path.lstrip("/")))
+            if os.path.exists(alt_path):
+                resolved_path = alt_path
+            else:
+                warnings.append(f"[MEDIA ERROR: Attached file '{clean_path}' not found on disk.]")
+                continue
+
+        try:
+            allowed_safe = [WORKSPACE_DIR, "/app/workspace", "/app/host_input"]
+            valid_safe = [d for d in allowed_safe if os.path.exists(d)]
+            if valid_safe and not any(os.path.commonpath([resolved_path, d]) == d for d in valid_safe):
+                warnings.append(f"[MEDIA ACCESS DENIED: Path '{os.path.basename(resolved_path)}' falls outside safe workspace boundaries.]")
+                continue
+        except Exception:
+            pass
+
+        file_size_bytes = os.path.getsize(resolved_path)
+        mime_type, _ = mimetypes.guess_type(resolved_path)
+        filename = os.path.basename(resolved_path)
+
+        # File size safety limits (10MB for images, 25MB for audio/video/PDF)
+        mime = (mime_type or "").lower()
+        max_size = 25 * 1024 * 1024 if (mime.startswith("audio/") or mime.startswith("video/") or mime == "application/pdf") else 10 * 1024 * 1024
+        if file_size_bytes > max_size:
+            warnings.append(f"[MEDIA ERROR: File '{filename}' is too massive ({file_size_bytes / (1024*1024):.1f} MB, max {max_size // (1024*1024)} MB).]")
+            continue
+
+        try:
+            with open(resolved_path, "rb") as mf:
+                raw_bytes = mf.read()
+            b64_data = base64.b64encode(raw_bytes).decode("utf-8")
+        except Exception as read_err:
+            warnings.append(f"[MEDIA READ ERROR: Could not read '{filename}': {str(read_err)}]")
+            continue
+
+        effective_mime = mime or "application/octet-stream"
+        if effective_mime.startswith("image/"):
+            content_blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{effective_mime};base64,{b64_data}"}
+            })
+        elif effective_mime.startswith("audio/"):
+            fmt = "wav" if "wav" in effective_mime else ("mp3" if "mp3" in effective_mime or "mpeg" in effective_mime else "wav")
+            content_blocks.append({
+                "type": "input_audio",
+                "input_audio": {"data": b64_data, "format": fmt}
+            })
+        elif effective_mime.startswith("video/") or effective_mime == "application/pdf":
+            # LiteLLM/Gemini data URI standard
+            content_blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{effective_mime};base64,{b64_data}"}
+            })
+        else:
+            content_blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{effective_mime};base64,{b64_data}"}
+            })
+
+    if warnings:
+        warn_text = "\n".join(warnings) + "\n\n"
+        if content_blocks and content_blocks[0].get("type") == "text":
+            content_blocks[0]["text"] = warn_text + content_blocks[0]["text"]
+
+    return content_blocks, warnings
 
 
 def read_file_slice(
@@ -433,6 +538,12 @@ def gather_agent_context(filepaths: list[str] = None, max_chars_per_file: int = 
                 file_size_bytes = os.path.getsize(resolved_path)
                 if file_size_bytes > 5_000_000: # 5MB limit safety cutoff
                     context_str += f"\n\n--- REFERENCE FILE STATE: {os.path.basename(resolved_path)} ---\n[SYSTEM NOTICE: This file is too massive ({file_size_bytes / 1024 / 1024:.2f} MB) to read directly. Use dedicated grep or chunk analysis tools.]"
+                    continue
+
+                mime_t, _ = mimetypes.guess_type(resolved_path)
+                mime_str = (mime_t or "").lower()
+                if mime_str and (mime_str.startswith("image/") or mime_str.startswith("audio/") or mime_str.startswith("video/") or mime_str == "application/pdf"):
+                    context_str += f"\n\n--- REFERENCE FILE: {os.path.basename(resolved_path)} ---\n[MULTIMODAL MEDIA FILE ({mime_str}): Pass via 'media_filepaths' in query_universal_llm or 'filepaths' in analyze_files to inspect visually/auditorily.]"
                     continue
 
                 content, start_idx, end_idx, total_lines, is_partial = read_file_slice(
@@ -864,9 +975,16 @@ async def query_universal_llm(
     seed: int = None,
     extra_body: dict = None,
     extra_headers: dict = None,
-    context_filepaths: list[str] = None
+    context_filepaths: list[str] = None,
+    media_filepaths: list[str] = None
 ) -> str:
-    """Queries an available LLM endpoint to run experiments, delegate sub-tasks, or obtain second opinions.
+    """Auxiliary / backup tool: Queries an external LLM endpoint to run experiments, obtain second opinions, or test alternative models.
+    CRITICAL: Do NOT use as default communication. For routine tasks, ALWAYS prioritize your primary specialized sub-agents:
+    - Coding/tools: 'forge_and_register_plugin' (The Coder)
+    - Data/logs/media: 'analyze_files' (The Analyst)
+    - Strategy/bottlenecks: 'consult_adviser' (The Adviser)
+    - Snap judgments: 'fast_decision' (The Decider)
+    - SOPs/skills: 'commission_architect' (The Architect)
     
     Actions:
     - 'list_endpoints': Returns all pre-configured endpoint presets and their URLs from llm_config.
@@ -897,7 +1015,9 @@ async def query_universal_llm(
     - seed: Integer random seed for deterministic generations.
     - extra_body: Custom dictionary passed to the request body (e.g. top_k, repetition_penalty, chat_template_kwargs).
     - extra_headers: Custom HTTP headers (e.g. OpenRouter HTTP-Referer).
-    - context_filepaths: List of absolute or workspace filepaths to inject silently into context.
+    - context_filepaths: List of absolute or workspace filepaths to inject silently into context as text.
+    - media_filepaths: List of paths (or URLs) to images (.png, .jpg, .webp), audio (.wav, .mp3), video (.mp4),
+                       or PDFs for multimodal models (e.g. Gemini 2.5 Flash, GPT-4o, Claude 3.5 Sonnet).
     """
     if action == "list_endpoints":
         presets = getattr(config, "UNIVERSAL_ENDPOINTS", {})
@@ -936,11 +1056,14 @@ async def query_universal_llm(
         file_environmental_context = gather_agent_context(context_filepaths)
         final_user_payload = f"{file_environmental_context}{user_prompt}"
 
+        # Build multimodal content if media files attached
+        user_message_content, _ = build_multimodal_content(final_user_payload, media_filepaths)
+
         api_args = {
             "model": effective_model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": final_user_payload}
+                {"role": "user", "content": user_message_content}
             ],
             "temperature": float(temperature),
             "top_p": float(top_p),
@@ -1039,9 +1162,13 @@ async def execute_rest_call(
     response_filepath: str = None,
     headers: dict = None,
     extract_field: str = None,
-    timeout_seconds: int = 180
+    timeout_seconds: int = 180,
+    files: dict[str, str] = None,
+    media_filepaths: list[str] = None
 ) -> str:
-    """Dispatches an arbitrary HTTP REST call to any local or remote model or web service.
+    """Auxiliary escape hatch: Dispatches an arbitrary HTTP REST call to any local or remote model or web service.
+    CRITICAL: This is an escape hatch for ad-hoc external APIs, custom microservices, or raw HTTP queries.
+    Do NOT use for routine agent orchestration or tasks handled by primary native sub-agents.
     
     Arguments:
     - url: The destination endpoint URL (e.g. 'http://host.containers.internal:11434/v1/chat/completions' or 'https://api.openai.com/v1/chat/completions').
@@ -1053,6 +1180,10 @@ async def execute_rest_call(
     - headers: Optional dictionary of HTTP headers (e.g. {"Authorization": "Bearer ...", "x-api-key": "..."}).
     - extract_field: Optional dot-notation path to extract from the response JSON (e.g. 'choices.0.message.content', 'response', or 'content.0.text'). If omitted, common LLM response fields are auto-detected.
     - timeout_seconds: Request timeout in seconds (default 180).
+    - files: Optional dictionary mapping form field names to local file paths (e.g. {"file": "/app/workspace/audio.wav"}).
+             When provided, dispatches as multipart/form-data (e.g. for Whisper /v1/audio/transcriptions or file upload APIs).
+    - media_filepaths: Optional list of image, audio, video, or PDF file paths. If dispatching a chat completions JSON payload,
+                       automatically base64-encodes and injects these media blocks into the user message array.
     
     Returns an audit summary with HTTP status, duration, file paths, and extracted content preview.
     """
@@ -1078,6 +1209,26 @@ async def execute_rest_call(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     req_archive_path = os.path.join(rest_calls_dir, f"req_{timestamp}.json")
 
+    opened_files = {}
+    if files and isinstance(files, dict):
+        for field_name, fpath in files.items():
+            if not fpath or not isinstance(fpath, str):
+                continue
+            resolved_f = os.path.realpath(fpath.strip())
+            if not os.path.exists(resolved_f):
+                alt_f = os.path.realpath(os.path.join(WORKSPACE_DIR, fpath.strip().lstrip("/")))
+                if os.path.exists(alt_f):
+                    resolved_f = alt_f
+                else:
+                    return f"SYSTEM ERROR: Upload file '{fpath}' for field '{field_name}' not found on disk."
+            mime_t, _ = mimetypes.guess_type(resolved_f)
+            fname = os.path.basename(resolved_f)
+            try:
+                fp = open(resolved_f, "rb")
+                opened_files[field_name] = (fname, fp, mime_t or "application/octet-stream")
+            except Exception as fe:
+                return f"SYSTEM ERROR: Could not open upload file '{fpath}': {str(fe)}"
+
     data_payload = None
     if request_filepath:
         resolved_req = os.path.abspath(request_filepath)
@@ -1086,6 +1237,9 @@ async def execute_rest_call(
             if os.path.exists(alt_path):
                 resolved_req = alt_path
             else:
+                for file_entry in opened_files.values():
+                    try: file_entry[1].close()
+                    except Exception: pass
                 return f"SYSTEM ERROR: Request file '{request_filepath}' not found on disk."
         try:
             with open(resolved_req, "r", encoding="utf-8") as f:
@@ -1097,6 +1251,9 @@ async def execute_rest_call(
             with open(req_archive_path, "w", encoding="utf-8") as f:
                 f.write(file_content if isinstance(data_payload, str) else json.dumps(data_payload, indent=2))
         except Exception as e:
+            for file_entry in opened_files.values():
+                try: file_entry[1].close()
+                except Exception: pass
             return f"SYSTEM ERROR: Failed reading request file '{request_filepath}': {str(e)}"
     elif payload_json is not None:
         data_payload = payload_json
@@ -1106,10 +1263,25 @@ async def execute_rest_call(
         except Exception:
             pass
     elif method in ["POST", "PUT", "PATCH"]:
-        return f"SYSTEM ERROR: HTTP {method} requires either 'request_filepath' or 'payload_json'."
+        if not opened_files:
+            return f"SYSTEM ERROR: HTTP {method} requires either 'request_filepath', 'payload_json', or 'files'."
+
+    # If media_filepaths is specified for chat completions, inject multimodal blocks
+    if media_filepaths and isinstance(data_payload, dict) and "messages" in data_payload and isinstance(data_payload["messages"], list):
+        for msg in reversed(data_payload["messages"]):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                orig_content = msg.get("content", "")
+                if isinstance(orig_content, str):
+                    multimodal_content, _ = build_multimodal_content(orig_content, media_filepaths)
+                    msg["content"] = multimodal_content
+                elif isinstance(orig_content, list):
+                    blocks, _ = build_multimodal_content("", media_filepaths)
+                    if isinstance(blocks, list):
+                        msg["content"] = orig_content + [b for b in blocks if b.get("type") != "text" or b.get("text")]
+                break
 
     req_headers = {"User-Agent": "AI-Forge-Overseer/1.0"}
-    if data_payload is not None:
+    if data_payload is not None and not opened_files:
         req_headers["Content-Type"] = "application/json"
     if headers and isinstance(headers, dict):
         req_headers.update(headers)
@@ -1129,7 +1301,11 @@ async def execute_rest_call(
     try:
         async with httpx.AsyncClient(timeout=timeout_val, follow_redirects=True) as client:
             req_kwargs = {"headers": req_headers}
-            if data_payload is not None:
+            if opened_files:
+                req_kwargs["files"] = opened_files
+                if data_payload is not None and isinstance(data_payload, dict):
+                    req_kwargs["data"] = data_payload
+            elif data_payload is not None:
                 if isinstance(data_payload, (dict, list)):
                     req_kwargs["json"] = data_payload
                 else:
@@ -1149,6 +1325,12 @@ async def execute_rest_call(
     except Exception as req_err:
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
         return f"SYSTEM ERROR: REST request to '{clean_url}' failed after {elapsed_ms}ms: {str(req_err)}"
+    finally:
+        for file_entry in opened_files.values():
+            try:
+                file_entry[1].close()
+            except Exception:
+                pass
 
     status_code = response.status_code
     reason_phrase = response.reason_phrase or "OK"
@@ -2817,11 +2999,11 @@ async def analyze_files(
     filter_pattern: str = None,
     context_lines: int = 2
 ) -> str:
-    """Delegates the analysis of multiple massive text files, logs, or images to the Analyst LLM.
+    """Delegates the analysis of multiple massive text files, logs, images, audio, video, or PDFs to the Analyst LLM.
     Use this to prevent large files from blowing out your context window, or to compare multiple files.
     
     Parameters:
-    - filepaths: List of absolute paths to the files (text or images).
+    - filepaths: List of absolute paths to the files (text, images, audio, video, or PDFs).
     - instruction: Specific question or analysis directive (e.g., "Find all error root causes and timeout occurrences").
     - filter_pattern: Optional regex or keyword pattern to filter massive files (e.g., "ERROR|Traceback|TimeoutException"). When specified, extracts all matching lines and surrounding context lines with line numbers instead of reading sequentially.
     - context_lines: Number of surrounding lines of context to include around each match when filter_pattern is set (defaults to 2).
@@ -2855,7 +3037,7 @@ async def analyze_files(
         
         available_text_tokens = max(10000, safe_budget - 5000)
         total_char_budget = int(available_text_tokens * 3.2)  # Conservative 3.2 chars/token
-        num_text_files = max(1, len([f for f in filepaths if os.path.exists(f) and not os.path.isdir(f) and not (mimetypes.guess_type(f)[0] and mimetypes.guess_type(f)[0].startswith('image/'))]))
+        num_text_files = max(1, len([f for f in filepaths if os.path.exists(f) and not os.path.isdir(f) and not (mimetypes.guess_type(f)[0] and (mimetypes.guess_type(f)[0].startswith('image/') or mimetypes.guess_type(f)[0].startswith('audio/') or mimetypes.guess_type(f)[0].startswith('video/') or mimetypes.guess_type(f)[0] == 'application/pdf'))]))
         allocated_chars = max(40000, min(280000, total_char_budget // num_text_files))
         effective_max_chars = max_chars if (max_chars and max_chars > 0) else allocated_chars
 
@@ -2869,20 +3051,37 @@ async def analyze_files(
                 continue
 
             mime_type, _ = mimetypes.guess_type(filepath)
-            is_image = mime_type and mime_type.startswith('image/')
+            mime_str = (mime_type or "").lower()
+            is_image = mime_str.startswith('image/')
+            is_audio = mime_str.startswith('audio/')
+            is_video = mime_str.startswith('video/')
+            is_pdf = mime_str == 'application/pdf'
             
             filename = os.path.basename(filepath)
             
-            if is_image:
-                # --- VISION PIPELINE ---
+            if is_image or is_audio or is_video or is_pdf:
+                # --- MULTIMODAL SENSORY PIPELINE ---
                 file_size = os.path.getsize(filepath)
-                if file_size > 10 * 1024 * 1024:
-                    user_content.append({"type": "text", "text": f"\n[ERROR: Image '{filename}' is too massive ({file_size / (1024*1024):.1f} MB) for the vision API. Max size is 10 MB.]"})
+                max_media_size = 25 * 1024 * 1024 if (is_audio or is_video or is_pdf) else 10 * 1024 * 1024
+                if file_size > max_media_size:
+                    user_content.append({"type": "text", "text": f"\n[ERROR: Media '{filename}' is too massive ({file_size / (1024*1024):.1f} MB) for the multimodal API. Max size is {max_media_size // (1024*1024)} MB.]"})
                     continue
-                with open(filepath, "rb") as image_file:
-                    base64_image = base64.b64encode(image_file.read()).decode('utf-8')
-                user_content.append({"type": "text", "text": f"\n--- IMAGE: {filename} ---"})
-                user_content.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}})
+                with open(filepath, "rb") as mf:
+                    b64_data = base64.b64encode(mf.read()).decode('utf-8')
+                
+                if is_image:
+                    user_content.append({"type": "text", "text": f"\n--- IMAGE: {filename} ---"})
+                    user_content.append({"type": "image_url", "image_url": {"url": f"data:{mime_str};base64,{b64_data}"}})
+                elif is_audio:
+                    fmt = "wav" if "wav" in mime_str else ("mp3" if "mp3" in mime_str or "mpeg" in mime_str else "wav")
+                    user_content.append({"type": "text", "text": f"\n--- AUDIO: {filename} ({fmt}) ---"})
+                    user_content.append({"type": "input_audio", "input_audio": {"data": b64_data, "format": fmt}})
+                elif is_video:
+                    user_content.append({"type": "text", "text": f"\n--- VIDEO: {filename} ---"})
+                    user_content.append({"type": "image_url", "image_url": {"url": f"data:{mime_str};base64,{b64_data}"}})
+                elif is_pdf:
+                    user_content.append({"type": "text", "text": f"\n--- DOCUMENT PDF: {filename} ---"})
+                    user_content.append({"type": "image_url", "image_url": {"url": f"data:application/pdf;base64,{b64_data}"}})
             else:
                 # --- TEXT PIPELINE ---
                 file_size = os.path.getsize(filepath)
