@@ -978,46 +978,13 @@ async def query_universal_llm(
     context_filepaths: list[str] = None,
     media_filepaths: list[str] = None
 ) -> str:
-    """Auxiliary / backup tool: Queries an external LLM endpoint to run experiments, obtain second opinions, or test alternative models.
-    CRITICAL: Do NOT use as default communication. For routine tasks, ALWAYS prioritize your primary specialized sub-agents:
-    - Coding/tools: 'forge_and_register_plugin' (The Coder)
-    - Data/logs/media: 'analyze_files' (The Analyst)
-    - Strategy/bottlenecks: 'consult_adviser' (The Adviser)
-    - Snap judgments: 'fast_decision' (The Decider)
-    - SOPs/skills: 'commission_architect' (The Architect)
-    
+    """Auxiliary backup tool to query an external LLM endpoint for experiments, second opinions, or cloud models via LiteLLM.
+    Use ONLY when primary specialized sub-agents (Coder, Analyst, Adviser, Decider, Architect) cannot perform the task.
+
     Actions:
-    - 'list_endpoints': Returns all pre-configured endpoint presets and their URLs from llm_config.
-    - 'list_models': Queries an endpoint to list all available models. Defaults to 'ollama' or uses 'endpoint'.
-    - 'chat': Sends a prompt to the specified 'model' on 'endpoint' with fully tunable parameters.
-    
-    Parameters:
-    - endpoint: Preset name ('ollama', 'litellm_proxy') or any custom URL
-                (e.g. 'http://host.containers.internal:8000/v1' or 'https://api.openai.com/v1').
-                Defaults to DEFAULT_UNIVERSAL_ENDPOINT ('ollama') from llm_config.
-    - model: Model identifier (required for 'chat', e.g. from 'list_models').
-             When targeting 'litellm_proxy', prefix with provider namespace matching your proxy
-             routes: Google directly via 'gemini/*' (e.g. 'gemini/gemini-2.5-flash'),
-             OpenAI directly via 'openai/*' (e.g. 'openai/gpt-4o-mini'),
-             or other models via OpenRouter (e.g. 'openrouter/anthropic/claude-3.5-haiku').
-    - system_prompt: Custom system instructions/persona (defaults to 'You are a helpful AI assistant.').
-    - user_prompt: Main instruction or query payload (required for 'chat').
-    - api_key: Custom API key. If omitted, uses the endpoint's configured default or environment key.
-    - temperature: Sampling temperature (0.0 to 2.0, default 0.7).
-    - top_p: Nucleus sampling probability threshold (0.0 to 1.0, default 1.0).
-    - max_tokens: Maximum completion length (default 32768).
-    - timeout_seconds: Maximum request timeout in seconds (default 300, up to 3600 for 1 hour).
-    - reasoning_effort: Reasoning tier ('low', 'medium', 'high') for supported reasoning models.
-    - response_format: Set to 'json_object' to enforce strict JSON output from supported models.
-    - presence_penalty: Penalize new tokens based on presence in text (-2.0 to 2.0).
-    - frequency_penalty: Penalize new tokens based on frequency in text (-2.0 to 2.0).
-    - stop: Custom stop strings to halt generation.
-    - seed: Integer random seed for deterministic generations.
-    - extra_body: Custom dictionary passed to the request body (e.g. top_k, repetition_penalty, chat_template_kwargs).
-    - extra_headers: Custom HTTP headers (e.g. OpenRouter HTTP-Referer).
-    - context_filepaths: List of absolute or workspace filepaths to inject silently into context as text.
-    - media_filepaths: List of paths (or URLs) to images (.png, .jpg, .webp), audio (.wav, .mp3), video (.mp4),
-                       or PDFs for multimodal models (e.g. Gemini 2.5 Flash, GPT-4o, Claude 3.5 Sonnet).
+    - 'list_endpoints': Lists pre-configured endpoint presets from llm_config.
+    - 'list_models': Lists available models on 'endpoint'.
+    - 'chat': Sends prompt to 'model' on 'endpoint' with optional parameters (temperature, max_tokens, reasoning_effort, context_filepaths, media_filepaths, etc.).
     """
     if action == "list_endpoints":
         presets = getattr(config, "UNIVERSAL_ENDPOINTS", {})
@@ -1129,6 +1096,8 @@ async def query_universal_llm(
 
             if not content.strip() and not thinking:
                 result_str += f"\n[SYSTEM WARNING: Empty response. Finish Reason: '{finish_reason}']"
+            elif finish_reason == "length":
+                result_str += f"\n\n[SYSTEM NOTICE: Model reached max_tokens limit ({max_tokens}) during reasoning/generation. Output was truncated by the model, but all thinking and partial output are fully preserved above.]"
 
             if thinking:
                 result_str += f"\n<___UNIVERSAL_THOUGHTS___>\n{thinking}\n</___UNIVERSAL_THOUGHTS___>"
@@ -1166,26 +1135,10 @@ async def execute_rest_call(
     files: dict[str, str] = None,
     media_filepaths: list[str] = None
 ) -> str:
-    """Auxiliary escape hatch: Dispatches an arbitrary HTTP REST call to any local or remote model or web service.
-    CRITICAL: This is an escape hatch for ad-hoc external APIs, custom microservices, or raw HTTP queries.
-    Do NOT use for routine agent orchestration or tasks handled by primary native sub-agents.
-    
-    Arguments:
-    - url: The destination endpoint URL (e.g. 'http://host.containers.internal:11434/v1/chat/completions' or 'https://api.openai.com/v1/chat/completions').
-           Note: 'localhost' or '127.0.0.1' is automatically mapped to 'host.containers.internal' to reach services running on the host machine.
-    - method: HTTP method ('POST', 'GET', 'PUT', 'DELETE', 'PATCH'). Defaults to 'POST'.
-    - request_filepath: Absolute or workspace path to a JSON file to use as the request body. If specified, this is read from disk.
-    - payload_json: Dictionary to use as the request body if 'request_filepath' is not provided.
-    - response_filepath: Path where the full raw JSON response should be written. If omitted, automatically archived to state/rest_calls/resp_<timestamp>.json.
-    - headers: Optional dictionary of HTTP headers (e.g. {"Authorization": "Bearer ...", "x-api-key": "..."}).
-    - extract_field: Optional dot-notation path to extract from the response JSON (e.g. 'choices.0.message.content', 'response', or 'content.0.text'). If omitted, common LLM response fields are auto-detected.
-    - timeout_seconds: Request timeout in seconds (default 180).
-    - files: Optional dictionary mapping form field names to local file paths (e.g. {"file": "/app/workspace/audio.wav"}).
-             When provided, dispatches as multipart/form-data (e.g. for Whisper /v1/audio/transcriptions or file upload APIs).
-    - media_filepaths: Optional list of image, audio, video, or PDF file paths. If dispatching a chat completions JSON payload,
-                       automatically base64-encodes and injects these media blocks into the user message array.
-    
-    Returns an audit summary with HTTP status, duration, file paths, and extracted content preview.
+    """Auxiliary escape hatch: Dispatches an arbitrary HTTP REST call to an external API, microservice, or local model.
+    Use ONLY for ad-hoc HTTP queries or custom endpoints, NOT for routine agent orchestration.
+    Loopback addresses ('localhost', '127.0.0.1') are automatically mapped to 'host.containers.internal'.
+    Supports JSON payloads ('payload_json', 'request_filepath'), multipart file uploads ('files'), and media ('media_filepaths').
     """
     if not url or not isinstance(url, str):
         return "SYSTEM ERROR: The 'url' parameter must be a non-empty string."
@@ -1430,16 +1383,52 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
     if not command or not isinstance(command, str):
         return 'SYSTEM ERROR: The "command" parameter must be a non-empty string. Example: command="ls -la"'
 
-    # 2. Block Destructive Commands (rm as an executed command, not an argument inside quotes/grep)
-    if re.search(r'\bgit\s+rm\s+--cached\b', command.lower()):
-        pass  # Explicitly permit non-destructive git index untracking
-    elif re.search(r'(?:^|[;&|\n]|\bxargs\b)\s*(?:/bin/|/usr/bin/)?(?:rm|unlink)\s+', command.strip().lower()) or re.search(r'\s+-delete\b', command.strip().lower()):
-        first_token = command.strip().split()[0].lower() if command.strip().split() else ""
-        if first_token in ("grep", "egrep", "fgrep", "rg", "echo", "printf", "sed", "awk"):
-            pass
-        else:
-            logger.warning(f"[execute_bash] Security block: destructive rm/unlink/-delete command rejected: {command[:200]}")
-            return "SYSTEM ERROR: Destructive commands (rm, unlink, -delete) are blocked. Use the archive folder instead."
+    # 2. Block Destructive Commands (rm, unlink, -delete, git rm without --cached, variable indirection)
+    # Check for variable indirection assigning to rm / unlink (e.g., R="rm", CMD='unlink')
+    if re.search(r'\b[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*[\'"]?(?:/bin/|/usr/bin/)?(?:rm|unlink|shred)\b', command, re.IGNORECASE):
+        logger.warning(f"[execute_bash] Security block: variable indirection to rm/unlink rejected: {command[:200]}")
+        return "SYSTEM ERROR: Destructive commands (rm, unlink, -delete) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
+
+    # Strip quoted string literals to inspect active unquoted shell syntax
+    unquoted = re.sub(r'"[^"\\]*(?:\\.[^"\\]*)*"', '""', command)
+    unquoted = re.sub(r"'[^'\\]*(?:\\.[^'\\]*)*'", "''", unquoted)
+
+    # Check for find -delete or find -exec rm / xargs rm
+    if re.search(r'\bfind\b[^;&|\n]*\s+-delete\b', unquoted, re.IGNORECASE) or \
+       re.search(r'\bfind\b[^;&|\n]*\s+-exec(?:dir)?\s+(?:/bin/|/usr/bin/)?(?:rm|unlink|shred)\b', unquoted, re.IGNORECASE) or \
+       re.search(r'\bxargs\b[^;&|\n]*\s+(?:/bin/|/usr/bin/)?(?:rm|unlink|shred)\b', unquoted, re.IGNORECASE):
+        logger.warning(f"[execute_bash] Security block: destructive find/xargs deletion rejected: {command[:200]}")
+        return "SYSTEM ERROR: Destructive commands (rm, unlink, -delete) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
+
+    # Split command into individual statements by unquoted shell operators (; && || | \n &)
+    statements = re.split(r';|&&|\|\||\||\n|&', unquoted)
+    for stmt in statements:
+        parts = stmt.strip().split()
+        if not parts:
+            continue
+        # Skip leading environment variable assignments (e.g. VAR=val cmd)
+        idx = 0
+        while idx < len(parts) and "=" in parts[idx] and not parts[idx].startswith("-"):
+            idx += 1
+        if idx >= len(parts):
+            continue
+
+        raw_token = parts[idx].lower().strip(" \t\r\n\\\"'")
+        base_token = raw_token.split("/")[-1]
+
+        # git rm check: only permit non-destructive index untracking with --cached
+        if base_token == "git" and (idx + 1) < len(parts):
+            sub_git = parts[idx + 1].lower()
+            if sub_git == "rm":
+                if "--cached" not in stmt.lower():
+                    logger.warning(f"[execute_bash] Security block: git rm without --cached rejected: {command[:200]}")
+                    return "SYSTEM ERROR: Destructive command 'git rm' (without --cached) is blocked. Use the archive folder instead."
+                continue
+
+        # Reject rm, unlink, shred as executable command binaries
+        if base_token in ("rm", "unlink", "shred"):
+            logger.warning(f"[execute_bash] Security block: destructive '{base_token}' rejected: {command[:200]}")
+            return f"SYSTEM ERROR: Destructive command '{base_token}' is blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
 
     try:
         if not command.strip():
@@ -1449,9 +1438,18 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
         current_env = os.environ.copy()
         current_env["PYTHONPATH"] = f"/app/workspace/custom_packages:{current_env.get('PYTHONPATH', '')}"
 
+        # Prepend runtime bash interceptor functions for rm and unlink to guarantee defense-in-depth against variable indirection
+        safe_bash_payload = (
+            "rm() { echo 'SYSTEM ERROR: Destructive command rm is blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead.' >&2; return 1; }; "
+            "export -f rm 2>/dev/null || true; "
+            "unlink() { echo 'SYSTEM ERROR: Destructive command unlink is blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead.' >&2; return 1; }; "
+            "export -f unlink 2>/dev/null || true; "
+            + command
+        )
+
         # Utilizes an asynchronous shell context to permit multi-language execution pipelines (&&, |, >) safely within container borders
         process = await asyncio.create_subprocess_shell(
-            command,
+            safe_bash_payload,
             cwd=SANDBOX_DIR,
             env=current_env,
             executable="/bin/bash",
@@ -3016,6 +3014,9 @@ async def analyze_files(
     max_lines = int(max_lines) if max_lines is not None else None
     max_chars = int(max_chars) if max_chars is not None else None
     context_lines = int(context_lines) if context_lines is not None else 2
+
+    if isinstance(filepaths, str):
+        filepaths = [filepaths]
 
     api_args = analyst_profile["api_params"].copy()
     api_args["model"] = analyst_profile["model"]

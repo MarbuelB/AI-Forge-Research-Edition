@@ -852,7 +852,7 @@ async def run_chat():
                         "type": "function",
                         "function": {
                             "name": "manage_external_mcp",
-                            "description": "Meta-tool to inspect, connect, or disconnect external Model Context Protocol (MCP) tool suites outside the sandbox (e.g. ChimeraX for 3D molecular visualization, host tools, or any universal custom MCP server). When connected, its tools are registered directly into your toolset for all subsequent turns in this session until disconnected.",
+                            "description": "Meta-tool to inspect, connect, or disconnect Model Context Protocol (MCP) tool suites (SSE or stdio). When connected, its tools are registered directly into your toolset until disconnected.",
                             "parameters": {
                                 "type": "object",
                                 "properties": {
@@ -1033,7 +1033,13 @@ async def run_chat():
                                 tool_names = [t["function"]["name"] for t in tools_added]
                                 return f"SUCCESS: Connected to '{cfg.get('name', server_name)}'. Registered {len(tool_names)} tools: {', '.join(tool_names)}. These tools are now permanently available in your toolset for all subsequent turns in this session until you disconnect them."
                             else:
-                                return f"SYSTEM ERROR: Could not connect to '{server_name}' at {cfg.get('url', cfg.get('command', ''))}. The server appears to be offline or unreachable."
+                                err_hint = ""
+                                target_loc = str(cfg.get('url', cfg.get('command', '')))
+                                if "127.0.0.1" in target_loc or "localhost" in target_loc:
+                                    err_hint = " Note: The Overseer runs on the host and looks for servers on the host network. If you are building new tools inside the container, do NOT use in-container MCP servers; use 'forge_and_register_plugin' to build and register tools natively instead."
+                                elif cfg.get("transport") == "stdio":
+                                    err_hint = " Note: stdio commands execute on the host machine. Ensure the command binary is installed and executable on the host."
+                                return f"SYSTEM ERROR: Could not connect to '{server_name}' at {target_loc}. The server appears to be offline or unreachable.{err_hint}"
 
                         elif action == "disconnect":
                             if not server_name:
@@ -1312,6 +1318,7 @@ async def run_chat():
                                 tool_calls_dict = {}
                                 final_usage = None
                                 loop_interrupted = False  # Track if a loop circuit breaker trips
+                                stream_finish_reason = None
                                 last_loop_check_think = 0
                                 last_loop_check_content = 0
                                 
@@ -1325,6 +1332,9 @@ async def run_chat():
                                     async for chunk in response_stream:
                                         if chunk.usage:
                                             final_usage = chunk.usage
+
+                                        if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].finish_reason:
+                                            stream_finish_reason = chunk.choices[0].finish_reason
 
                                         if not chunk.choices or not chunk.choices[0].delta:
                                             continue
@@ -1421,6 +1431,8 @@ async def run_chat():
                                 # If mode is "silent", we do nothing visually!
                                 if config.VERBOSITY_MODE != "silent":
                                     print()  # Drop a clean newline after the stream is fully finished
+                                    if stream_finish_reason == "length":
+                                        print(f"{COLOR_YELLOW}[SYSTEM NOTICE: Response reached max_tokens limit while emitting reasoning/response. Output was stopped by serving model. All thinking and generated content have been safely preserved in session logs.]{COLOR_RESET}")
 
                                 if not full_thinking and full_content:
                                     for tag in ["think", "thought"]:
