@@ -221,7 +221,8 @@ description: A clear, 1-2 sentence explanation of what this skill does and when 
    === STRICT CONSTRAINTS ===
 - DO NOT wrap the entire output in ```markdown or ``` code blocks. Output the raw text of the markdown file directly.
 - Be extremely precise, detailed, and actionable. Avoid vague descriptions.
-- Read all files under the `=== ATTACHED AGENT CONTEXT BACKGROUND ENVIRONMENT ===` header to capture exact command flags, configurations, and environment setups accurately.""",
+- Read all files under the `=== ATTACHED AGENT CONTEXT BACKGROUND ENVIRONMENT ===` header to capture exact command flags, configurations, and environment setups accurately.
+- ANTI-DELETION COMPLIANCE: NEVER write literal 'rm', 'rm -rf', or destructive commands in generated skills or SOPs. The execution environment enforces an Anti-Deletion Protocol that strictly blocks them. Always use non-destructive operations, such as archiving via 'mv <target> /app/workspace/archive/', when removing or cleaning up files.""",
     "autonomous_audit_nudge": (
         "[SYSTEM AUTONOMOUS AUDIT: You did not invoke any tools. "
         "If your task is 100% finished and all requested deliverables/files are verified on disk, reply confirming completion without invoking tools to conclude. "

@@ -74,6 +74,8 @@ logging.basicConfig(
 )
 # Forcefully clear any existing console handlers that might corrupt the JSON-RPC stream
 logging.getLogger().handlers = [h for h in logging.getLogger().handlers if isinstance(h, logging.FileHandler)]
+for noisy_lib in ("httpx", "httpcore", "fastmcp", "openai"):
+    logging.getLogger(noisy_lib).setLevel(logging.WARNING)
 logger = logging.getLogger("ForgeContainer")
 
 
@@ -248,8 +250,11 @@ def save_failure_trace(subagent_name: str, payload: dict) -> str:
         return ""
 
 def sqlite_authorizer(action, arg1, arg2, dbname, source):
-    # 9 = SQLITE_DELETE, 11 = SQLITE_DROP_TABLE
-    if action in (sqlite3.SQLITE_DELETE, sqlite3.SQLITE_DROP_TABLE):
+    # 9 = SQLITE_DELETE, 11 = SQLITE_DROP_TABLE, 24 = SQLITE_ATTACH
+    denied = (sqlite3.SQLITE_DELETE, sqlite3.SQLITE_DROP_TABLE)
+    if hasattr(sqlite3, "SQLITE_ATTACH"):
+        denied += (sqlite3.SQLITE_ATTACH,)
+    if action in denied:
         return sqlite3.SQLITE_DENY
     return sqlite3.SQLITE_OK
 
@@ -1410,51 +1415,72 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
         return 'SYSTEM ERROR: The "command" parameter must be a non-empty string. Example: command="ls -la"'
 
     # 2. Block Destructive Commands (rm, unlink, -delete, git rm without --cached, variable indirection)
-    # Check for variable indirection assigning to rm / unlink (e.g., R="rm", CMD='unlink')
-    if re.search(r'\b[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*[\'"]?(?:/bin/|/usr/bin/)?(?:rm|unlink|shred)\b', command, re.IGNORECASE):
-        logger.warning(f"[execute_bash] Security block: variable indirection to rm/unlink rejected: {command[:200]}")
-        return "SYSTEM ERROR: Destructive commands (rm, unlink, -delete) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
+    # Strip inline comments to avoid false-triggering on comment annotations
+    cmd_no_comments = re.sub(r'(?m)(^|\s+)#[^"\'\n]*$', '', command)
 
     # Strip quoted string literals to inspect active unquoted shell syntax
-    unquoted = re.sub(r'"[^"\\]*(?:\\.[^"\\]*)*"', '""', command)
+    unquoted = re.sub(r'"[^"\\]*(?:\\.[^"\\]*)*"', '""', cmd_no_comments)
     unquoted = re.sub(r"'[^'\\]*(?:\\.[^'\\]*)*'", "''", unquoted)
 
     # Check for find -delete or find -exec rm / xargs rm
     if re.search(r'\bfind\b[^;&|\n]*\s+-delete\b', unquoted, re.IGNORECASE) or \
        re.search(r'\bfind\b[^;&|\n]*\s+-exec(?:dir)?\s+(?:/bin/|/usr/bin/)?(?:rm|unlink|shred)\b', unquoted, re.IGNORECASE) or \
        re.search(r'\bxargs\b[^;&|\n]*\s+(?:/bin/|/usr/bin/)?(?:rm|unlink|shred)\b', unquoted, re.IGNORECASE):
-        logger.warning(f"[execute_bash] Security block: destructive find/xargs deletion rejected: {command[:200]}")
-        return "SYSTEM ERROR: Destructive commands (rm, unlink, -delete) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
+        logger.warning(f"[execute_bash] Security block: destructive find/xargs deletion rejected: {command}")
+        return "SYSTEM ERROR: Destructive commands (rm, unlink, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
 
-    # Split command into individual statements by unquoted shell operators (; && || | \n &)
-    statements = re.split(r';|&&|\|\||\||\n|&', unquoted)
-    for stmt in statements:
-        parts = stmt.strip().split()
-        if not parts:
+    # Check unquoted variable indirection assigning to rm / unlink / shred (e.g., R=rm, CMD=/bin/unlink)
+    if re.search(r'\b[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*(?:/bin/|/usr/bin/)?(?:rm|unlink|shred)\b', unquoted, re.IGNORECASE):
+        logger.warning(f"[execute_bash] Security block: unquoted variable indirection to rm/unlink rejected: {command}")
+        return "SYSTEM ERROR: Destructive commands (rm, unlink, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
+
+    # Tokenize statements by shell operators (; && || | \n &)
+    statements = re.split(r';|&&|\|\||\||\n|&', command)
+    for raw_stmt in statements:
+        raw_stmt = raw_stmt.strip()
+        if not raw_stmt or raw_stmt.startswith('#'):
             continue
-        # Skip leading environment variable assignments (e.g. VAR=val cmd)
+        try:
+            tokens = shlex.split(raw_stmt, comments=True)
+        except Exception:
+            tokens = raw_stmt.split()
+        if not tokens:
+            continue
+
         idx = 0
-        while idx < len(parts) and "=" in parts[idx] and not parts[idx].startswith("-"):
-            idx += 1
-        if idx >= len(parts):
-            continue
+        while idx < len(tokens):
+            tok = tokens[idx]
+            # Check for variable assignment indirection (e.g., R="rm", CMD='unlink')
+            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*=(?:/bin/|/usr/bin/)?(?:rm|unlink|shred)$', tok, re.IGNORECASE):
+                logger.warning(f"[execute_bash] Security block: variable indirection assignment rejected: {command}")
+                return "SYSTEM ERROR: Destructive commands (rm, unlink, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
 
-        raw_token = parts[idx].lower().strip(" \t\r\n\\\"'")
-        base_token = raw_token.split("/")[-1]
-
-        # git rm check: only permit non-destructive index untracking with --cached
-        if base_token == "git" and (idx + 1) < len(parts):
-            sub_git = parts[idx + 1].lower()
-            if sub_git == "rm":
-                if "--cached" not in stmt.lower():
-                    logger.warning(f"[execute_bash] Security block: git rm without --cached rejected: {command[:200]}")
-                    return "SYSTEM ERROR: Destructive command 'git rm' (without --cached) is blocked. Use the archive folder instead."
+            # Skip benign variable assignments (e.g., VAR=hello cmd)
+            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*=', tok):
+                idx += 1
                 continue
 
-        # Reject rm, unlink, shred as executable command binaries
-        if base_token in ("rm", "unlink", "shred"):
-            logger.warning(f"[execute_bash] Security block: destructive '{base_token}' rejected: {command[:200]}")
-            return f"SYSTEM ERROR: Destructive command '{base_token}' is blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
+            # Skip command prefixes
+            if tok in ('export', 'env', 'command', 'builtin', 'sudo'):
+                idx += 1
+                continue
+
+            base_token = tok.split('/')[-1].lower()
+
+            # git rm check: only permit non-destructive index untracking with --cached
+            if base_token == 'git' and idx + 1 < len(tokens):
+                if tokens[idx + 1].lower() == 'rm':
+                    if '--cached' not in [t.lower() for t in tokens]:
+                        logger.warning(f"[execute_bash] Security block: git rm without --cached rejected: {command}")
+                        return "SYSTEM ERROR: Destructive commands (rm, unlink, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
+                    break
+
+            # Reject rm, unlink, shred as executable command binaries
+            if base_token in ('rm', 'unlink', 'shred'):
+                logger.warning(f"[execute_bash] Security block: destructive binary '{base_token}' rejected: {command}")
+                return "SYSTEM ERROR: Destructive commands (rm, unlink, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
+
+            break
 
     try:
         if not command.strip():
@@ -1466,9 +1492,9 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
 
         # Prepend runtime bash interceptor functions for rm and unlink to guarantee defense-in-depth against variable indirection
         safe_bash_payload = (
-            "rm() { echo 'SYSTEM ERROR: Destructive command rm is blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead.' >&2; return 1; }; "
+            "rm() { echo 'SYSTEM ERROR: Destructive commands (rm, unlink, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead.' >&2; return 1; }; "
             "export -f rm 2>/dev/null || true; "
-            "unlink() { echo 'SYSTEM ERROR: Destructive command unlink is blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead.' >&2; return 1; }; "
+            "unlink() { echo 'SYSTEM ERROR: Destructive commands (rm, unlink, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead.' >&2; return 1; }; "
             "export -f unlink 2>/dev/null || true; "
             + command
         )
@@ -2071,13 +2097,16 @@ async def forge_and_register_plugin(
 
             deps_report = ""
             if target_lang == "python":
-                requires_match = re.search(r"# REQUIRES:\s*(.*)", code, re.IGNORECASE)
-                if requires_match:
-                    raw_reqs = requires_match.group(1).replace("pip install", "").replace("pixi add", "").replace(",", " ").strip()
+                requires_matches = re.findall(r"# REQUIRES:\s*(.*)", code, re.IGNORECASE)
+                if requires_matches:
+                    raw_reqs = " ".join(requires_matches).replace("pip install", "").replace("pixi add", "").replace(",", " ").strip()
                     cleaned_reqs = re.sub(r'\(.*?\)', '', raw_reqs).strip()
                     words = [w.strip() for w in cleaned_reqs.split() if w.strip()]
                     ignored_words = {"none", "null", "nil", "standard", "stdlib", "library", "only", "built-in", "builtin", "no", "external", "dependencies", "deps", "-"}
-                    safe_deps_list = [w for w in words if re.match(r'^[A-Za-z0-9_]+[A-Za-z0-9_.-]*(?:\[.*\])?(?:[<>=!~].*)?$', w) and w.lower() not in ignored_words]
+                    safe_deps_list = list(dict.fromkeys(
+                        w for w in words
+                        if re.match(r'^[A-Za-z0-9_]+[A-Za-z0-9_.-]*(?:\[.*\])?(?:[<>=!~].*)?$', w) and w.lower() not in ignored_words
+                    ))
                     if safe_deps_list:
                         os.makedirs("/app/workspace/custom_packages", exist_ok=True)
                         proc_install = await asyncio.create_subprocess_exec(
@@ -2085,7 +2114,7 @@ async def forge_and_register_plugin(
                             cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                         )
                         _, stderr_install = await proc_install.communicate()
-                        deps_report = f"\n[SYSTEM: Installed custom dependencies]" if proc_install.returncode == 0 else f"\n[SYSTEM WARNING: Dependency fault: {stderr_install.decode('utf-8', errors='replace')}]"
+                        deps_report = f"\n[SYSTEM: Installed custom dependencies: {', '.join(safe_deps_list)}]" if proc_install.returncode == 0 else f"\n[SYSTEM WARNING: Dependency fault: {stderr_install.decode('utf-8', errors='replace')}]"
 
             # Dynamic platform syntax compile evaluations across all supported execution architectures
             is_valid = True
