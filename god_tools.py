@@ -874,10 +874,12 @@ async def query_universal_llm(
     - 'chat': Sends a prompt to the specified 'model' on 'endpoint' with fully tunable parameters.
     
     Parameters:
-    - endpoint: Preset name ('ollama', 'ollama_default', 'litellm_proxy', 'vllm', 'openrouter', 'openai', 'deepseek', 'groq')
-                or any custom URL (e.g. 'http://host.containers.internal:8000/v1' or 'https://api.openai.com/v1').
-                Defaults to 'ollama' from llm_config.
+    - endpoint: Preset name ('ollama', 'litellm_proxy') or any custom URL
+                (e.g. 'http://host.containers.internal:8000/v1' or 'https://api.openai.com/v1').
+                Defaults to DEFAULT_UNIVERSAL_ENDPOINT ('ollama') from llm_config.
     - model: Model identifier (required for 'chat', e.g. from 'list_models').
+             When targeting 'litellm_proxy', use bare model identifiers
+             (e.g. 'google/gemini-2.5-flash', 'anthropic/claude-3.5-sonnet') without an 'openrouter/' prefix.
     - system_prompt: Custom system instructions/persona (defaults to 'You are a helpful AI assistant.').
     - user_prompt: Main instruction or query payload (required for 'chat').
     - api_key: Custom API key. If omitted, uses the endpoint's configured default or environment key.
@@ -926,12 +928,18 @@ async def query_universal_llm(
 
         target_url, target_key, timeout_val = resolve_universal_endpoint(endpoint, api_key, timeout_seconds)
 
+        # Defensive normalization: strip redundant "openrouter/" prefix if targeting litellm_proxy (:4000)
+        # to prevent proxy double-prefixing ("openrouter/openrouter/...") under wildcard routes
+        effective_model = model.strip() if model else ""
+        if (":4000" in target_url or "litellm" in target_url) and effective_model.startswith("openrouter/"):
+            effective_model = effective_model[len("openrouter/"):].strip()
+
         # Extract background context files quietly
         file_environmental_context = gather_agent_context(context_filepaths)
         final_user_payload = f"{file_environmental_context}{user_prompt}"
 
         api_args = {
-            "model": model,
+            "model": effective_model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": final_user_payload}
@@ -976,7 +984,7 @@ async def query_universal_llm(
                     f"Please refine your 'context_filepaths' selection.")
 
         if config.VERBOSITY_MODE != "silent":
-            sys.stderr.write(f"\n\033[93m[System: Sending prompt to Universal Sub-Agent ({model} at {target_url}) (~{payload_tokens} estimated tokens, timeout: {timeout_val:.0f}s)...\033[0m\n")
+            sys.stderr.write(f"\n\033[93m[System: Sending prompt to Universal Sub-Agent ({effective_model} at {target_url}) (~{payload_tokens} estimated tokens, timeout: {timeout_val:.0f}s)...\033[0m\n")
 
         try:
             client = AsyncOpenAI(base_url=target_url, api_key=target_key, timeout=timeout_val)
@@ -993,7 +1001,7 @@ async def query_universal_llm(
 
             finish_reason = response.choices[0].finish_reason or "unknown"
 
-            result_str = f"--- RESPONSE FROM {model} ({target_url}) ---\n"
+            result_str = f"--- RESPONSE FROM {effective_model} ({target_url}) ---\n"
             if thinking:
                 result_str += f"<thinking>\n{thinking}\n</thinking>\n\n"
             result_str += content
@@ -1004,7 +1012,7 @@ async def query_universal_llm(
             if thinking:
                 result_str += f"\n<___UNIVERSAL_THOUGHTS___>\n{thinking}\n</___UNIVERSAL_THOUGHTS___>"
             if content:
-                result_str += f"\n<___UNIVERSAL_OUTPUT___ model=\"{model}\">\n{content}\n</___UNIVERSAL_OUTPUT___>"
+                result_str += f"\n<___UNIVERSAL_OUTPUT___ model=\"{effective_model}\">\n{content}\n</___UNIVERSAL_OUTPUT___>"
 
             return result_str
 
@@ -1012,7 +1020,7 @@ async def query_universal_llm(
             trace_file = save_failure_trace("universal", {
                 "subagent": "universal",
                 "endpoint": target_url,
-                "model": model,
+                "model": effective_model,
                 "error": str(e),
                 "traceback": traceback.format_exc(),
                 "messages": api_args.get("messages", []) if 'api_args' in locals() else []

@@ -62,7 +62,7 @@ This project utilizes multiple distinct Large Language Models (LLMs) to maximize
 * **The Architect (The Methodologist & Skill Builder):** A specialized agent dedicated to Standard Operating Procedure (SOP) codification. When the Brain solves a novel or complex engineering task, it calls `commission_architect`. The Architect synthesizes the full workflow (prerequisites, setup commands, code patterns, edge cases, troubleshooting table, and verification checks) into a permanent, reusable `SKILL.md` file saved to `/app/workspace/skills/<skill_name>/`. The Brain dynamically loads and follows these skills via `load_skill`.
 * **The Decider (The Reflex & Snap Judgement):** A specialized, ultra-fast decision-making subagent powered by a local non-autoregressive decision model (e.g., Clef Flash 9B via Ollama's `/v1/systemone` endpoint). While the Adviser provides deep, multi-step strategic reflection, the Decider acts as the Brain's System-1 reflex. It delivers instantaneous single-step rulings—such as categorical selections (`choice`), boolean validity/safety gates (`boolean`/`noul`), or ordinal confidence ratings (`score`)—with sub-second latency and mathematically calibrated probability distributions without consuming large generation budgets.
 * **Universal Sub-Agents (`query_universal_llm`):** The Brain has the ability to dynamically spawn independent LLM sub-agents to delegate isolated tasks, test prompt variations, or request second opinions.
-  * *Preset & Custom Endpoints:* Can pick from pre-configured zero-trust endpoint presets defined in [`llm_config.py`](file:///home/agent/ai_workspace/llm_config.py) (`ollama` on local port 64165, `litellm_proxy` on port 4000 for cloud models via host LiteLLM gateway) or connect to any custom URL. The fallback default is set by `DEFAULT_UNIVERSAL_ENDPOINT = "ollama"`.
+  * *Preset & Custom Endpoints:* Can pick from pre-configured zero-trust endpoint presets defined in [`llm_config.py`](file:///home/agent/ai_workspace/llm_config.py) (`ollama` on local port 64165, `litellm_proxy` on port 4000 for cloud models via host LiteLLM gateway) or connect to any custom URL. The fallback default is set by `DEFAULT_UNIVERSAL_ENDPOINT = "ollama"`. When routing through `litellm_proxy`, supply bare model IDs (e.g. `google/gemini-2.5-flash`, `anthropic/claude-3.5-sonnet`) without an `openrouter/` prefix.
   * *Authentication & Long-Running Timeouts:* Supports inserting custom API keys on the fly and configuring request timeouts up to 1 hour (`timeout_seconds=3600`) for deep reasoning or heavy generation workloads.
   * *Prompt & Setting Tunability:* Supports arbitrary system and user prompts with background context injection (`context_filepaths`), plus full tuning across sampling parameters (`temperature`, `top_p`, `max_tokens`, `reasoning_effort`, `response_format={'type': 'json_object'}`, `presence_penalty`, `frequency_penalty`, `stop`, `seed`, `extra_body`, and `extra_headers`).
   * *Endpoint Introspection:* Includes `action="list_endpoints"` to view pre-configured preset URLs and `action="list_models"` to discover available models on any target server.
@@ -363,13 +363,15 @@ Example (includes option to remove unsupported flags):
           api_key: os.environ/OPENROUTER_API_KEY
 
       # [4] Dynamic Wildcard Passthrough (Allows calling ANY model on OpenRouter!)
-      - model_name: "openrouter/*"
+      # Note: Captures bare model IDs (e.g. google/gemini-2.5-flash) and routes to openrouter/*
+      - model_name: "*"
         litellm_params:
           model: "openrouter/*"
           api_key: os.environ/OPENROUTER_API_KEY
 
 > **Note on Model Naming & Provider Prefixes:**
 > * In `config.yaml`, LiteLLM requires a provider routing prefix in `litellm_params.model` (e.g. `openai/qwen3.8`, `openai/Qwen3.8-Flash-Next-FP8`, `ollama/qwen2.5:latest`) so the proxy knows which API adapter to invoke.
+> * When using wildcard passthrough (`model_name: "*"` with upstream `openrouter/*`), always pass the **bare OpenRouter model ID** (e.g. `google/gemini-2.5-flash`, `anthropic/claude-3.5-sonnet`) without an `openrouter/` prefix. The proxy wildcard automatically prepends the provider prefix.
 > * In `llm_config.py` (and framework CLI overrides), use only the clean model identifier matching LiteLLM's `model_name` (e.g. `"model": "qwen3.8"`), **without** the `openai/` prefix. The setup script handles this separation automatically.
 
 Run this in your standard WSL2 terminal:
