@@ -614,31 +614,22 @@ model_list:
       api_key: os.environ/DEFAULT_LLM_API_KEY${default_alias_block}
 
   # ============================================================================
-  # [2] Examples: Add additional local, remote cluster, or cloud models
+  # [2] Cloud & Provider Wildcards: Route direct to providers or OpenRouter
   # ============================================================================
-  # - model_name: Qwen3.8-Flash-Next-FP8
+  # - model_name: "gemini/*"
   #   litellm_params:
-  #     model: openai/Qwen3.8-Flash-Next-FP8
-  #     # LiteLLM automatically pulls these from your ~/.bashrc exports!
-  #     api_base: os.environ/LLM_PLATFORM_API_BASE
-  #     api_key: os.environ/LLM_PLATFORM_API_KEY
+  #     model: "gemini/*"
+  #     api_key: os.environ/GEMINI_API_KEY
   #
-  # - model_name: google/gemini-3.5-flash
+  # - model_name: "openai/*"
   #   litellm_params:
-  #     model: openai/google/gemini-3.5-flash
-  #     # LiteLLM automatically pulls these from your ~/.bashrc exports!
-  #     api_base: os.environ/OPENROUTER_API_BASE
-  #     api_key: os.environ/OPENROUTER_API_KEY
-  #
-  # - model_name: gpt-4o
-  #   litellm_params:
-  #     model: openai/gpt-4o
+  #     model: "openai/*"
   #     api_key: os.environ/OPENAI_API_KEY
   #
-  # - model_name: claude-3-7-sonnet
+  # - model_name: "openrouter/*"
   #   litellm_params:
-  #     model: anthropic/claude-3-7-sonnet-20250219
-  #     api_key: os.environ/ANTHROPIC_API_KEY
+  #     model: "openrouter/*"
+  #     api_key: os.environ/OPENROUTER_API_KEY
 EOF
         log_done "Generated $PROXY_DIR/config.yaml with default model '${clean_model_name}' (upstream: '${litellm_upstream_model}')."
     fi

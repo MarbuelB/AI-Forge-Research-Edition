@@ -62,7 +62,7 @@ This project utilizes multiple distinct Large Language Models (LLMs) to maximize
 * **The Architect (The Methodologist & Skill Builder):** A specialized agent dedicated to Standard Operating Procedure (SOP) codification. When the Brain solves a novel or complex engineering task, it calls `commission_architect`. The Architect synthesizes the full workflow (prerequisites, setup commands, code patterns, edge cases, troubleshooting table, and verification checks) into a permanent, reusable `SKILL.md` file saved to `/app/workspace/skills/<skill_name>/`. The Brain dynamically loads and follows these skills via `load_skill`.
 * **The Decider (The Reflex & Snap Judgement):** A specialized, ultra-fast decision-making subagent powered by a local non-autoregressive decision model (e.g., Clef Flash 9B via Ollama's `/v1/systemone` endpoint). While the Adviser provides deep, multi-step strategic reflection, the Decider acts as the Brain's System-1 reflex. It delivers instantaneous single-step rulings—such as categorical selections (`choice`), boolean validity/safety gates (`boolean`/`noul`), or ordinal confidence ratings (`score`)—with sub-second latency and mathematically calibrated probability distributions without consuming large generation budgets.
 * **Universal Sub-Agents (`query_universal_llm`):** The Brain has the ability to dynamically spawn independent LLM sub-agents to delegate isolated tasks, test prompt variations, or request second opinions.
-  * *Preset & Custom Endpoints:* Can pick from pre-configured zero-trust endpoint presets defined in [`llm_config.py`](file:///home/agent/ai_workspace/llm_config.py) (`ollama` on local port 64165, `litellm_proxy` on port 4000 for cloud models via host LiteLLM gateway) or connect to any custom URL. The fallback default is set by `DEFAULT_UNIVERSAL_ENDPOINT = "ollama"`. When routing through `litellm_proxy`, supply bare model IDs (e.g. `google/gemini-2.5-flash`, `anthropic/claude-3.5-sonnet`) without an `openrouter/` prefix.
+  * *Preset & Custom Endpoints:* Can pick from pre-configured zero-trust endpoint presets defined in [`llm_config.py`](file:///home/agent/ai_workspace/llm_config.py) (`ollama` on local port 64165, `litellm_proxy` on port 4000 for cloud models via host LiteLLM gateway) or connect to any custom URL. The fallback default is set by `DEFAULT_UNIVERSAL_ENDPOINT = "ollama"`. When routing through `litellm_proxy`, supply provider-namespaced model IDs matching the proxy's routes: Google directly (`gemini/gemini-2.5-flash`), OpenAI directly (`openai/gpt-4o-mini`), and other providers via OpenRouter (`openrouter/anthropic/claude-3.5-haiku`).
   * *Authentication & Long-Running Timeouts:* Supports inserting custom API keys on the fly and configuring request timeouts up to 1 hour (`timeout_seconds=3600`) for deep reasoning or heavy generation workloads.
   * *Prompt & Setting Tunability:* Supports arbitrary system and user prompts with background context injection (`context_filepaths`), plus full tuning across sampling parameters (`temperature`, `top_p`, `max_tokens`, `reasoning_effort`, `response_format={'type': 'json_object'}`, `presence_penalty`, `frequency_penalty`, `stop`, `seed`, `extra_body`, and `extra_headers`).
   * *Endpoint Introspection:* Includes `action="list_endpoints"` to view pre-configured preset URLs and `action="list_models"` to discover available models on any target server.
@@ -354,24 +354,32 @@ Example (includes option to remove unsupported flags):
           api_base: os.environ/LLM_PLATFORM_API_BASE
           api_key: os.environ/LLM_PLATFORM_API_KEY
 
-      # [3] OpenRouter - Specific Model Example
-      - model_name: google/gemini-3.5-flash
+      # [3] Google Gemini - Direct Universal Access (e.g. gemini/gemini-2.5-flash)
+      - model_name: "gemini/*"
         litellm_params:
-          model: openai/google/gemini-3.5-flash
+          model: "gemini/*"
           # LiteLLM automatically pulls these from your ~/.bashrc exports!
-          api_base: os.environ/OPENROUTER_API_BASE
-          api_key: os.environ/OPENROUTER_API_KEY
+          api_key: os.environ/GEMINI_API_KEY
 
-      # [4] Dynamic Wildcard Passthrough (Allows calling ANY model on OpenRouter!)
-      # Note: Captures bare model IDs (e.g. google/gemini-2.5-flash) and routes to openrouter/*
-      - model_name: "*"
+      # [4] OpenAI - Direct Universal Access (e.g. openai/gpt-4o-mini)
+      - model_name: "openai/*"
+        litellm_params:
+          model: "openai/*"
+          # LiteLLM automatically pulls these from your ~/.bashrc exports!
+          api_key: os.environ/OPENAI_API_KEY
+
+      # [5] OpenRouter - Universal Access for all other models (e.g. openrouter/anthropic/claude-3.5-haiku)
+      - model_name: "openrouter/*"
         litellm_params:
           model: "openrouter/*"
+          # LiteLLM automatically pulls these from your ~/.bashrc exports!
           api_key: os.environ/OPENROUTER_API_KEY
 
 > **Note on Model Naming & Provider Prefixes:**
-> * In `config.yaml`, LiteLLM requires a provider routing prefix in `litellm_params.model` (e.g. `openai/qwen3.8`, `openai/Qwen3.8-Flash-Next-FP8`, `ollama/qwen2.5:latest`) so the proxy knows which API adapter to invoke.
-> * When using wildcard passthrough (`model_name: "*"` with upstream `openrouter/*`), always pass the **bare OpenRouter model ID** (e.g. `google/gemini-2.5-flash`, `anthropic/claude-3.5-sonnet`) without an `openrouter/` prefix. The proxy wildcard automatically prepends the provider prefix.
+> * In `config.yaml`, LiteLLM matches provider-namespaced wildcards (`gemini/*`, `openai/*`, `openrouter/*`). When delegating via `litellm_proxy`, prepend the provider namespace matching the proxy rule:
+>   - **Google Direct:** `gemini/gemini-2.5-flash` (or `gemini/gemini-2.0-flash`) routes directly to Google Gemini using `GEMINI_API_KEY`.
+>   - **OpenAI Direct:** `openai/gpt-4o-mini` routes directly to OpenAI using `OPENAI_API_KEY`.
+>   - **OpenRouter Universal:** `openrouter/anthropic/claude-3.5-haiku` routes all other models via `OPENROUTER_API_KEY`.
 > * In `llm_config.py` (and framework CLI overrides), use only the clean model identifier matching LiteLLM's `model_name` (e.g. `"model": "qwen3.8"`), **without** the `openai/` prefix. The setup script handles this separation automatically.
 
 Run this in your standard WSL2 terminal:
@@ -384,7 +392,8 @@ Add your secret variables like this:
     export DEFAULT_LLM_API_KEY="local-key"
     export LLM_PLATFORM_API_BASE="https://your-hpc-endpoint/v1"
     export LLM_PLATFORM_API_KEY="sk-platform-secret-key"
-    export OPENROUTER_API_BASE="https://openrouter.ai/api/v1"
+    export GEMINI_API_KEY="AIzaSy-your-gemini-key"
+    export OPENAI_API_KEY="sk-proj-your-openai-key"
     export OPENROUTER_API_KEY="sk-or-v1-secret-key"
 
 Add this auto-start script to the bottom of the `.bashrc` file:

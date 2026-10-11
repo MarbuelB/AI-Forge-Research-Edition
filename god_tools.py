@@ -878,8 +878,10 @@ async def query_universal_llm(
                 (e.g. 'http://host.containers.internal:8000/v1' or 'https://api.openai.com/v1').
                 Defaults to DEFAULT_UNIVERSAL_ENDPOINT ('ollama') from llm_config.
     - model: Model identifier (required for 'chat', e.g. from 'list_models').
-             When targeting 'litellm_proxy', use bare model identifiers
-             (e.g. 'google/gemini-2.5-flash', 'anthropic/claude-3.5-sonnet') without an 'openrouter/' prefix.
+             When targeting 'litellm_proxy', prefix with provider namespace matching your proxy
+             routes: Google directly via 'gemini/*' (e.g. 'gemini/gemini-2.5-flash'),
+             OpenAI directly via 'openai/*' (e.g. 'openai/gpt-4o-mini'),
+             or other models via OpenRouter (e.g. 'openrouter/anthropic/claude-3.5-haiku').
     - system_prompt: Custom system instructions/persona (defaults to 'You are a helpful AI assistant.').
     - user_prompt: Main instruction or query payload (required for 'chat').
     - api_key: Custom API key. If omitted, uses the endpoint's configured default or environment key.
@@ -928,11 +930,7 @@ async def query_universal_llm(
 
         target_url, target_key, timeout_val = resolve_universal_endpoint(endpoint, api_key, timeout_seconds)
 
-        # Defensive normalization: strip redundant "openrouter/" prefix if targeting litellm_proxy (:4000)
-        # to prevent proxy double-prefixing ("openrouter/openrouter/...") under wildcard routes
         effective_model = model.strip() if model else ""
-        if (":4000" in target_url or "litellm" in target_url) and effective_model.startswith("openrouter/"):
-            effective_model = effective_model[len("openrouter/"):].strip()
 
         # Extract background context files quietly
         file_environmental_context = gather_agent_context(context_filepaths)
@@ -1046,7 +1044,7 @@ async def execute_rest_call(
     """Dispatches an arbitrary HTTP REST call to any local or remote model or web service.
     
     Arguments:
-    - url: The destination endpoint URL.
+    - url: The destination endpoint URL (e.g. 'http://host.containers.internal:11434/v1/chat/completions' or 'https://api.openai.com/v1/chat/completions').
            Note: 'localhost' or '127.0.0.1' is automatically mapped to 'host.containers.internal' to reach services running on the host machine.
     - method: HTTP method ('POST', 'GET', 'PUT', 'DELETE', 'PATCH'). Defaults to 'POST'.
     - request_filepath: Absolute or workspace path to a JSON file to use as the request body. If specified, this is read from disk.
