@@ -1408,7 +1408,8 @@ async def execute_rest_call(
 async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
     """Executes a bash command STRICTLY inside the sandbox directory. 
     'timeout_seconds' defaults to 180. Increase it up to 600 if you expect a long-running process like a massive download or large database search.
-    Do NOT use destructive commands! Move files to the archive folder instead."""
+    Do NOT use destructive commands! Move files to the archive folder instead.
+    DO NOT use this to author scripts or execute multi-line inline programs (use forge_and_register_plugin instead)."""
     
     # 1. Catch empty inputs or incorrect types immediately
     if not command or not isinstance(command, str):
@@ -1543,6 +1544,26 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
         else:
             logger.info(f"[execute_bash] Success (exit 0): {command[:200]}")
 
+        # Check for inline coding patterns and append soft delegation advisory
+        inline_advisory = ""
+        is_inline_code = (
+            bool(re.search(r'>\s*[^;&|\n]*\.(?:py|js|ts|rs|cpp|c|hpp|h|mjs|cjs)\b', command, re.IGNORECASE)) or
+            bool(re.search(r'\bpython[3]?\s+-\s*<<', command, re.IGNORECASE)) or
+            any(
+                '\n' in code.strip() or len(code.strip()) > 100 or bool(re.search(r'\b(def |class |while |for |with |open\(|lambda )\b', code))
+                for _, code in re.findall(r'\bpython[3]?\s+-c\s+([\'"])(.*?)\1', command, re.DOTALL)
+            ) or
+            any(
+                '\n' in code.strip() or len(code.strip()) > 60
+                for _, code in re.findall(r'\bnode\s+-e\s+([\'"])(.*?)\1', command, re.DOTALL)
+            )
+        )
+        if is_inline_code:
+            inline_advisory = (
+                "\n\n[SYSTEM DELEGATION ADVISORY: You authored or executed an inline script directly in bash. "
+                "For reliability, automated syntax checking, and persistence, delegate script creation and data tasks to the Coder via 'forge_and_register_plugin'.]"
+            )
+
         # --- THE POINTER APPROACH (Context Protection) ---
         if len(output) > 10000:
             # Generate a clean timestamped filename
@@ -1575,9 +1596,9 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
                     f"- To inspect additional tail lines: execute_bash('tail -n 100 /app/workspace/sandbox/{temp_file_name}')\n"
                     f"- To inspect a specific line range: execute_bash('sed -n \\'100,200p\\' /app/workspace/sandbox/{temp_file_name}')\n"
                     f"- To search for specific keywords: execute_bash('grep -n -C 3 \"ERROR\\|Exception\" /app/workspace/sandbox/{temp_file_name}')\n"
-                    f"- To delegate analysis of the entire file: analyze_files(['/app/workspace/sandbox/{temp_file_name}'], 'Find errors ...')]")
+                    f"- To delegate analysis of the entire file: analyze_files(['/app/workspace/sandbox/{temp_file_name}'], 'Find errors ...')]{inline_advisory}")
 
-        return f"Exit Code: {process.returncode}\nOutput:\n{output}"
+        return f"Exit Code: {process.returncode}\nOutput:\n{output}{inline_advisory}"
         
     except Exception as e:
         logger.error(f"[execute_bash] Exception on '{command[:200]}': {str(e)}")
@@ -1631,7 +1652,7 @@ def write_file(filepath: str, content: str, mode: str = "w") -> str:
             if existing_size > 1000 and len(content) < int(existing_size * 0.4):
                 return (f"SYSTEM WARNING: Overwrite blocked to protect data integrity. "
                         f"Existing file is {existing_size} bytes, but incoming content is only {len(content)} bytes ({int(len(content)/existing_size*100)}%). "
-                        f"If you intended to append, call write_file with mode='a'. If you intentionally wish to replace the file with this shorter content, write via execute_bash redirection.")
+                        f"If you intended to append, call write_file with mode='a'. If you intentionally wish to edit or replace sections, use surgical_code_edit.")
 
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             filename = os.path.basename(resolved_path)
