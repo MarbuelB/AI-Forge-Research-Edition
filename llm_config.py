@@ -18,7 +18,7 @@ Profiles can be addressed from:
 #   [2] Qwen 3.6 35B vLLM (Host)     | [3] Qwen 3.6 35B vLLM (Container)
 #   [4] Qwen 3.8 Flash Next (Host)   | [5] Qwen 3.8 Flash Next (Container)
 #   [6] Qwen 3.6 35B test (Container)
-#   [7] Gemini 3.5 Flash (Host)      | [8] Gemini 3.5 Flash (Container)
+#   [7] Gemini 3.8 Flash (Host)      | [8] Gemini 3.8 Flash (Container)
 #   [9] Laguna S 2.1 vLLM (Host)     | [10] Laguna S 2.1 vLLM (Container)
 ACTIVE_BRAIN_PROFILE = 4
 ACTIVE_CODER_PROFILE = 5  # must be reachable from Podman container
@@ -213,12 +213,12 @@ LLM_PROFILES = [
             "seed": None,
         },
     },
-    # [7] OpenRouter - example of Gemini 3.5 Flash - from WSL2
+    # [7] OpenRouter - example of Gemini 3.8 Flash - from WSL2
     {
-        "name": "Gemini 3.5 Flash",
+        "name": "Gemini 3.8 Flash",
         "base_url": "http://localhost:4000/v1",
         "api_key": "sk-sandbox-fake-key",
-        "model": "google/gemini-3.5-flash",
+        "model": "google/gemini-3.8-flash",
         "api_params": {
             "temperature": 1,
             "top_p": 0.95,
@@ -228,12 +228,12 @@ LLM_PROFILES = [
             "max_tokens": 16384,
         },
     },
-    # [8] OpenRouter - example of Gemini 3.5 Flash - from Podman
+    # [8] OpenRouter - example of Gemini 3.8 Flash - from Podman
     {
-        "name": "Gemini 3.5 Flash",
+        "name": "Gemini 3.8 Flash",
         "base_url": "http://host.containers.internal:4000/v1",
         "api_key": "sk-sandbox-fake-key",
-        "model": "google/gemini-3.5-flash",
+        "model": "google/gemini-3.8-flash",
         "api_params": {
             "temperature": 1,
             "top_p": 0.95,

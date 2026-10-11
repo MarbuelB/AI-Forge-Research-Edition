@@ -554,10 +554,10 @@ EOF
     log_step "Configuring Default LLM Endpoint (Out-of-the-Box Setup)..."
     echo -e "Configure your primary LLM endpoint so the framework is fully functional out of the box."
 
-    local llm_name="claude-3.5-haiku"
+    local llm_name="claude-haiku-5.5"
     local llm_base_url="https://openrouter.ai/api/v1"
     local llm_api_key=""
-    local llm_model="openrouter/anthropic/claude-3.5-haiku"
+    local llm_model="openrouter/anthropic/claude-haiku-5.5"
     local provider_choice="1"
     local prompt_user_for_llm=true
 
@@ -571,11 +571,11 @@ EOF
         echo ""
         echo -e "${BOLD}Select your primary default LLM provider:${RESET}"
         echo -e "  [1] ${CYAN}OpenRouter${RESET} (Recommended for CPU & multi-model routing: Claude, Llama 3, DeepSeek, etc.)"
-        echo -e "      Default: Anthropic Claude 3.5 Haiku ('openrouter/anthropic/claude-3.5-haiku')"
+        echo -e "      Default: Anthropic Claude Haiku 5.5 ('openrouter/anthropic/claude-haiku-5.5')"
         echo -e "  [2] ${CYAN}Direct OpenAI${RESET} (api.openai.com)"
-        echo -e "      Default: GPT-4o Mini ('openai/gpt-4o-mini')"
+        echo -e "      Default: GPT-6 Luna ('openai/gpt-6-luna')"
         echo -e "  [3] ${CYAN}Direct Google Gemini${RESET} (generativelanguage.googleapis.com)"
-        echo -e "      Default: Gemini 2.5 Flash ('gemini/gemini-2.5-flash')"
+        echo -e "      Default: Gemini 3.8 Flash ('gemini/gemini-3.8-flash')"
         echo -e "  [4] ${CYAN}Local Ollama / vLLM${RESET} (Self-hosted on localhost)"
         echo -e "      Default: Qwen 2.5 ('ollama/qwen2.5:latest' on http://localhost:11434/v1)"
         echo -e "  [5] ${CYAN}Custom Endpoint${RESET} (Custom OpenAI-compatible base URL / model)"
@@ -584,33 +584,33 @@ EOF
 
         case "$provider_choice" in
             1)
-                llm_name="claude-3.5-haiku"
+                llm_name="claude-haiku-5.5"
                 llm_base_url="https://openrouter.ai/api/v1"
-                llm_model="openrouter/anthropic/claude-3.5-haiku"
+                llm_model="openrouter/anthropic/claude-haiku-5.5"
                 echo ""
                 echo -e "${BOLD}Configuring OpenRouter:${RESET}"
-                prompt_input "  [1/3] Overseer Model Alias" "claude-3.5-haiku" llm_name
-                prompt_input "  [2/3] OpenRouter Upstream Model" "openrouter/anthropic/claude-3.5-haiku" llm_model
+                prompt_input "  [1/3] Overseer Model Alias" "claude-haiku-5.5" llm_name
+                prompt_input "  [2/3] OpenRouter Upstream Model" "openrouter/anthropic/claude-haiku-5.5" llm_model
                 prompt_input "  [3/3] OpenRouter API Key (sk-or-v1-...)" "${OPENROUTER_API_KEY:-sk-or-v1-placeholder}" llm_api_key
                 ;;
             2)
-                llm_name="gpt-4o-mini"
+                llm_name="gpt-6-luna"
                 llm_base_url="https://api.openai.com/v1"
-                llm_model="openai/gpt-4o-mini"
+                llm_model="openai/gpt-6-luna"
                 echo ""
                 echo -e "${BOLD}Configuring Direct OpenAI:${RESET}"
-                prompt_input "  [1/3] Overseer Model Alias" "gpt-4o-mini" llm_name
-                prompt_input "  [2/3] Upstream Model" "openai/gpt-4o-mini" llm_model
+                prompt_input "  [1/3] Overseer Model Alias" "gpt-6-luna" llm_name
+                prompt_input "  [2/3] Upstream Model" "openai/gpt-6-luna" llm_model
                 prompt_input "  [3/3] OpenAI API Key (sk-...)" "${OPENAI_API_KEY:-sk-placeholder}" llm_api_key
                 ;;
             3)
-                llm_name="gemini-2.5-flash"
+                llm_name="gemini-3.8-flash"
                 llm_base_url="https://generativelanguage.googleapis.com/v1beta"
-                llm_model="gemini/gemini-2.5-flash"
+                llm_model="gemini/gemini-3.8-flash"
                 echo ""
                 echo -e "${BOLD}Configuring Direct Google Gemini:${RESET}"
-                prompt_input "  [1/3] Overseer Model Alias" "gemini-2.5-flash" llm_name
-                prompt_input "  [2/3] Upstream Model" "gemini/gemini-2.5-flash" llm_model
+                prompt_input "  [1/3] Overseer Model Alias" "gemini-3.8-flash" llm_name
+                prompt_input "  [2/3] Upstream Model" "gemini/gemini-3.8-flash" llm_model
                 prompt_input "  [3/3] Gemini API Key" "${GEMINI_API_KEY:-AIzaSy-placeholder}" llm_api_key
                 ;;
             4)
@@ -642,25 +642,25 @@ EOF
     else
         # Unattended / non-interactive defaults: check environment variables
         if [ -n "$OPENROUTER_API_KEY" ]; then
-            llm_name="claude-3.5-haiku"
+            llm_name="claude-haiku-5.5"
             llm_base_url="https://openrouter.ai/api/v1"
             llm_api_key="$OPENROUTER_API_KEY"
-            llm_model="openrouter/anthropic/claude-3.5-haiku"
+            llm_model="openrouter/anthropic/claude-haiku-5.5"
         elif [ -n "$OPENAI_API_KEY" ]; then
-            llm_name="gpt-4o-mini"
+            llm_name="gpt-6-luna"
             llm_base_url="https://api.openai.com/v1"
             llm_api_key="$OPENAI_API_KEY"
-            llm_model="openai/gpt-4o-mini"
+            llm_model="openai/gpt-6-luna"
         elif [ -n "$GEMINI_API_KEY" ]; then
-            llm_name="gemini-2.5-flash"
+            llm_name="gemini-3.8-flash"
             llm_base_url="https://generativelanguage.googleapis.com/v1beta"
             llm_api_key="$GEMINI_API_KEY"
-            llm_model="gemini/gemini-2.5-flash"
+            llm_model="gemini/gemini-3.8-flash"
         else
-            llm_name="claude-3.5-haiku"
+            llm_name="claude-haiku-5.5"
             llm_base_url="https://openrouter.ai/api/v1"
             llm_api_key="sk-or-v1-placeholder"
-            llm_model="openrouter/anthropic/claude-3.5-haiku"
+            llm_model="openrouter/anthropic/claude-haiku-5.5"
         fi
     fi
 
@@ -735,9 +735,9 @@ model_list:
       api_key: os.environ/OPENROUTER_API_KEY
 
   # Example curated alias for latest Claude Haiku via OpenRouter:
-  - model_name: "claude-3.5-haiku"
+  - model_name: "claude-haiku-5.5"
     litellm_params:
-      model: "openrouter/anthropic/claude-3.5-haiku"
+      model: "openrouter/anthropic/claude-haiku-5.5"
       api_key: os.environ/OPENROUTER_API_KEY
 
   # ============================================================================
@@ -749,9 +749,9 @@ model_list:
       api_key: os.environ/GEMINI_API_KEY
 
   # Example curated alias for latest Google Flash direct:
-  - model_name: "gemini-2.5-flash"
+  - model_name: "gemini-3.8-flash"
     litellm_params:
-      model: "gemini/gemini-2.5-flash"
+      model: "gemini/gemini-3.8-flash"
       api_key: os.environ/GEMINI_API_KEY
 
   # ============================================================================
@@ -763,9 +763,9 @@ model_list:
       api_key: os.environ/OPENAI_API_KEY
 
   # Example curated alias for OpenAI's latest cost-efficient model:
-  - model_name: "gpt-4o-mini"
+  - model_name: "gpt-6-luna"
     litellm_params:
-      model: "openai/gpt-4o-mini"
+      model: "openai/gpt-6-luna"
       api_key: os.environ/OPENAI_API_KEY
 EOF
         log_done "Generated $PROXY_DIR/config.yaml with default model '${clean_model_name}' (upstream: '${litellm_upstream_model}')."

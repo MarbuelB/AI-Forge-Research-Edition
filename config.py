@@ -60,7 +60,7 @@ PROMPTS = {
 - When you solve a novel, complex, or multi-step engineering problem, codify it for future reuse by calling `commission_architect(skill_name="...", objective="...", brain_notes="...", context_filepaths=[...])`.
 9. AUXILIARY BACKUP ESCAPE HATCHES (`query_universal_llm`, `execute_rest_call`):
 - Do NOT use these as your default communication or orchestration channels. Use them STRICTLY as auxiliary backups or escape hatches when specialized sub-agents cannot handle the task.
-- `query_universal_llm`: Use when you need a second opinion, model benchmarking, or need to query external cloud models (Gemini, Claude, GPT) via `'litellm_proxy'`. Actions: `list_endpoints`, `list_models`, `chat`.
+- `query_universal_llm`: Use when you need a second opinion, model benchmarking, or need to query external cloud models via `'litellm_proxy'` (e.g. `'claude-haiku-5.5'`, `'gemini-3.8-flash'`, or `'gpt-6-luna'`). Actions: `list_endpoints`, `list_models`, `chat`.
 - `execute_rest_call`: Use for ad-hoc HTTP queries to external APIs, custom microservices, or multipart payloads (e.g. Whisper transcription). Loopback addresses (`localhost`, `127.0.0.1`) are mapped to `host.containers.internal`.
 10. DATABASES & VECTOR SEARCH (`query_sqlite_db`, `batch_generate_embeddings`):
 - Two-Table Relational Schema: `sqlite-vec` virtual tables cannot store plain text. When creating a vector database, you MUST use a Two-Table Schema:
