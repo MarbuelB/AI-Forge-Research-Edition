@@ -442,6 +442,7 @@ def log_event(role, content, usage=None, thinking=None, text_color=None, hide_co
             reasoning_str = f" (~{r_tokens} thinking)"
         file_msg += f"[Tokens: {usage.prompt_tokens} in | {usage.completion_tokens} out{reasoning_str}]\n"
         
+    file_msg = file_msg.replace("\x00", "")
     with open(LOG_FILE, "a", encoding="utf-8") as f: 
         f.write(file_msg)
 
@@ -1793,7 +1794,7 @@ async def run_chat():
                                                     print(f"--- {content_label} ---\n{agent_content}\n")
 
                                             with open(LOG_FILE, "a", encoding="utf-8") as f:
-                                                f.write(log_text)
+                                                f.write(log_text.replace("\x00", ""))
 
                                     out_color = COLOR_ORANGE if name in ["forge_and_register_plugin", "compress_and_store_context", "commission_architect", "consult_adviser", "fast_decision", "query_universal_llm", "analyze_files", "execute_rest_call"] else COLOR_DARK_GREEN
                                     
@@ -1834,7 +1835,7 @@ async def run_chat():
                                 # --- ESCALATING LOOP DETECTION (CHECK) ---
                                 consecutive_tool_chains += 1
 
-                                if consecutive_tool_chains >= 1000:
+                                if consecutive_tool_chains >= 300:
                                     # Hard Stop: Protect the API limits
                                     halt_msg = f"[SYSTEM METRIC: You have executed {consecutive_tool_chains} consecutive tool chains. For safety and observability, you MUST STOP using tools now. Summarize your progress and ask the user for permission to continue.]"
                                     messages = load_history()
@@ -1845,7 +1846,7 @@ async def run_chat():
                                     log_event("SYSTEM", halt_msg)
                                     consecutive_tool_chains = 0
                                 
-                                elif consecutive_tool_chains > 0 and consecutive_tool_chains % 300 == 0:
+                                elif consecutive_tool_chains > 0 and consecutive_tool_chains % 100 == 0:
                                     messages = load_history()
                                     # Sweep old soft-pauses before saving so they never accumulate
                                     messages = [msg for msg in messages if not (msg.get("role") == "user" and "[SYSTEM METRIC: You have executed" in str(msg.get("content")))]
