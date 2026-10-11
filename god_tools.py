@@ -22,6 +22,7 @@ import socket
 import ipaddress
 import time
 import httpx
+from typing import Any, Optional, Union, Dict, List
 from datetime import datetime
 from openai import AsyncOpenAI
 from playwright.async_api import async_playwright
@@ -120,13 +121,6 @@ if architect_profile.get("base_url"):
 else:
     architect_client = AsyncOpenAI(api_key=architect_profile["api_key"], timeout=180.0)
     
-# --- Initialize Universal Client ---
-uni_config = config.UNIVERSAL_LLM_CONFIG
-universal_client = AsyncOpenAI(
-    base_url=uni_config["base_url"], 
-    api_key=uni_config["api_key"], 
-    timeout=uni_config["timeout"]
-)
 
 # --- Initialize Embedding Client ---
 emb_config = config.EMBEDDING_CONFIG
@@ -809,27 +803,21 @@ async def fast_decision(
 def resolve_universal_endpoint(endpoint_name_or_url: str = None, api_key: str = None, timeout_seconds: float = 300.0) -> tuple[str, str, float]:
     """Resolves an endpoint name or URL to a concrete base_url, API key, and clamped timeout."""
     presets = getattr(config, "UNIVERSAL_ENDPOINTS", {})
-    default_cfg = getattr(config, "UNIVERSAL_LLM_CONFIG", {})
+    default_name = getattr(config, "DEFAULT_UNIVERSAL_ENDPOINT", "ollama")
     
     target_url = None
     target_key = api_key
     
     if not endpoint_name_or_url:
-        default_name = default_cfg.get("default_endpoint", "ollama")
-        if default_name in presets:
-            preset = presets[default_name]
-            target_url = preset.get("url")
-            if not target_key:
-                target_key = preset.get("default_api_key")
-        if not target_url:
-            target_url = default_cfg.get("base_url", "http://host.containers.internal:64165/v1")
+        preset = presets.get(default_name) or presets.get("ollama", {})
+        target_url = preset.get("url", "http://host.containers.internal:64165/v1")
         if not target_key:
-            target_key = default_cfg.get("api_key", "Ollama")
+            target_key = preset.get("default_api_key", "Ollama")
     elif endpoint_name_or_url in presets:
         preset = presets[endpoint_name_or_url]
         target_url = preset.get("url")
         if not target_key:
-            target_key = preset.get("default_api_key") or default_cfg.get("api_key", "sk-sandbox-fake-key")
+            target_key = preset.get("default_api_key", "sk-sandbox-fake-key")
     else:
         # Treat as custom URL
         raw_url = endpoint_name_or_url.strip()
@@ -909,8 +897,7 @@ async def query_universal_llm(
     """
     if action == "list_endpoints":
         presets = getattr(config, "UNIVERSAL_ENDPOINTS", {})
-        default_cfg = getattr(config, "UNIVERSAL_LLM_CONFIG", {})
-        default_name = default_cfg.get("default_endpoint", "ollama")
+        default_name = getattr(config, "DEFAULT_UNIVERSAL_ENDPOINT", "ollama")
         lines = ["--- PRE-CONFIGURED UNIVERSAL LLM ENDPOINTS ---"]
         for ep_name, ep_data in presets.items():
             mark = " (DEFAULT)" if ep_name == default_name else ""
