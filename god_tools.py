@@ -1046,7 +1046,7 @@ async def execute_rest_call(
     """Dispatches an arbitrary HTTP REST call to any local or remote model or web service.
     
     Arguments:
-    - url: The destination endpoint URL (e.g. 'http://host.containers.internal:11434/v1/chat/completions' or 'https://api.openai.com/v1/chat/completions').
+    - url: The destination endpoint URL.
            Note: 'localhost' or '127.0.0.1' is automatically mapped to 'host.containers.internal' to reach services running on the host machine.
     - method: HTTP method ('POST', 'GET', 'PUT', 'DELETE', 'PATCH'). Defaults to 'POST'.
     - request_filepath: Absolute or workspace path to a JSON file to use as the request body. If specified, this is read from disk.
