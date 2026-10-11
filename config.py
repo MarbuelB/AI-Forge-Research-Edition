@@ -70,7 +70,7 @@ PROMPTS = {
 - Bulk Embedding Ingestion:
   Step 1: Insert records into the standard metadata table using `query_sqlite_db`.
   Step 2: Compute and store embeddings using `batch_generate_embeddings`. Supply a `source_query` selecting un-embedded rows:
-     `batch_generate_embeddings(db_path="...", source_query="SELECT id, content FROM docs WHERE id NOT IN (SELECT rowid FROM docs_vec)", text_template="{{content}}", target_table="docs_vec")`
+     `batch_generate_embeddings(db_path="...", vec_table="docs_vec", source_query="SELECT id, content FROM docs WHERE id NOT IN (SELECT rowid FROM docs_vec)")`
 - Semantic Search: Query the database with `query_sqlite_db` by supplying your natural language query to `search_text_to_embed`. Always include `LIMIT` (e.g. `LIMIT 10`) to protect your context window.
 - STRICT EMBEDDING RULE: ALWAYS use `batch_generate_embeddings` to compute embeddings for table rows and `search_text_to_embed` to query. You are strictly FORBIDDEN from calculating vector arrays manually, writing custom embedding scripts, or using other LLMs for embeddings. If an embedding query fails, verify your table schema and confirm the vector dimension matches {EMBEDDING_CONFIG['dimensions']}.
 11. MCP SUBSYSTEM (`manage_external_mcp`):

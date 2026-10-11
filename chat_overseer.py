@@ -103,7 +103,10 @@ cli_args = parser.parse_args()
 # Apply Overrides BEFORE any LLM clients initialize
 if cli_args.format: config.FORMAT_MODE = cli_args.format
 if cli_args.verbosity: config.VERBOSITY_MODE = cli_args.verbosity
-if cli_args.session: config.SESSION_ID = cli_args.session
+if cli_args.session:
+    if not re.fullmatch(r"^[A-Za-z0-9._-]{1,64}$", cli_args.session):
+        parser.error(f"Invalid session ID '{cli_args.session}'. Must be 1-64 characters matching [A-Za-z0-9._-].")
+    config.SESSION_ID = cli_args.session
 if cli_args.brain is not None: config.ACTIVE_BRAIN_PROFILE = cli_args.brain
 if cli_args.coder is not None: config.ACTIVE_CODER_PROFILE = cli_args.coder
 if cli_args.summarizer is not None: config.ACTIVE_SUMMARIZER_PROFILE = cli_args.summarizer
@@ -487,8 +490,8 @@ def cleanup_container():
         if config.VERBOSITY_MODE != "silent":
             print(f"\n{COLOR_CYAN}[SYSTEM] Tearing down container {active_container_name}...{COLOR_RESET}")
         subprocess.run(
-            f"podman rm -f {active_container_name}", 
-            shell=True, 
+            ["podman", "rm", "-f", "--ignore", active_container_name],
+            check=False,
             stderr=subprocess.DEVNULL, 
             stdout=subprocess.DEVNULL
         )
@@ -541,8 +544,8 @@ async def run_chat():
             print(f"{COLOR_CYAN}[SYSTEM] Sweeping stale Podman state...{COLOR_RESET}")
 
         subprocess.run(
-            f"podman rm -f --ignore {active_container_name}",
-            shell=True, 
+            ["podman", "rm", "-f", "--ignore", active_container_name],
+            check=False,
             stderr=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL
         )
@@ -955,7 +958,7 @@ async def run_chat():
                                 cfg = copy.deepcopy(mcp_config.EXTERNAL_MCP_SERVERS[server_name])
                                 if m_args.get("address"):
                                     raw_addr = m_args["address"]
-                                    for h_alias in ["host.wsl.internal", "host.containers.internal", "host.docker.internal", "host"]:
+                                    for h_alias in ["{HOST_IP}", "{host}", "{HOST}", "host.wsl.internal", "host.containers.internal", "host.docker.internal", "host"]:
                                         raw_addr = raw_addr.replace(h_alias, mcp_config.HOST_IP)
                                     cfg["url"] = raw_addr
                                 if m_args.get("prefix"):
@@ -993,7 +996,7 @@ async def run_chat():
                                     if not address:
                                         return f"SYSTEM ERROR: Unknown server '{server_name}' in mcp_config. To connect a universal custom SSE MCP, provide 'address' (e.g. 'http://host:9000/sse')."
                                     raw_addr = address
-                                    for h_alias in ["host.wsl.internal", "host.containers.internal", "host.docker.internal", "host"]:
+                                    for h_alias in ["{HOST_IP}", "{host}", "{HOST}", "host.wsl.internal", "host.containers.internal", "host.docker.internal", "host"]:
                                         raw_addr = raw_addr.replace(h_alias, mcp_config.HOST_IP)
                                     cfg = {
                                         "name": server_name,

@@ -895,7 +895,17 @@ async def fast_decision(
             conf = q_res.get("confidence", 0.0)
             legend = q_res.get("legend", {})
             probs = q_res.get("probabilities", {})
-            output_lines.append(f"- **Question [{q_name}] Rating:** `{score_val:.2f}` (Confidence: {conf:.1%})")
+            argmax_level = None
+            if probs:
+                try:
+                    argmax_level = max(probs.items(), key=lambda x: x[1])[0]
+                except Exception:
+                    pass
+            label_suffix = ""
+            if argmax_level is not None:
+                level_name = legend.get(argmax_level, f"Level {argmax_level}") if legend else f"Level {argmax_level}"
+                label_suffix = f" → **[{level_name}]**"
+            output_lines.append(f"- **Question [{q_name}] Rating:** `{score_val:.2f}`{label_suffix} (Confidence: {conf:.1%})")
             if legend and probs:
                 prob_parts = [f"Level {lvl} ({legend.get(lvl, lvl)}): {prob:.1%}" for lvl, prob in probs.items()]
                 output_lines.append(f"  *Levels:* {', '.join(prob_parts)}")
@@ -1539,9 +1549,10 @@ def write_file(filepath: str, content: str, mode: str = "w") -> str:
     IMPORTANT: For any source code files (Python, JS, TS, Rust, C++), you MUST use forge_and_register_plugin!
     """
     
+    filepath = filepath.strip() if filepath else ""
     # Enforces code containment by routing all source code modifications through the syntax checking pipeline
     forbidden_extensions = (".py", ".js", ".ts", ".rs", ".cpp", ".c", ".hpp", ".h", ".cc", ".cxx", ".mjs", ".cjs")
-    if filepath.strip().lower().endswith(forbidden_extensions):
+    if filepath.lower().endswith(forbidden_extensions):
         logger.warning(f"[write_file] Blocked direct write to forbidden source extension: '{filepath}'")
         return f"SYSTEM ERROR: You are strictly FORBIDDEN from using write_file to create source code scripts directly. You MUST use 'forge_and_register_plugin' with the appropriate 'language' parameter so the Coder agent can generate and validate it safely."
 
@@ -2234,6 +2245,7 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
     - filepath: Absolute path to the file to modify.
     - edit_objective: Clear instruction on what needs to be changed, added, or fixed.
     """
+    filepath = filepath.strip() if filepath else ""
     real_target = os.path.realpath(filepath)
     if not os.path.exists(real_target):
         return f"SYSTEM ERROR: Target file '{filepath}' does not exist."
@@ -2665,7 +2677,13 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, sea
 
 
 @mcp.tool()
-async def batch_generate_embeddings(db_path: str, vec_table: str, source_query: str) -> str:
+async def batch_generate_embeddings(
+    db_path: str,
+    vec_table: Optional[str] = None,
+    source_query: Optional[str] = None,
+    target_table: Optional[str] = None,
+    text_template: Optional[str] = None
+) -> str:
     """
     Generates vector embeddings in bulk natively from the database and inserts them into a vec0 virtual table.
     This completely bypasses the context window!
@@ -2674,8 +2692,15 @@ async def batch_generate_embeddings(db_path: str, vec_table: str, source_query: 
     2. The text string to be embedded.
     Example: "SELECT id, description FROM tools WHERE id NOT IN (SELECT rowid FROM tools_vec)"
     """
+    effective_vec_table = (vec_table or target_table or "").strip()
+    if not effective_vec_table:
+        return "SYSTEM ERROR: 'vec_table' (or 'target_table') must be specified."
+
+    if not source_query or not source_query.strip():
+        return "SYSTEM ERROR: 'source_query' must be provided."
+
     # HARDENING: Validate table names to prevent SQL injection compilation tricks
-    if not re.match(r'^[a-zA-Z0-9_]+$', vec_table):
+    if not re.match(r'^[a-zA-Z0-9_]+$', effective_vec_table):
         return "SYSTEM ERROR: Invalid characters detected in table name parameters."
     
     # Validate database path is inside workspace
@@ -2736,17 +2761,17 @@ async def batch_generate_embeddings(db_path: str, vec_table: str, source_query: 
                 embedding_vector = response.data[i].embedding
                 vector_blob = array.array('f', embedding_vector).tobytes()
                 try:
-                    cursor.execute(f"INSERT INTO {vec_table}(rowid, embedding) VALUES (?, ?)", (rowid, vector_blob))
+                    cursor.execute(f"INSERT INTO {effective_vec_table}(rowid, embedding) VALUES (?, ?)", (rowid, vector_blob))
                 except (sqlite3.IntegrityError, sqlite3.OperationalError) as insert_err:
                     if "UNIQUE constraint failed" in str(insert_err):
-                        cursor.execute(f"UPDATE {vec_table} SET embedding = ? WHERE rowid = ?", (vector_blob, rowid))
+                        cursor.execute(f"UPDATE {effective_vec_table} SET embedding = ? WHERE rowid = ?", (vector_blob, rowid))
                     else:
                         raise insert_err
                 inserted_count += 1
 
         config.log_token_usage(STATE_DIR, "embedding", total_tokens_in, 0, 0)
         conn.commit()
-        return f"SUCCESS: Natively extracted and embedded {inserted_count} rows into '{vec_table}'."
+        return f"SUCCESS: Natively extracted and embedded {inserted_count} rows into '{effective_vec_table}'."
         
     except Exception as e:
         return f"SYSTEM ERROR: Batch Embedding Failed. {str(e)}"
@@ -3038,11 +3063,12 @@ async def analyze_files(
         
         available_text_tokens = max(10000, safe_budget - 5000)
         total_char_budget = int(available_text_tokens * 3.2)  # Conservative 3.2 chars/token
-        num_text_files = max(1, len([f for f in filepaths if os.path.exists(f) and not os.path.isdir(f) and not (mimetypes.guess_type(f)[0] and (mimetypes.guess_type(f)[0].startswith('image/') or mimetypes.guess_type(f)[0].startswith('audio/') or mimetypes.guess_type(f)[0].startswith('video/') or mimetypes.guess_type(f)[0] == 'application/pdf'))]))
+        num_text_files = max(1, len([f for f in filepaths if os.path.exists(f) and not os.path.isdir(f) and not (mimetypes.guess_type(f)[0] and (mimetypes.guess_type(f)[0].startswith('image/') or mimetypes.guess_type(f)[0].startswith('audio/') or mimetypes.guess_type(f)[0].startswith('video/')))]))
         allocated_chars = max(40000, min(280000, total_char_budget // num_text_files))
         effective_max_chars = max_chars if (max_chars and max_chars > 0) else allocated_chars
 
-        for filepath in filepaths:
+        for raw_path in filepaths:
+            filepath = raw_path.strip() if isinstance(raw_path, str) else str(raw_path)
             if not os.path.exists(filepath):
                 user_content.append({"type": "text", "text": f"\n[ERROR: File '{filepath}' does not exist.]"})
                 continue
@@ -3053,39 +3079,172 @@ async def analyze_files(
 
             mime_type, _ = mimetypes.guess_type(filepath)
             mime_str = (mime_type or "").lower()
-            is_image = mime_str.startswith('image/')
-            is_audio = mime_str.startswith('audio/')
-            is_video = mime_str.startswith('video/')
-            is_pdf = mime_str == 'application/pdf'
+            is_image = mime_str.startswith('image/') or filepath.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'))
+            is_audio = mime_str.startswith('audio/') or filepath.lower().endswith(('.wav', '.mp3', '.m4a', '.ogg', '.flac', '.aac'))
+            is_video = mime_str.startswith('video/') or filepath.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm'))
+            is_pdf = mime_str == 'application/pdf' or filepath.lower().endswith('.pdf')
             
             filename = os.path.basename(filepath)
-            
-            if is_image or is_audio or is_video or is_pdf:
-                # --- MULTIMODAL SENSORY PIPELINE ---
-                file_size = os.path.getsize(filepath)
-                max_media_size = 25 * 1024 * 1024 if (is_audio or is_video or is_pdf) else 10 * 1024 * 1024
+            file_size = os.path.getsize(filepath)
+
+            if is_image:
+                # --- IMAGE PIPELINE ---
+                max_media_size = 10 * 1024 * 1024
                 if file_size > max_media_size:
-                    user_content.append({"type": "text", "text": f"\n[ERROR: Media '{filename}' is too massive ({file_size / (1024*1024):.1f} MB) for the multimodal API. Max size is {max_media_size // (1024*1024)} MB.]"})
+                    user_content.append({"type": "text", "text": f"\n[ERROR: Image '{filename}' is too massive ({file_size / (1024*1024):.1f} MB). Max size is 10 MB.]"})
                     continue
                 with open(filepath, "rb") as mf:
                     b64_data = base64.b64encode(mf.read()).decode('utf-8')
+                actual_mime = mime_str if mime_str.startswith('image/') else "image/png"
+                user_content.append({"type": "text", "text": f"\n--- IMAGE: {filename} ---"})
+                user_content.append({"type": "image_url", "image_url": {"url": f"data:{actual_mime};base64,{b64_data}"}})
+
+            elif is_video:
+                # --- VIDEO PIPELINE (Sample keyframe via ffmpeg) ---
+                thumb_path = os.path.join(SANDBOX_DIR, f".thumb_{filename}.jpg")
+                video_meta = ""
+                try:
+                    probe = subprocess.run(
+                        ["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_name,width,height", "-of", "default=noprint_wrappers=1", filepath],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10
+                    )
+                    if probe.returncode == 0 and probe.stdout.strip():
+                        video_meta = f"Metadata: {probe.stdout.strip().replace(chr(10), ', ')}"
+                except Exception:
+                    pass
+
+                try:
+                    os.makedirs(SANDBOX_DIR, exist_ok=True)
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-ss", "00:00:01", "-i", filepath, "-vframes", "1", "-q:v", "2", thumb_path],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20
+                    )
+                except Exception:
+                    pass
+
+                if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+                    with open(thumb_path, "rb") as tf:
+                        b64_thumb = base64.b64encode(tf.read()).decode('utf-8')
+                    header = f"\n--- VIDEO: {filename} (Keyframe sampled at 1s via ffmpeg) ---"
+                    if video_meta:
+                        header += f"\n[{video_meta}]"
+                    user_content.append({"type": "text", "text": header})
+                    user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_thumb}"}})
+                else:
+                    user_content.append({
+                        "type": "text",
+                        "text": f"\n--- VIDEO: {filename} ({file_size:,} bytes) ---\n[NOTICE: Video file detected. {video_meta} No image keyframe could be extracted.]"
+                    })
+
+            elif is_audio:
+                # --- AUDIO PIPELINE (Metadata + Whisper transcription routing notice) ---
+                audio_meta = ""
+                try:
+                    probe = subprocess.run(
+                        ["ffprobe", "-v", "error", "-show_entries", "format=duration,bit_rate:stream=codec_name,channels,sample_rate", "-of", "default=noprint_wrappers=1", filepath],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10
+                    )
+                    if probe.returncode == 0 and probe.stdout.strip():
+                        audio_meta = f"Metadata: {probe.stdout.strip().replace(chr(10), ', ')}"
+                except Exception:
+                    pass
+                user_content.append({
+                    "type": "text",
+                    "text": (
+                        f"\n--- AUDIO FILE: {filename} ({file_size:,} bytes) ---\n"
+                        f"[NOTICE: Raw audio waveforms cannot be directly ingested by LLM vision endpoints. {audio_meta}\n"
+                        f"To transcribe audio content, use `execute_rest_call` against Whisper at `/v1/audio/transcriptions` (e.g. via `files={{'file': '{filepath}'}}`) or run an in-container transcription script.]\n"
+                    )
+                })
+
+            elif is_pdf:
+                # --- PDF PIPELINE (Auto-extract text via pdftotext / pypdf) ---
+                extracted_txt_path = os.path.join(SANDBOX_DIR, f".extracted_{filename}.txt")
+                extracted_text = ""
+                try:
+                    res = subprocess.run(["pdftotext", filepath, "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+                    if res.returncode == 0 and res.stdout.strip():
+                        extracted_text = res.stdout
+                except Exception:
+                    pass
+
+                if not extracted_text:
+                    try:
+                        import pypdf
+                        reader = pypdf.PdfReader(filepath)
+                        pages_text = [page.extract_text() or "" for page in reader.pages]
+                        extracted_text = "\n\n".join(pages_text).strip()
+                    except Exception:
+                        pass
+
+                if not extracted_text:
+                    try:
+                        import PyPDF2
+                        reader = PyPDF2.PdfReader(filepath)
+                        pages_text = [page.extract_text() or "" for page in reader.pages]
+                        extracted_text = "\n\n".join(pages_text).strip()
+                    except Exception:
+                        pass
+
+                if not extracted_text:
+                    user_content.append({
+                        "type": "text",
+                        "text": f"\n--- PDF DOCUMENT: {filename} ({file_size:,} bytes) ---\n[SYSTEM NOTICE: No extractable text found in '{filename}'. It may be a scanned image or empty. To inspect scanned documents, extract pages as images or run OCR.]\n"
+                    })
+                    continue
+
+                os.makedirs(SANDBOX_DIR, exist_ok=True)
+                with open(extracted_txt_path, "w", encoding="utf-8") as pf:
+                    pf.write(extracted_text)
+
+                target_text_file = extracted_txt_path
+                eff_file_size = len(extracted_text)
                 
-                if is_image:
-                    user_content.append({"type": "text", "text": f"\n--- IMAGE: {filename} ---"})
-                    user_content.append({"type": "image_url", "image_url": {"url": f"data:{mime_str};base64,{b64_data}"}})
-                elif is_audio:
-                    fmt = "wav" if "wav" in mime_str else ("mp3" if "mp3" in mime_str or "mpeg" in mime_str else "wav")
-                    user_content.append({"type": "text", "text": f"\n--- AUDIO: {filename} ({fmt}) ---"})
-                    user_content.append({"type": "input_audio", "input_audio": {"data": b64_data, "format": fmt}})
-                elif is_video:
-                    user_content.append({"type": "text", "text": f"\n--- VIDEO: {filename} ---"})
-                    user_content.append({"type": "image_url", "image_url": {"url": f"data:{mime_str};base64,{b64_data}"}})
-                elif is_pdf:
-                    user_content.append({"type": "text", "text": f"\n--- DOCUMENT PDF: {filename} ---"})
-                    user_content.append({"type": "image_url", "image_url": {"url": f"data:application/pdf;base64,{b64_data}"}})
+                if filter_pattern:
+                    content, total_matches, included_matches, total_lines, is_partial = filter_file_lines(
+                        target_text_file, filter_pattern, context_lines=context_lines, max_chars=effective_max_chars
+                    )
+                    if is_partial:
+                        pct = max(1, int((included_matches / total_matches) * 100)) if total_matches > 0 else 100
+                        truncated_files_info.append(
+                            f"'{filename}' (PDF) [FILTER: '{filter_pattern}'] ({included_matches} of {total_matches} matches, {len(content):,} chars, {pct}%)"
+                        )
+                        coverage_header = (
+                            f"[FILTERED EXTRACTION FROM PDF: Pattern '{filter_pattern}' matched {total_matches} occurrences across {total_lines:,} total lines.\n"
+                            f"INCLUDED IN THIS WINDOW: First {included_matches} matches ({len(content):,} chars, {pct}% coverage). Remaining {total_matches - included_matches} matches were omitted to protect context window limits.\n"
+                            f"MANDATORY INSTRUCTION FOR ANALYST:\n"
+                            f"- State this filtered coverage explicitly in your executive summary.\n"
+                            f"- Do NOT assume what occurred in the omitted matches.]\n"
+                        )
+                    else:
+                        coverage_header = (
+                            f"[FILTERED EXTRACTION FROM PDF: Pattern '{filter_pattern}' matched {total_matches} occurrences across {total_lines:,} total lines (100% of matches included, {len(content):,} chars).\n"
+                            f"Note: Only lines matching the filter and their context (±{context_lines} lines) are displayed. Matching lines are prefixed with '>>>'.]\n"
+                        )
+                    content = coverage_header + content
+                    user_content.append({"type": "text", "text": f"\n--- PDF DOCUMENT (FILTERED TEXT): {filename} ---\n{content}\n"})
+                else:
+                    content, start_idx, end_idx, total_lines, is_partial = read_file_slice(
+                        target_text_file, start_line=start_line, max_lines=max_lines, tail_mode=tail_mode, max_chars=effective_max_chars
+                    )
+                    if is_partial:
+                        pct = max(1, int((len(content) / eff_file_size) * 100)) if eff_file_size > 0 else 100
+                        truncated_files_info.append(f"'{filename}' (PDF) (read lines {start_idx}–{end_idx} of {total_lines:,}, {len(content):,}/{eff_file_size:,} chars, {pct}%)")
+                        unread_desc = f"lines 1–{max(1, start_idx - 1):,}" if tail_mode else f"lines {end_idx + 1}–{total_lines:,}"
+                        coverage_header = (
+                            f"[COVERAGE BOUNDARY: Read lines {start_idx} to {end_idx} of {total_lines:,} total lines "
+                            f"({len(content):,} of {eff_file_size:,} chars, {pct}% coverage). "
+                            f"Lines outside this window were omitted to protect context window limits.\n"
+                            f"MANDATORY INSTRUCTION FOR ANALYST:\n"
+                            f"- State this crop/coverage explicitly in your executive summary.\n"
+                            f"- Do NOT assume, extrapolate, or hallucinate events or errors in unread lines ({unread_desc}).]\n"
+                        )
+                        content = coverage_header + content + f"\n... [END OF INGESTED SLICE (lines {start_idx}–{end_idx} of {total_lines:,})] ..."
+
+                    user_content.append({"type": "text", "text": f"\n--- PDF DOCUMENT (EXTRACTED TEXT): {filename} ---\n{content}\n"})
+
             else:
                 # --- TEXT PIPELINE ---
-                file_size = os.path.getsize(filepath)
                 if file_size == 0:
                     user_content.append({"type": "text", "text": f"\n--- TEXT FILE: {filename} (EMPTY - 0 bytes) ---\n[This file is currently 0 bytes / empty. No data has been written to it.]\n"})
                     continue
@@ -3122,6 +3281,7 @@ async def analyze_files(
                     if is_partial:
                         pct = max(1, int((len(content) / file_size) * 100)) if file_size > 0 else 100
                         truncated_files_info.append(f"'{filename}' (read lines {start_idx}–{end_idx} of {total_lines:,}, {len(content):,}/{file_size:,} chars, {pct}%)")
+                        unread_desc = f"lines 1–{max(1, start_idx - 1):,}" if tail_mode else f"lines {end_idx + 1}–{total_lines:,}"
                         
                         coverage_header = (
                             f"[COVERAGE BOUNDARY: Read lines {start_idx} to {end_idx} of {total_lines:,} total lines "
@@ -3129,7 +3289,7 @@ async def analyze_files(
                             f"Lines outside this window were omitted to protect context window limits.\n"
                             f"MANDATORY INSTRUCTION FOR ANALYST:\n"
                             f"- State this crop/coverage explicitly in your executive summary.\n"
-                            f"- Do NOT assume, extrapolate, or hallucinate events or errors in unread lines (lines {end_idx + 1}–{total_lines:,}).\n"
+                            f"- Do NOT assume, extrapolate, or hallucinate events or errors in unread lines ({unread_desc}).\n"
                             f"- If your analysis requires inspecting unread parts of this file, explicitly advise the Brain in your next steps to retrieve subsequent chunks (e.g. `analyze_files(..., start_line={end_idx + 1})`), inspect the tail (`tail_mode=True`), or apply a targeted filter (`filter_pattern='...'`).]\n"
                         )
                         content = coverage_header + content + f"\n... [END OF INGESTED SLICE (lines {start_idx}–{end_idx} of {total_lines:,})] ..."
