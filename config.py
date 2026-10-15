@@ -386,3 +386,114 @@ def get_totals_diff(before, after):
             }
     return diff
 
+
+# --- TOOL USAGE TRACKING UTILITIES ---
+def log_tool_usage(state_dir, tool_name, caller="brain", duration_seconds=0.0, is_error=False):
+    """Logs tool usage metrics to a shared state file."""
+    import json
+    import os
+    import time
+    from datetime import datetime
+
+    file_path = os.path.join(state_dir, "tool_usage.json")
+    os.makedirs(state_dir, exist_ok=True)
+
+    lock_file = f"{file_path}.lock"
+    acquired = False
+    for _ in range(100):
+        try:
+            fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            acquired = True
+            break
+        except FileExistsError:
+            try:
+                mtime = os.path.getmtime(lock_file)
+                if time.time() - mtime > 10.0:
+                    try:
+                        os.remove(lock_file)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            time.sleep(0.1)
+
+    try:
+        data = {}
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                pass
+
+        if "totals" not in data:
+            data["totals"] = {
+                "total_calls": 0,
+                "by_tool": {},
+                "by_caller": {},
+                "total_duration": 0.0,
+                "errors": 0
+            }
+        if "history" not in data:
+            data["history"] = []
+
+        totals = data["totals"]
+        totals["total_calls"] = totals.get("total_calls", 0) + 1
+
+        if "by_tool" not in totals:
+            totals["by_tool"] = {}
+        totals["by_tool"][tool_name] = totals["by_tool"].get(tool_name, 0) + 1
+
+        if "by_caller" not in totals:
+            totals["by_caller"] = {}
+        totals["by_caller"][caller] = totals["by_caller"].get(caller, 0) + 1
+
+        totals["total_duration"] = round(totals.get("total_duration", 0.0) + duration_seconds, 3)
+        if is_error:
+            totals["errors"] = totals.get("errors", 0) + 1
+
+        data["history"].append({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "tool": tool_name,
+            "caller": caller,
+            "duration": round(duration_seconds, 3),
+            "is_error": is_error
+        })
+
+        temp_path = f"{file_path}.tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+            os.replace(temp_path, file_path)
+        except Exception:
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=4)
+            except Exception:
+                pass
+    finally:
+        if acquired:
+            try:
+                os.remove(lock_file)
+            except Exception:
+                pass
+
+
+def get_tool_totals(state_dir):
+    """Retrieves current tool totals from the state file."""
+    import json
+    import os
+
+    file_path = os.path.join(state_dir, "tool_usage.json")
+    if not os.path.exists(file_path):
+        return {"total_calls": 0, "by_tool": {}, "by_caller": {}, "total_duration": 0.0, "errors": 0}
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("totals", {"total_calls": 0, "by_tool": {}, "by_caller": {}, "total_duration": 0.0, "errors": 0})
+    except Exception:
+        return {"total_calls": 0, "by_tool": {}, "by_caller": {}, "total_duration": 0.0, "errors": 0}
+
+

@@ -153,17 +153,17 @@ LLM_PROFILES = [
         "api_key": "sk-sandbox-fake-key",
         "model": "Qwen3.8-Flash-Next-FP8",
         "api_params": {
-            "temperature": 0.7, # 1.0 for thinking
-            "top_p": 0.80, # 0.95 for thinking
+            "temperature": 1.0, # 1.0 for thinking, 0.7 non-reasoning
+            "top_p": 0.95, # 0.95 for thinking, 0.8 non-reasoning
             "reasoning_effort": "low",
             "max_tokens": 65536,
-            "presence_penalty": 1.5, # 0.0 for thinking
+            "presence_penalty": 0.0, # 0.0 for thinking, 1.5 non-reasoning
             "timeout": 600.0,
             "extra_body": {
                 "top_k": 20,
                 "min_p": 0.0,
                 "repetition_penalty": 1.00,
-                "chat_template_kwargs": {"enable_thinking": False},
+                "chat_template_kwargs": {"enable_thinking": True},
             },
             "seed": None,
         },
@@ -175,17 +175,17 @@ LLM_PROFILES = [
         "api_key": "sk-sandbox-fake-key",
         "model": "Qwen3.8-Flash-Next-FP8",
         "api_params": {
-            "temperature": 0.7, # 1.0 for thinking
-            "top_p": 0.80, # 0.95 for thinking
+            "temperature": 1.0, # 1.0 for thinking, 0.7 non-reasoning
+            "top_p": 0.95, # 0.95 for thinking, 0.8 non-reasoning
             "reasoning_effort": "low",
             "max_tokens": 65536,
-            "presence_penalty": 1.5, # 0.0 for thinking
+            "presence_penalty": 0.0, # 0.0 for thinking, 1.5 non-reasoning
             "timeout": 600.0,
             "extra_body": {
                 "top_k": 20,
                 "min_p": 0.0,
                 "repetition_penalty": 1.00,
-                "chat_template_kwargs": {"enable_thinking": False},
+                "chat_template_kwargs": {"enable_thinking": True},
             },
             "seed": None,
         },

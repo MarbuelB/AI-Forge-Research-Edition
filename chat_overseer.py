@@ -508,6 +508,13 @@ async def run_chat():
     state_dir = os.path.join(SESSION_DIR, "state")
     totals = config.get_token_totals(state_dir)
     grand = totals.get("_grand_total", {"total": 0, "prompt": 0, "completion": 0, "thinking": 0})
+    tool_totals = config.get_tool_totals(state_dir)
+    total_tool_calls = tool_totals.get("total_calls", 0)
+    by_tool = tool_totals.get("by_tool", {})
+    tool_breakdown_str = ""
+    if total_tool_calls > 0 and by_tool:
+        top_tools = [f"{t}: {c}" for t, c in sorted(by_tool.items(), key=lambda x: -x[1])[:5]]
+        tool_breakdown_str = f" ({', '.join(top_tools)})"
     banner = (
         f"Session: [{active_session}]\n"
         f"Brain:      {config.LLM_PROFILES[config.ACTIVE_BRAIN_PROFILE]['name']}\n"
@@ -518,7 +525,7 @@ async def run_chat():
         f"Architect:  {config.LLM_PROFILES[config.ACTIVE_ARCHITECT_PROFILE]['name']}\n"
         f"Decider:    {config.DECIDER_CONFIG['name']}\n"
         f"Log saved to: {LOG_FILE}\n"
-        f"Accumulated Session Tokens: {grand['total']} ({grand['prompt']} in, {grand['completion']} out, {grand['thinking']} thinking)"
+        f"Accumulated Session Tokens: {grand['total']:,} ({grand['prompt']:,} in, {grand['completion']:,} out, {grand['thinking']:,} thinking) | Tool Calls: {total_tool_calls}{tool_breakdown_str}"
     )
     log_event("SYSTEM", banner)
     
@@ -529,6 +536,7 @@ async def run_chat():
     token_calibration_ratio = 1.0 # Calibrated ratio: serving model tokenizer vs cl100k_base
     last_history_len = 0
     tool_schemas_overhead = 0 # Estimate of token cost for registered tool schemas
+    current_token_estimate = 0
     
     help_text = "Commands: '/exit' or '/quit' to quit | UI: '/text', '/markdown' | Verbosity: '/silent', '/minimal', '/standard', '/detailed' | MCP: '/mcp'"
     
@@ -599,7 +607,8 @@ async def run_chat():
 
             podman_args.extend([
                 f"--name={active_container_name}", # True unique identifier
-                    "--network=slirp4netns:allow_host_loopback=false", # networking mode built specifically for rootless Podman
+                    "--network=slirp4netns:allow_host_loopback=false", # prevents talking to the host machine through things like rest calls!
+#                    "--add-host=host.containers.internal:10.0.2.2", # this version is needed for direct communication with Win11 host server
                     "--add-host=host.containers.internal:host-gateway",
                     # Core Security Protections
                     "--security-opt", "no-new-privileges=true",
@@ -1252,6 +1261,10 @@ async def run_chat():
                         last_tool_call_signature = None
                         consecutive_identical_tool_calls = 0
                         
+                        turn_start_time = time.time()
+                        turn_llm_time = 0.0
+                        turn_tool_time = 0.0
+                        
                         while True:
                             try:
                                 messages = load_history()
@@ -1317,6 +1330,7 @@ async def run_chat():
                                         ext_tool_names = list(ext_tool_router.keys())
                                         print(f"{COLOR_CYAN}[Active External MCP Tools in Brain Context: {', '.join(ext_tool_names)}]{COLOR_RESET}", flush=True)
 
+                                llm_start_time = time.time()
                                 response_stream = await brain_client.chat.completions.create(**api_args)
                                 
                                 if config.VERBOSITY_MODE != "silent":
@@ -1491,6 +1505,9 @@ async def run_chat():
                                     save_history(messages)
                                     log_event("BRAIN", full_content, final_usage, full_thinking)
                                     
+                                    llm_duration = time.time() - llm_start_time
+                                    turn_llm_time += llm_duration
+                                    
                                     # ◄--- Keeps session statistics completely accurate! ---
                                     reasoning_tokens = getattr(final_usage.completion_tokens_details, 'reasoning_tokens', 0) if hasattr(final_usage, 'completion_tokens_details') and final_usage.completion_tokens_details else 0
                                     if reasoning_tokens == 0 and full_thinking: 
@@ -1535,12 +1552,19 @@ async def run_chat():
                                     reasoning_tokens
                                 )
                                     
+                                llm_duration = time.time() - llm_start_time
+                                turn_llm_time += llm_duration
+
                                 if config.VERBOSITY_MODE != "silent":   
                                     est_tag = "" if is_actual_usage else " (est)"
+                                    max_ctx = getattr(config, "MAX_CONTEXT_TOKENS", 120000)
+                                    ctx_pct = (final_usage.prompt_tokens / max_ctx * 100) if max_ctx else 0.0
+                                    llm_time_str = f"Time: {llm_duration:.1f}s"
+                                    ctx_str = f"Context: {ctx_pct:.1f}% ({final_usage.prompt_tokens:,}/{max_ctx:,})"
                                     if reasoning_tokens > 0:
-                                        print(f"{COLOR_YELLOW}[Tokens{est_tag}: {final_usage.prompt_tokens} in | {final_usage.completion_tokens} out (~{reasoning_tokens} thinking)]{COLOR_RESET}")
+                                        print(f"{COLOR_YELLOW}[Tokens{est_tag}: {final_usage.prompt_tokens:,} in | {final_usage.completion_tokens:,} out (~{reasoning_tokens:,} thinking) | {llm_time_str} | {ctx_str}]{COLOR_RESET}")
                                     else:
-                                        print(f"{COLOR_YELLOW}[Tokens{est_tag}: {final_usage.prompt_tokens} in | {final_usage.completion_tokens} out]{COLOR_RESET}")
+                                        print(f"{COLOR_YELLOW}[Tokens{est_tag}: {final_usage.prompt_tokens:,} in | {final_usage.completion_tokens:,} out | {llm_time_str} | {ctx_str}]{COLOR_RESET}")
 
                                 if not tool_calls_dict:
                                     if cli_args.exit and consecutive_no_tool_turns == 0:
@@ -1585,40 +1609,44 @@ async def run_chat():
                                     hide_args = config.VERBOSITY_MODE in ["minimal", "standard"]
                                     log_event("TOOL CALL", f"Requesting: {name}\nArgs: {json.dumps(args, indent=2)}", hide_console=hide_args)
 
-                                    if config.VERBOSITY_MODE != "silent":                                    
+                                    state_dir = os.path.join(SESSION_DIR, "state")
+                                    tool_totals_before = config.get_tool_totals(state_dir)
+                                    call_num = tool_totals_before.get("total_calls", 0) + 1
+
+                                    if config.VERBOSITY_MODE != "silent":
+                                        pfx = f"▶ Tool #{call_num}: "
                                         if name == "forge_and_register_plugin":
-                                            print(f"\n{COLOR_ORANGE}▶ Routing to Coder for plugin forging...{COLOR_RESET}")
+                                            print(f"\n{COLOR_ORANGE}{pfx}Routing to Coder for plugin forging...{COLOR_RESET}")
                                         elif name == "compress_and_store_context":
-                                            print(f"\n{COLOR_ORANGE}▶ Triggering Memory Manager Pipeline... Awaiting response...{COLOR_RESET}")
+                                            print(f"\n{COLOR_ORANGE}{pfx}Triggering Memory Manager Pipeline... Awaiting response...{COLOR_RESET}")
                                         elif name == "consult_adviser":
-                                            print(f"\n{COLOR_ORANGE}▶ Consulting Senior Adviser... Awaiting strategic report...{COLOR_RESET}")
+                                            print(f"\n{COLOR_ORANGE}{pfx}Consulting Senior Adviser... Awaiting strategic report...{COLOR_RESET}")
                                         elif name == "fast_decision":
-                                            print(f"\n{COLOR_ORANGE}▶ Routing to The Decider for rapid ruling...{COLOR_RESET}")
+                                            print(f"\n{COLOR_ORANGE}{pfx}Routing to The Decider for rapid ruling...{COLOR_RESET}")
                                         elif name == "query_universal_llm":
                                             target_model = args.get("model", "")
                                             target_ep = args.get("endpoint", "")
                                             ep_str = f" ({target_model}" + (f" on {target_ep}" if target_ep else "") + ")" if target_model else ""
-                                            print(f"\n{COLOR_ORANGE}▶ Spawning Universal Sub-Agent{ep_str}... Awaiting response...{COLOR_RESET}")
+                                            print(f"\n{COLOR_ORANGE}{pfx}Spawning Universal Sub-Agent{ep_str}... Awaiting response...{COLOR_RESET}")
                                         elif name == "execute_rest_call":
                                             target_url = args.get("url", "")
-                                            print(f"\n{COLOR_ORANGE}▶ Dispatching REST call ({target_url})...{COLOR_RESET}")
+                                            print(f"\n{COLOR_ORANGE}{pfx}Dispatching REST call ({target_url})...{COLOR_RESET}")
                                         elif name == "analyze_files":
-                                            print(f"\n{COLOR_ORANGE}▶ Passing files to The Analyst... Awaiting report...{COLOR_RESET}")
+                                            print(f"\n{COLOR_ORANGE}{pfx}Passing files to The Analyst... Awaiting report...{COLOR_RESET}")
                                         elif name == "commission_architect":
-                                            print(f"\n{COLOR_ORANGE}▶ Waking up the Architect to draft skill...{COLOR_RESET}")
+                                            print(f"\n{COLOR_ORANGE}{pfx}Waking up the Architect to draft skill...{COLOR_RESET}")
                                         elif name == "manage_external_mcp":
                                             action_tag = args.get("action", "")
                                             srv_tag = args.get("server_name", "")
-                                            print(f"\n{COLOR_CYAN}▶ Managing external MCP tool suites ({action_tag} {srv_tag})...{COLOR_RESET}")
+                                            print(f"\n{COLOR_CYAN}{pfx}Managing external MCP tool suites ({action_tag} {srv_tag})...{COLOR_RESET}")
                                         elif name in ext_tool_router:
                                             srv_id = ext_tool_router[name]["server_id"]
-                                            print(f"\n{COLOR_CYAN}▶ Routing to external host MCP '{srv_id}': {name}...{COLOR_RESET}")
+                                            print(f"\n{COLOR_CYAN}{pfx}Routing to external host MCP '{srv_id}': {name}...{COLOR_RESET}")
                                         elif hide_args:
                                             # If we hid the JSON args, print a clean 1-liner so the user knows it's doing something!
-                                            print(f"{COLOR_ORANGE}▶ Running tool: {name}...{COLOR_RESET}")
+                                            print(f"{COLOR_ORANGE}{pfx}Running tool: {name}...{COLOR_RESET}")
                                             
                                     start = time.time()
-                                    state_dir = os.path.join(SESSION_DIR, "state")
                                     totals_before = config.get_token_totals(state_dir)
                                     
                                     try:
@@ -1664,17 +1692,8 @@ async def run_chat():
                                     except Exception as tool_err:
                                         output = f"SYSTEM ERROR: Tool execution failed: {str(tool_err)}"
                                     
-                                    totals_after = config.get_token_totals(state_dir)
-                                    token_diff = config.get_totals_diff(totals_before, totals_after)
-                                    if token_diff and config.VERBOSITY_MODE != "silent":
-                                        diff_parts = []
-                                        for agent, details in token_diff.items():
-                                            part = f"{agent}: +{details['total']} ({details['prompt']} in, {details['completion']} out"
-                                            if details['thinking'] > 0:
-                                                part += f", {details['thinking']} thinking"
-                                            part += ")"
-                                            diff_parts.append(part)
-                                        print(f"{COLOR_YELLOW}[Tokens used: {', '.join(diff_parts)}]{COLOR_RESET}")
+                                    tool_duration = time.time() - start
+                                    turn_tool_time += tool_duration
 
                                     # --- FAILURE STREAK TRACKER (REFINED) ---
                                     # Determine if the output looks like a true execution failure
@@ -1691,6 +1710,26 @@ async def run_chat():
                                             is_error = False
                                         else:
                                             is_error = True
+
+                                    config.log_tool_usage(
+                                        state_dir,
+                                        name,
+                                        caller="brain",
+                                        duration_seconds=tool_duration,
+                                        is_error=is_error
+                                    )
+
+                                    totals_after = config.get_token_totals(state_dir)
+                                    token_diff = config.get_totals_diff(totals_before, totals_after)
+                                    if token_diff and config.VERBOSITY_MODE != "silent":
+                                        diff_parts = []
+                                        for agent, details in token_diff.items():
+                                            part = f"{agent}: +{details['total']:,} ({details['prompt']:,} in, {details['completion']:,} out"
+                                            if details['thinking'] > 0:
+                                                part += f", {details['thinking']:,} thinking"
+                                            part += ")"
+                                            diff_parts.append(part)
+                                        print(f"{COLOR_YELLOW}[Tokens used: {', '.join(diff_parts)} | Time: {tool_duration:.2f}s | Tool #{call_num} ({name})]{COLOR_RESET}")
 
                                     # Update the streak, tracking command variance so pivoting does not trigger false loops
                                     cmd_fingerprint = json.dumps(args, sort_keys=True) if isinstance(args, dict) else str(args)
@@ -1800,13 +1839,13 @@ async def run_chat():
                                     
                                     # Hide massive output dumps from console if in minimal/standard
                                     hide_output = config.VERBOSITY_MODE in ["minimal", "standard"]
-                                    log_event(f"TOOL RESULT ({time.time() - start:.2f}s)", output, text_color=out_color, hide_console=hide_output)
+                                    log_event(f"TOOL RESULT #{call_num} ({tool_duration:.2f}s)", output, text_color=out_color, hide_console=hide_output)
                                     
                                     if hide_output and config.VERBOSITY_MODE != "silent":
                                         if name in ["commission_architect", "consult_adviser", "fast_decision", "query_universal_llm", "analyze_files", "forge_and_register_plugin", "execute_rest_call"]:
                                             print(f"{out_color}{output}{COLOR_RESET}")
                                         else:
-                                            print(f"{COLOR_DARK_GREEN}✓ Tool '{name}' completed ({time.time() - start:.2f}s).{COLOR_RESET}")
+                                            print(f"{COLOR_DARK_GREEN}✓ Tool #{call_num} '{name}' completed ({tool_duration:.2f}s).{COLOR_RESET}")
 
                                     if name == "compress_and_store_context":
                                         print(f"\n{COLOR_ORANGE}[SYSTEM] Memory compression cycle complete. Waking up with pristine context...{COLOR_RESET}")
@@ -1896,16 +1935,40 @@ async def run_chat():
                                 for agent, details in totals.items():
                                     if agent == "_grand_total":
                                         continue
-                                    part = f"{agent}: {details['total']}"
+                                    part = f"{agent}: {details['total']:,}"
                                     if details['thinking'] > 0:
-                                        part += f" ({details['thinking']} thinking)"
+                                        part += f" ({details['thinking']:,} thinking)"
                                     totals_parts.append(part)
                                 grand = totals.get("_grand_total", {"total": 0, "thinking": 0})
-                                grand_str = f"grand: {grand['total']}"
+                                grand_str = f"grand: {grand['total']:,}"
                                 if grand['thinking'] > 0:
-                                    grand_str += f" ({grand['thinking']} thinking)"
+                                    grand_str += f" ({grand['thinking']:,} thinking)"
                                 totals_parts.append(grand_str)
-                                print(f"\n{COLOR_YELLOW}[Session Totals: {' | '.join(totals_parts)}]{COLOR_RESET}")
+                                print(f"\n{COLOR_YELLOW}[Session Tokens: {' | '.join(totals_parts)}]{COLOR_RESET}")
+
+                            tool_totals = config.get_tool_totals(state_dir)
+                            total_calls = tool_totals.get("total_calls", 0)
+                            by_tool = tool_totals.get("by_tool", {})
+                            if total_calls > 0 and by_tool:
+                                breakdown_parts = [f"{t}: {c}" for t, c in sorted(by_tool.items(), key=lambda x: -x[1])]
+                                breakdown_str = f" ({', '.join(breakdown_parts)})"
+                            else:
+                                breakdown_str = ""
+
+                            turn_total_time = time.time() - turn_start_time
+                            max_ctx = getattr(config, "MAX_CONTEXT_TOKENS", 120000)
+                            tokens_for_ctx = last_actual_prompt_tokens if last_actual_prompt_tokens > 0 else current_token_estimate
+                            ctx_pct = (tokens_for_ctx / max_ctx * 100) if max_ctx else 0.0
+
+                            tools_summary_line = (
+                                f"[Session Tools: {total_calls} calls{breakdown_str} | "
+                                f"Turn Time: {turn_total_time:.1f}s (LLM: {turn_llm_time:.1f}s, Tools: {turn_tool_time:.1f}s) | "
+                                f"Context: {ctx_pct:.1f}% ({tokens_for_ctx:,}/{max_ctx:,})]"
+                            )
+                            if not totals:
+                                print(f"\n{COLOR_YELLOW}{tools_summary_line}{COLOR_RESET}")
+                            else:
+                                print(f"{COLOR_YELLOW}{tools_summary_line}{COLOR_RESET}")
                                 
                     # Clean up any active external MCP sessions
                     for s_data in list(active_ext_servers.values()):
