@@ -623,6 +623,8 @@ async def run_chat():
 
             podman_args.extend([
                 f"--name={active_container_name}", # True unique identifier
+                    "--hostname=sandbox",     # Mask host/session identity inside /etc/hosts and hostname
+                    "--dns-search=.",         # Prevent host organization DNS search domains from leaking into /etc/resolv.conf
                     "--network=slirp4netns:allow_host_loopback=false", # prevents talking to the host machine through things like rest calls!
 #                    "--add-host=host.containers.internal:10.0.2.2", # this version is needed for direct communication with Win11 host server
                     "--add-host=host.containers.internal:host-gateway",
@@ -641,9 +643,12 @@ async def run_chat():
 #                    "--storage-opt", "size=10G", # Limits the container's scratch space, does not work on WSL2
                     "--env", "PYTHONSAFEPATH=1",
                     "--env", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/app/.pixi/envs/default/bin:/home/agent/.cargo/bin",
-                    # MANDATORY HARDENING: Blinds the container to unused high-risk SUID paths entirely
+                    # MANDATORY HARDENING: Blinds the container to unused high-risk SUID and namespace-manipulation paths entirely
                     "-v", "/dev/null:/usr/bin/su:ro",
                     "-v", "/dev/null:/usr/bin/mount:ro",
+                    "-v", "/dev/null:/usr/bin/umount:ro",
+                    "-v", "/dev/null:/usr/bin/unshare:ro",
+                    "-v", "/dev/null:/usr/bin/nsenter:ro",
                     "-v", "/dev/null:/usr/bin/passwd:ro",
                     "-v", "/dev/null:/usr/bin/gpasswd:ro",
                     
@@ -1831,14 +1836,21 @@ async def run_chat():
                                         # --- FAILURE STREAK TRACKER (REFINED) ---
                                         is_error = False
                                         output_lower = output.lower()
-                                        if "system error:" in output_lower or "traceback (most recent" in output_lower or "error executing" in output_lower or "unknown tool" in output_lower or "tool not found" in output_lower or "validation error" in output_lower:
-                                            is_error = True
-                                        elif "exit code:" in output_lower and "exit code: 0" not in output_lower:
-                                            cmd_str = str(args.get("command", "")).strip() if isinstance(args, dict) else ""
-                                            first_word = cmd_str.split()[0] if cmd_str.split() else ""
-                                            if first_word in ["grep", "egrep", "fgrep", "rg", "diff", "cmp", "test", "[", "pgrep"] and "exit code: 1" in output_lower:
-                                                is_error = False
-                                            else:
+                                        output_stripped = output_lower.lstrip()
+                                        if name == "execute_bash":
+                                            if output_stripped.startswith(("system error:", "error executing")):
+                                                is_error = True
+                                            elif output_stripped.startswith("exit code:") and not output_stripped.startswith("exit code: 0"):
+                                                cmd_str = str(args.get("command", "")).strip() if isinstance(args, dict) else ""
+                                                first_word = cmd_str.split()[0] if cmd_str.split() else ""
+                                                if first_word in ["grep", "egrep", "fgrep", "rg", "diff", "cmp", "test", "[", "pgrep"] and output_stripped.startswith("exit code: 1"):
+                                                    is_error = False
+                                                else:
+                                                    is_error = True
+                                        else:
+                                            if output_stripped.startswith(("system error:", "[system error:", "[architect error]", "error:", "error executing", "error writing", "error reading", "failed", "fatal forging exception", "llm query failed", "analyst failed", "unknown tool", "tool not found", "validation error", "syntax error")):
+                                                is_error = True
+                                            elif "traceback (most recent" in output_lower and not output_stripped.startswith(("---", "success", "[")):
                                                 is_error = True
 
                                         config.log_tool_usage(
