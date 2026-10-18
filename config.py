@@ -82,10 +82,8 @@ PROMPTS = {
 - Only output a response without tool calls when: (1) all tasks are 100% complete and you are presenting the final summary, or (2) you are blocked and need clarifying input from the user.
 
 === CODE VERSION CONTROL & AUDITING ===
-You have full access to an active Git repository initialized directly inside `/app/workspace/`. 
-Whenever you successfully forge a new plugin via `forge_and_register_plugin`, or whenever you execute a tool script that modifies existing logic inside `/plugins/`, use `execute_bash` to run a Git tracking sequence:
-1. Stage changes: `git add plugins/`
-2. Commit with a concise descriptive message: `git commit -m "feat(plugin): added/patched <plugin_name> logic for <objective>"`
+You have full access to an active Git repository initialized directly inside `/app/workspace/`.
+`forge_and_register_plugin` and `surgical_code_edit` automatically stage (`git add`) and commit (`git commit`) your changes. You only need to run manual `git add` / `git commit` via `execute_bash` if a tool script modifies tracked files directly outside those tools.
 If you run into compilation tracebacks or bugs, use `git checkout` or `git reset` to roll back to a known stable baseline.
 
 === SYSTEM ENVIRONMENT & CAPABILITIES ===
@@ -301,23 +299,29 @@ def log_token_usage(state_dir, agent_name, prompt_tokens, completion_tokens, thi
             
         # Update agent totals
         if agent_name not in data["totals"]:
-            data["totals"][agent_name] = {"prompt": 0, "completion": 0, "thinking": 0, "total": 0}
+            data["totals"][agent_name] = {"prompt": 0, "completion": 0, "thinking": 0, "total": 0, "calls": 0}
             
         agent_totals = data["totals"][agent_name]
+        if "calls" not in agent_totals:
+            agent_totals["calls"] = sum(1 for h in data.get("history", []) if h.get("agent") == agent_name)
         agent_totals["prompt"] += prompt_tokens
         agent_totals["completion"] += completion_tokens
         agent_totals["thinking"] += thinking_tokens
         agent_totals["total"] += (prompt_tokens + completion_tokens)
+        agent_totals["calls"] += 1
         
         # Update grand totals
         if "_grand_total" not in data["totals"]:
-            data["totals"]["_grand_total"] = {"prompt": 0, "completion": 0, "thinking": 0, "total": 0}
+            data["totals"]["_grand_total"] = {"prompt": 0, "completion": 0, "thinking": 0, "total": 0, "calls": 0}
             
         grand = data["totals"]["_grand_total"]
+        if "calls" not in grand:
+            grand["calls"] = len(data.get("history", []))
         grand["prompt"] += prompt_tokens
         grand["completion"] += completion_tokens
         grand["thinking"] += thinking_tokens
         grand["total"] += (prompt_tokens + completion_tokens)
+        grand["calls"] += 1
         
         # Append to history
         data["history"].append({
@@ -361,9 +365,19 @@ def get_token_totals(state_dir):
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            return data.get("totals", {})
+            totals = data.get("totals", {})
+            history = data.get("history", [])
+            for ag, det in totals.items():
+                if isinstance(det, dict) and "calls" not in det:
+                    det["calls"] = len(history) if ag == "_grand_total" else sum(1 for h in history if h.get("agent") == ag)
+            return totals
     except Exception:
         return {}
+
+def get_agent_turn_count(state_dir, agent_name="brain"):
+    """Retrieves the total number of completed turns/calls for a specific agent."""
+    totals = get_token_totals(state_dir)
+    return totals.get(agent_name, {}).get("calls", 0)
 
 def get_totals_diff(before, after):
     """Computes the difference between two totals dictionaries."""

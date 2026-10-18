@@ -344,10 +344,14 @@ def save_image(filepath: str = "chimerax_snapshot.png", width: int = 1920, heigh
     - DO NOT search /tmp or /app/workspace for the image; inspect /app/host_input/<filename>.
     """
     filename = os.path.basename(filepath.strip()) if filepath else "chimerax_snapshot.png"
-    if not filename:
+    filename = re.sub(r'[^A-Za-z0-9._-]', '_', filename)
+    if not filename or filename.startswith("."):
         filename = "chimerax_snapshot.png"
     if not os.path.splitext(filename)[1]:
         filename += ".png"
+    for ext in DANGEROUS_EXTS:
+        if filename.lower().endswith(ext):
+            return f"[Security Block]: Forbidden file extension '{ext}' in save_image."
 
     host_input_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "my_host_input")
     os.makedirs(host_input_dir, exist_ok=True)
@@ -364,9 +368,10 @@ def save_image(filepath: str = "chimerax_snapshot.png", width: int = 1920, heigh
             pass
 
     # Method 1: Try Direct Save via Windows UNC Path to WSL2
-    unc_path = f"\\\\wsl.localhost\\{distro}\\home\\agent\\ai_workspace\\my_host_input\\{filename}"
-    unc_alt = f"\\\\wsl$\\{distro}\\home\\agent\\ai_workspace\\my_host_input\\{filename}"
-    unc_fwd = f"//wsl.localhost/{distro}/home/agent/ai_workspace/my_host_input/{filename}"
+    win_rel_path = local_path.lstrip("/").replace("/", "\\")
+    unc_path = f"\\\\wsl.localhost\\{distro}\\{win_rel_path}"
+    unc_alt = f"\\\\wsl$\\{distro}\\{win_rel_path}"
+    unc_fwd = f"//wsl.localhost/{distro}/{local_path.lstrip('/')}"
 
     for unc in [unc_path, unc_alt, unc_fwd]:
         res = send_chimerax_command(f'save "{unc}" width {width} height {height} transparent {t_flag}')
@@ -426,7 +431,10 @@ def close_models(target: str = "all") -> str:
     Arguments:
     - target: Model specifier (e.g. '#1', '#1,2') or 'all' to clear the entire session.
     """
-    cmd = "close" if target.strip().lower() == "all" else f"close {target}"
+    cmd = "close" if target.strip().lower() == "all" else f"close {target.strip()}"
+    is_valid, reason = validate_command(cmd)
+    if not is_valid:
+        return f"[Security Block]: Command rejected by ChimeraX safety firewall: {reason}"
     return send_chimerax_command(cmd)
 
 

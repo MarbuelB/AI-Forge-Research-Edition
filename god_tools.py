@@ -334,7 +334,7 @@ def build_multimodal_content(text_content: str, media_filepaths: list[str] = Non
                 continue
 
         try:
-            allowed_safe = [WORKSPACE_DIR, "/app/workspace", "/app/host_input"]
+            allowed_safe = [WORKSPACE_DIR, "/app/workspace", "/app/host_input", "/app"]
             valid_safe = [d for d in allowed_safe if os.path.exists(d)]
             if valid_safe and not any(os.path.commonpath([resolved_path, d]) == d for d in valid_safe):
                 warnings.append(f"[MEDIA ACCESS DENIED: Path '{os.path.basename(resolved_path)}' falls outside safe workspace boundaries.]")
@@ -535,7 +535,8 @@ def gather_agent_context(filepaths: list[str] = None, max_chars_per_file: int = 
         resolved_path = os.path.realpath(path)
         if os.path.exists(resolved_path):
             try:
-                if os.path.commonpath([resolved_path, "/app/workspace"]) != "/app/workspace":
+                allowed_roots = [d for d in [WORKSPACE_DIR, "/app/workspace", "/app/host_input", "/app"] if os.path.exists(d)]
+                if allowed_roots and not any(os.path.commonpath([resolved_path, d]) == d for d in allowed_roots):
                     context_str += f"\n\n[ACCESS DENIED: Path '{os.path.basename(resolved_path)}' falls outside safe workspace boundaries.]"
                     continue
                     
@@ -786,8 +787,12 @@ async def fast_decision(
     # 2. Process images if any
     images_payload = []
     if image_filepaths:
+        allowed_roots = [d for d in [WORKSPACE_DIR, "/app/workspace", "/app/host_input", "/app"] if os.path.exists(d)]
         for img_path in image_filepaths:
-            clean_path = os.path.abspath(str(img_path).strip())
+            clean_path = os.path.realpath(str(img_path).strip())
+            if allowed_roots and not any(os.path.commonpath([clean_path, d]) == d for d in allowed_roots):
+                logger.warning(f"Blocked image read outside safe boundaries in fast_decision: {clean_path}")
+                continue
             if os.path.exists(clean_path):
                 try:
                     with open(clean_path, "rb") as img_f:
@@ -974,7 +979,7 @@ def resolve_universal_endpoint(endpoint_name_or_url: str = None, api_key: str = 
         except Exception:
             target_url = raw_url
         if not target_key:
-            target_key = default_cfg.get("api_key", "sk-sandbox-fake-key")
+            target_key = presets.get(default_name, {}).get("default_api_key", "sk-sandbox-fake-key")
             
     # Clamp timeout between 1.0 second and 3600.0 seconds (up to 1 hour)
     try:
@@ -1179,6 +1184,8 @@ async def execute_rest_call(
     # Auto-resolve localhost/127.0.0.1 to host.containers.internal for Podman container networking
     try:
         parsed_url = urllib.parse.urlparse(url.strip())
+        if parsed_url.port == 21049 and (parsed_url.hostname or "").lower() in ("localhost", "127.0.0.1", "host.containers.internal", "host.wsl.internal", "host.docker.internal"):
+            return "SYSTEM ERROR: Direct REST calls to the unauthenticated ChimeraX port (21049) are blocked for security. Use the 'cx_*' MCP tools via the ChimeraX FastMCP bridge instead."
         netloc = parsed_url.netloc
         if netloc.startswith("localhost:") or netloc == "localhost":
             netloc = netloc.replace("localhost", "host.containers.internal", 1)
@@ -1193,6 +1200,7 @@ async def execute_rest_call(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     req_archive_path = os.path.join(rest_calls_dir, f"req_{timestamp}.json")
 
+    allowed_roots = [d for d in [WORKSPACE_DIR, "/app/workspace", "/app/host_input", "/app"] if os.path.exists(d)]
     opened_files = {}
     if files and isinstance(files, dict):
         for field_name, fpath in files.items():
@@ -1205,6 +1213,8 @@ async def execute_rest_call(
                     resolved_f = alt_f
                 else:
                     return f"SYSTEM ERROR: Upload file '{fpath}' for field '{field_name}' not found on disk."
+            if allowed_roots and not any(os.path.commonpath([resolved_f, d]) == d for d in allowed_roots):
+                return f"SYSTEM ERROR: Upload file '{fpath}' falls outside safe workspace boundaries."
             mime_t, _ = mimetypes.guess_type(resolved_f)
             fname = os.path.basename(resolved_f)
             try:
@@ -1215,9 +1225,9 @@ async def execute_rest_call(
 
     data_payload = None
     if request_filepath:
-        resolved_req = os.path.abspath(request_filepath)
+        resolved_req = os.path.realpath(request_filepath)
         if not os.path.exists(resolved_req):
-            alt_path = os.path.abspath(os.path.join(WORKSPACE_DIR, request_filepath.lstrip("/")))
+            alt_path = os.path.realpath(os.path.join(WORKSPACE_DIR, request_filepath.lstrip("/")))
             if os.path.exists(alt_path):
                 resolved_req = alt_path
             else:
@@ -1225,6 +1235,11 @@ async def execute_rest_call(
                     try: file_entry[1].close()
                     except Exception: pass
                 return f"SYSTEM ERROR: Request file '{request_filepath}' not found on disk."
+        if allowed_roots and not any(os.path.commonpath([resolved_req, d]) == d for d in allowed_roots):
+            for file_entry in opened_files.values():
+                try: file_entry[1].close()
+                except Exception: pass
+            return f"SYSTEM ERROR: Request file '{request_filepath}' falls outside safe workspace boundaries."
         try:
             with open(resolved_req, "r", encoding="utf-8") as f:
                 file_content = f.read()
@@ -1606,9 +1621,10 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
         
 
 @mcp.tool()
-def write_file(filepath: str, content: str, mode: str = "w") -> str:
+def write_file(filepath: str, content: str, mode: str = "w", force: bool = False) -> str:
     """Writes text content to a file in 'outputs' or 'sandbox' directory.
     - mode: 'w' (default) to overwrite, or 'a' to append content to an existing file.
+    - force: Set to True to intentionally overwrite when the new content is <40% of the existing file size (a .bak backup is still saved).
     When mode='w' and the file already exists, an archive backup is automatically created.
     Use this instead of bash 'echo' or 'cat' to write markdown, or text files safely.
     You can only write to 'outputs' or 'sandbox' directories.
@@ -1649,10 +1665,10 @@ def write_file(filepath: str, content: str, mode: str = "w") -> str:
         if file_exists and write_mode == "w":
             existing_size = os.path.getsize(resolved_path)
             # Size-shrink guard: prevent accidental clobbering if new content is drastically smaller (< 40%)
-            if existing_size > 1000 and len(content) < int(existing_size * 0.4):
+            if not force and existing_size > 1000 and len(content) < int(existing_size * 0.4):
                 return (f"SYSTEM WARNING: Overwrite blocked to protect data integrity. "
                         f"Existing file is {existing_size} bytes, but incoming content is only {len(content)} bytes ({int(len(content)/existing_size*100)}%). "
-                        f"If you intended to append, call write_file with mode='a'. If you intentionally wish to edit or replace sections, use surgical_code_edit.")
+                        f"If you intended to append, call write_file with mode='a'. If you intentionally wish to overwrite with shorter content, pass force=True (the previous version will still be backed up to archive/).")
 
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             filename = os.path.basename(resolved_path)
@@ -1783,8 +1799,20 @@ async def compress_and_store_context() -> str:
             pass
     deliverables_summary = "\n".join(f"- {d}" for d in deliverables) if deliverables else "None identified yet in /app/workspace/outputs/."
 
-    # 4. Extract recent execution window (last 20 messages)
-    recent_turns = current_history[-20:] if len(current_history) > 20 else current_history
+    # 4. Extract recent execution window dynamically up to a safe token budget (excluding system prompt)
+    non_sys_history = [m for m in current_history if m.get("role") != "system"]
+    sum_ctx_limit = summarizer_profile.get("context_window", config.MAX_CONTEXT_TOKENS)
+    turn_token_budget = max(20000, int(sum_ctx_limit * 0.45))
+    recent_turns = []
+    accum_tokens = 0
+    for msg in reversed(non_sys_history):
+        msg_str = json.dumps(msg)
+        msg_tok = len(tokenizer.encode(msg_str)) if tokenizer else len(msg_str) // 4
+        if recent_turns and len(recent_turns) >= 20 and (accum_tokens + msg_tok > turn_token_budget):
+            break
+        recent_turns.append(msg)
+        accum_tokens += msg_tok
+    recent_turns.reverse()
     recent_context_text = json.dumps(recent_turns, indent=2)
 
     # Accumulators for subagent telemetry
@@ -2071,10 +2099,6 @@ async def forge_and_register_plugin(
     file_path = os.path.join(PLUGINS_DIR, filename)
     
     coder_sys = config.SYSTEM_PROMPTS["coder"]
-    if target_lang != "python":
-        coder_sys = re.sub(r"write robust, standalone Python scripts", f"write robust standalone {language} assets", coder_sys)
-        coder_sys = re.sub(r"Output ONLY valid, executable Python code", f"Output ONLY valid executable {language} source code", coder_sys)
-        coder_sys = re.sub(r"```python", f"```{md_block}", coder_sys)
 
     # ◄--- Gather background context files seamlessly ---
     file_environmental_context = gather_agent_context(context_filepaths)
@@ -2083,6 +2107,14 @@ async def forge_and_register_plugin(
         {"role": "system", "content": coder_sys},
         {"role": "user", "content": f"Language Selection: {target_lang}\n{file_environmental_context}\n\n" + config.PROMPTS["coder_user"].format(objective=objective)}
     ]
+
+    max_context = coder_profile.get("context_window", config.MAX_CONTEXT_TOKENS)
+    safe_budget = int(max_context * 0.90)
+    payload_tokens = get_payload_tokens(messages)
+    if payload_tokens > safe_budget:
+        return (f"SYSTEM ERROR: The prompt and attached context files sent to the Coder are too massive! "
+                f"Payload is {payload_tokens} tokens, but the safety limit is {safe_budget}. "
+                f"Please refine your 'context_filepaths' selection or shorten 'objective'.")
     
     last_validation_error = "Unknown error (validation failed without output)"
     for attempt in range(config.MAX_PLUGIN_RETRIES):
@@ -2099,8 +2131,15 @@ async def forge_and_register_plugin(
             response = await coder_client.chat.completions.create(**api_args)
             coder_thinking, raw_content = extract_thinking_and_content(response.choices[0].message)
             
-            match = re.search(rf"```{md_block}[ \t]*\r?\n(.*?)\r?\n```", raw_content, re.DOTALL)
-            code = match.group(1).strip() if match else raw_content.replace(f"```{md_block}", "").replace("```", "").strip()
+            stripped_raw = raw_content.strip()
+            fence_match = re.search(rf"```{md_block}[ \t]*\r?\n(.*)\r?\n```", stripped_raw, re.DOTALL)
+            if not fence_match:
+                fence_match = re.search(r"```[a-zA-Z0-9_+-]*[ \t]*\r?\n(.*)\r?\n```", stripped_raw, re.DOTALL)
+            if fence_match:
+                code = fence_match.group(1).strip()
+            else:
+                code = re.sub(r"^```[a-zA-Z0-9_+-]*[ \t]*\r?\n?", "", stripped_raw)
+                code = re.sub(r"\r?\n?```\s*$", "", code).strip()
     
             # Log token usage with fallback
             tokens_in = response.usage.prompt_tokens if (response.usage and response.usage.prompt_tokens) else get_payload_tokens(api_args["messages"])
@@ -2262,7 +2301,11 @@ edition = "2021"
                 if category not in registry: registry[category] = {"category_description": category_description, "tools": {}}
                 registry[category]["tools"][plugin_name] = {"path": file_path, "description": plugin_description, "language": target_lang, "usage_objective": objective}
                 save_json(TOOL_REGISTRY_FILE, registry)
-                
+
+                bin_dir = os.path.join(PLUGINS_DIR, "bin")
+                os.makedirs(bin_dir, exist_ok=True)
+                bin_path = os.path.join(bin_dir, safe_name)
+
                 if target_lang == "python":
                     run_hint = f"execute_bash('python {file_path}')"
                 elif target_lang == "javascript":
@@ -2270,8 +2313,21 @@ edition = "2021"
                 elif target_lang == "typescript":
                     run_hint = f"execute_bash('tsx {file_path}')"
                 elif target_lang == "cpp":
+                    try:
+                        await asyncio.to_thread(subprocess.run, ["g++", "-std=c++17", "-O2", file_path, "-o", bin_path], cwd=PLUGINS_DIR, capture_output=True, text=True, timeout=30)
+                        shutil.copy2(bin_path, f"{file_path}_bin")
+                    except Exception:
+                        pass
                     run_hint = f"execute_bash('g++ -std=c++17 {file_path} -o {file_path}_bin && {file_path}_bin')"
                 elif target_lang == "rust":
+                    project_dir = f"/app/workspace/sandbox/{safe_name}_project"
+                    try:
+                        os.makedirs(os.path.join(project_dir, "src"), exist_ok=True)
+                        with open(os.path.join(project_dir, "Cargo.toml"), "w", encoding="utf-8") as cf:
+                            cf.write(f'[package]\nname = "{safe_name}"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n{deps_block}')
+                        shutil.copy2(file_path, os.path.join(project_dir, "src", "main.rs"))
+                    except Exception:
+                        pass
                     cargo_deps_escaped = deps_block.replace('"', '\\"').replace('\n', '\\n')
                     run_hint = (
                         f"execute_bash('mkdir -p /app/workspace/sandbox/{safe_name}_project/src && "
@@ -2279,6 +2335,18 @@ edition = "2021"
                         f"cp {file_path} /app/workspace/sandbox/{safe_name}_project/src/main.rs && "
                         f"cd /app/workspace/sandbox/{safe_name}_project && cargo run')"
                     )
+
+                if os.path.exists("/app/workspace/.git"):
+                    try:
+                        proc_add = await asyncio.create_subprocess_exec("git", "add", file_path, cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                        await proc_add.communicate()
+                        proc_diff = await asyncio.create_subprocess_exec("git", "diff", "--cached", "--quiet", cwd=WORKSPACE_DIR)
+                        if (await proc_diff.wait()) != 0:
+                            clean_desc = re.sub(r'[\r\n\x00-\x1f]+', ' ', plugin_description).strip()[:40]
+                            proc_commit = await asyncio.create_subprocess_exec("git", "commit", "-m", f"feat(coder): forge {target_lang} plugin {safe_name} - {clean_desc}", cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                            await proc_commit.communicate()
+                    except Exception:
+                        pass
 
                 code_lines = len(code.splitlines())
                 report = f"SUCCESS (Attempt {attempt+1}): {language.upper()} Asset '{plugin_name}' saved to registry.\n"
@@ -2390,6 +2458,14 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
         {"role": "system", "content": coder_sys},
         {"role": "user", "content": coder_user}
     ]
+
+    max_context = coder_profile.get("context_window", config.MAX_CONTEXT_TOKENS)
+    safe_budget = int(max_context * 0.90)
+    payload_tokens = get_payload_tokens(messages)
+    if payload_tokens > safe_budget:
+        return (f"SYSTEM ERROR: The file '{filepath}' sent to the Coder for surgical edit is too massive! "
+                f"Payload is {payload_tokens} tokens, but the safety limit is {safe_budget}. "
+                f"Consider splitting the file or editing smaller modules.")
 
     try:
         api_args = coder_profile["api_params"].copy()
@@ -2580,6 +2656,24 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                 if coder_thinking: fail_msg += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
                 fail_msg += f"\n<___CODER_CODE___>\n{raw_json_str}\n</___CODER_CODE___>"
                 return fail_msg
+        elif ext in (".js", ".cpp", ".cc", ".cxx"):
+            os.makedirs(SANDBOX_DIR, exist_ok=True)
+            tmp_chk_path = os.path.join(SANDBOX_DIR, f".surgical_check_{os.getpid()}{ext}")
+            try:
+                with open(tmp_chk_path, "w", encoding="utf-8") as tf:
+                    tf.write(updated_code)
+                chk_cmd = ["node", "--check", tmp_chk_path] if ext == ".js" else ["g++", "-fsyntax-only", "-std=c++17", tmp_chk_path]
+                chk_res = await asyncio.to_thread(subprocess.run, chk_cmd, capture_output=True, text=True, timeout=15)
+                if chk_res.returncode != 0:
+                    err_detail = (chk_res.stderr or chk_res.stdout or "Syntax validation failed").strip()
+                    fail_msg = f"SYSTEM ERROR: Surgical edit aborted because it introduces a syntax error:\n{err_detail}\nFile on disk was NOT modified."
+                    if coder_thinking: fail_msg += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
+                    fail_msg += f"\n<___CODER_CODE___>\n{raw_json_str}\n</___CODER_CODE___>"
+                    return fail_msg
+            finally:
+                if os.path.exists(tmp_chk_path):
+                    try: os.remove(tmp_chk_path)
+                    except Exception: pass
 
         # Archive backup snapshot
         filename = os.path.basename(real_target)
@@ -2706,6 +2800,8 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, sea
         cursor = conn.cursor()
         
         is_bulk_operation = False
+        is_multi_statement = False
+        multi_stmt_rowcount = 0
         
         try:
             if parameters:
@@ -2719,16 +2815,28 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, sea
                 try:
                     cursor.execute(query)
                 except Exception as e:
-                    # Catch multi-statement attempts and cleanly route them to executescript
+                    # Catch multi-statement attempts and execute statements sequentially via cursor.execute()
                     if "one statement at a time" in str(e).lower() or "can only execute one statement" in str(e).lower():
-                        # Manually check for forbidden destructive actions since executescript bypasses the authorizer
                         forbidden_patterns = [r'\bdrop\s+table\b', r'\bdelete\s+from\b', r'\btruncate\b']
                         if any(re.search(pat, query.lower()) for pat in forbidden_patterns):
                             return "SYSTEM ERROR: Destructive database modifications (DROP/DELETE) are blocked in multi-statement queries."
                         
-                        cursor.executescript(query)
-                        conn.commit()
-                        return f"Multi-statement script executed successfully. Rows affected: {cursor.rowcount}"
+                        statements = []
+                        buf = ""
+                        for part in re.split(r'(;)', query):
+                            buf += part
+                            if part == ";" and sqlite3.complete_statement(buf):
+                                if re.sub(r'--[^\n]*|/\*[\s\S]*?\*/', '', buf).rstrip(';').strip():
+                                    statements.append(buf.strip())
+                                buf = ""
+                        if re.sub(r'--[^\n]*|/\*[\s\S]*?\*/', '', buf).rstrip(';').strip():
+                            statements.append(buf.strip())
+
+                        is_multi_statement = True
+                        for stmt in statements:
+                            cursor.execute(stmt)
+                            if cursor.description is None and cursor.rowcount and cursor.rowcount > 0:
+                                multi_stmt_rowcount += cursor.rowcount
                     else:
                         raise e
 
@@ -2740,8 +2848,8 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, sea
                         
         # --- Output Formatting & CONTEXT PROTECTION ---
         if is_bulk_operation or cursor.description is None:
-            # executescript and executemany don't return fetchable rows
-            rowcount = cursor.rowcount
+            # executemany and non-SELECT statements don't return fetchable rows
+            rowcount = multi_stmt_rowcount if is_multi_statement else cursor.rowcount
             result_str = f"Operation executed successfully. Rows affected/processed: {rowcount}"
         else:
             rows = cursor.fetchall()
@@ -2842,11 +2950,22 @@ async def batch_generate_embeddings(
             
         rowids = []
         texts_to_embed = []
+        col_names = [d[0] for d in cursor.description] if cursor.description else []
         for row in rows:
-            if len(row) != 2:
-                return f"SYSTEM ERROR: source_query must return exactly 2 columns (id, text). Yours returned {len(row)}."
-            rowids.append(row[0])
-            texts_to_embed.append(str(row[1]))
+            if text_template:
+                if len(row) < 1:
+                    return "SYSTEM ERROR: source_query must return at least 1 column (id) when using text_template."
+                rowids.append(row[0])
+                row_map = {col_names[i]: row[i] for i in range(min(len(col_names), len(row)))}
+                try:
+                    texts_to_embed.append(text_template.format(*row, **row_map))
+                except Exception:
+                    texts_to_embed.append(" ".join(str(x) for x in row[1:]))
+            else:
+                if len(row) != 2:
+                    return f"SYSTEM ERROR: source_query must return exactly 2 columns (id, text). Yours returned {len(row)}."
+                rowids.append(row[0])
+                texts_to_embed.append(str(row[1]))
             
         # 2. Generate Embeddings via API in safe chunks of 128
         BATCH_SIZE = 128
@@ -3021,7 +3140,7 @@ async def fetch_webpage(url: str) -> str:
     and returns ONLY the clean, readable text. 
     Use this to read documentation, articles, or search results without writing a custom scraper.
     """
-    safe, reason = is_safe_web_url(url)
+    safe, reason = await asyncio.to_thread(is_safe_web_url, url)
     if not safe:
         return f"SYSTEM ERROR: URL blocked by security policy. {reason}"
 
@@ -3051,7 +3170,7 @@ async def fetch_webpage(url: str) -> str:
                 # Protect against redirect SSRF to internal/host IPs
                 async def filter_navigation(route):
                     if route.request.is_navigation_request():
-                        req_safe, _ = is_safe_web_url(route.request.url)
+                        req_safe, _ = await asyncio.to_thread(is_safe_web_url, route.request.url)
                         if not req_safe:
                             await route.abort()
                             return
@@ -3178,8 +3297,14 @@ async def analyze_files(
         allocated_chars = max(40000, min(280000, total_char_budget // num_text_files))
         effective_max_chars = max_chars if (max_chars and max_chars > 0) else allocated_chars
 
+        allowed_roots = [d for d in [WORKSPACE_DIR, "/app/workspace", "/app/host_input", "/app"] if os.path.exists(d)]
         for raw_path in filepaths:
             filepath = raw_path.strip() if isinstance(raw_path, str) else str(raw_path)
+            resolved_fp = os.path.realpath(filepath)
+            if allowed_roots and not any(os.path.commonpath([resolved_fp, d]) == d for d in allowed_roots):
+                user_content.append({"type": "text", "text": f"\n[ACCESS DENIED: Path '{os.path.basename(resolved_fp)}' falls outside safe workspace boundaries.]"})
+                continue
+            filepath = resolved_fp
             if not os.path.exists(filepath):
                 user_content.append({"type": "text", "text": f"\n[ERROR: File '{filepath}' does not exist.]"})
                 continue
@@ -3609,9 +3734,16 @@ async def commission_architect(skill_name: str, objective: str, brain_notes: str
             {"role": "system", "content": config.SYSTEM_PROMPTS["architect"]},
             {"role": "user", "content": architect_user}
         ]
+
+        max_context = architect_profile.get("context_window", config.MAX_CONTEXT_TOKENS)
+        safe_budget = int(max_context * 0.90)
+        payload_tokens = get_payload_tokens(messages)
+        if payload_tokens > safe_budget:
+            return (f"[ARCHITECT ERROR] The notes and attached context files sent to the Architect are too massive! "
+                    f"Payload is {payload_tokens} tokens, but the safety limit is {safe_budget}. "
+                    f"Please refine 'context_filepaths' or shorten 'brain_notes'.")
         
         if config.VERBOSITY_MODE != "silent":
-            payload_tokens = get_payload_tokens(messages)
             sys.stderr.write(f"\n\033[93m[System: Architect payload is ~{payload_tokens} estimated tokens]\033[0m\n")
 
         api_args = architect_profile.get("api_params", {}).copy()

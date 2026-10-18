@@ -450,7 +450,7 @@ def log_event(role, content, usage=None, thinking=None, text_color=None, hide_co
     if config.VERBOSITY_MODE == "silent" or hide_console:
         return
 
-    if role.upper() not in ["BRAIN"]:
+    if not role.upper().startswith("BRAIN"):
         if role.upper().startswith("TOOL"):
             console_header = f"\n{COLOR_BRIGHT_GREEN}[{time_str}] === {role.upper()} ==={COLOR_RESET}"
             actual_color = text_color if text_color else COLOR_DARK_GREEN
@@ -1283,7 +1283,7 @@ async def run_chat():
                                 last_estimated_payload_tokens = payload_tokens
                                 # Calibrated estimate accounts for real serving tokenizer overhead
                                 calibrated_payload = int(payload_tokens * token_calibration_ratio)
-                                current_token_estimate = calibrated_payload + tool_schemas_overhead + (len(messages) * 4)
+                                current_token_estimate = calibrated_payload + tool_schemas_overhead
                                 if last_actual_prompt_tokens > 0 and len(messages) >= last_history_len and (calibrated_payload + tool_schemas_overhead) >= (last_actual_prompt_tokens - 1000):
                                     current_token_estimate = max(current_token_estimate, last_actual_prompt_tokens)
                                 last_history_len = len(messages)
@@ -1323,9 +1323,12 @@ async def run_chat():
                                 if api_args.get("seed") is None:
                                     api_args.pop("seed", None)
 
+                                state_dir = os.path.join(SESSION_DIR, "state")
+                                brain_turn_num = config.get_agent_turn_count(state_dir, "brain") + 1
+
                                 if config.VERBOSITY_MODE != "silent":
                                     calib_note = f" (calibrated x{token_calibration_ratio:.2f})" if abs(token_calibration_ratio - 1.0) > 0.04 else ""
-                                    print(f"\n{COLOR_YELLOW}[System: Brain payload is ~{payload_tokens} estimated tokens{calib_note} (Estimated total context window: ~{current_token_estimate})]{COLOR_RESET}", flush=True)
+                                    print(f"\n{COLOR_YELLOW}[System: Brain #{brain_turn_num} payload is ~{payload_tokens} estimated tokens{calib_note} (Estimated total context window: ~{current_token_estimate})]{COLOR_RESET}", flush=True)
                                     if config.VERBOSITY_MODE in ["standard", "detailed"] and active_ext_servers:
                                         ext_tool_names = list(ext_tool_router.keys())
                                         print(f"{COLOR_CYAN}[Active External MCP Tools in Brain Context: {', '.join(ext_tool_names)}]{COLOR_RESET}", flush=True)
@@ -1335,7 +1338,7 @@ async def run_chat():
                                 
                                 if config.VERBOSITY_MODE != "silent":
                                     time_str = datetime.now().strftime("%H:%M:%S")
-                                    print(f"\n{COLOR_BLUE}[{time_str}] === BRAIN ==={COLOR_RESET}")
+                                    print(f"\n{COLOR_BLUE}[{time_str}] === BRAIN #{brain_turn_num} ==={COLOR_RESET}")
                                 
                                 full_content = ""
                                 full_thinking = ""
@@ -1439,7 +1442,7 @@ async def run_chat():
                                                             
                                                         display_elements.append(Panel(
                                                             Markdown(display_thinking),
-                                                            title="[bold yellow]BRAIN THOUGHTS[/bold yellow]", border_style="yellow", padding=(1, 2), subtitle="[dim white]Internal Logic Loop[/dim white]"
+                                                            title=f"[bold yellow]BRAIN #{brain_turn_num} THOUGHTS[/bold yellow]", border_style="yellow", padding=(1, 2), subtitle="[dim white]Internal Logic Loop[/dim white]"
                                                         ))
                                                         
                                                     if full_content:
@@ -1503,7 +1506,7 @@ async def run_chat():
                                             completion_tokens_details=types.SimpleNamespace(reasoning_tokens=fb_reasoning)
                                         )
                                     save_history(messages)
-                                    log_event("BRAIN", full_content, final_usage, full_thinking)
+                                    log_event(f"BRAIN #{brain_turn_num}", full_content, final_usage, full_thinking)
                                     
                                     llm_duration = time.time() - llm_start_time
                                     turn_llm_time += llm_duration
@@ -1528,12 +1531,13 @@ async def run_chat():
                                             completion_tokens_details=types.SimpleNamespace(reasoning_tokens=fb_reasoning)
                                         )
                                     save_history(messages)
-                                    log_event("BRAIN", full_content, final_usage, full_thinking)
+                                    log_event(f"BRAIN #{brain_turn_num}", full_content, final_usage, full_thinking)
 
                                 # Update exact token count state and calibrate tokenizer for the next loop!
                                 if is_actual_usage and final_usage.prompt_tokens and last_estimated_payload_tokens > 0:
                                     # Calibrate ratio between serving model's tokenizer and local cl100k estimate
-                                    observed_ratio = final_usage.prompt_tokens / last_estimated_payload_tokens
+                                    observed_msg_tokens = max(1, final_usage.prompt_tokens - tool_schemas_overhead)
+                                    observed_ratio = observed_msg_tokens / last_estimated_payload_tokens
                                     if 0.5 <= observed_ratio <= 3.0:
                                         token_calibration_ratio = (0.7 * token_calibration_ratio) + (0.3 * observed_ratio)
                                 last_actual_prompt_tokens = final_usage.prompt_tokens
@@ -1562,9 +1566,9 @@ async def run_chat():
                                     llm_time_str = f"Time: {llm_duration:.1f}s"
                                     ctx_str = f"Context: {ctx_pct:.1f}% ({final_usage.prompt_tokens:,}/{max_ctx:,})"
                                     if reasoning_tokens > 0:
-                                        print(f"{COLOR_YELLOW}[Tokens{est_tag}: {final_usage.prompt_tokens:,} in | {final_usage.completion_tokens:,} out (~{reasoning_tokens:,} thinking) | {llm_time_str} | {ctx_str}]{COLOR_RESET}")
+                                        print(f"{COLOR_YELLOW}[Brain #{brain_turn_num} | Tokens{est_tag}: {final_usage.prompt_tokens:,} in | {final_usage.completion_tokens:,} out (~{reasoning_tokens:,} thinking) | {llm_time_str} | {ctx_str}]{COLOR_RESET}")
                                     else:
-                                        print(f"{COLOR_YELLOW}[Tokens{est_tag}: {final_usage.prompt_tokens:,} in | {final_usage.completion_tokens:,} out | {llm_time_str} | {ctx_str}]{COLOR_RESET}")
+                                        print(f"{COLOR_YELLOW}[Brain #{brain_turn_num} | Tokens{est_tag}: {final_usage.prompt_tokens:,} in | {final_usage.completion_tokens:,} out | {llm_time_str} | {ctx_str}]{COLOR_RESET}")
 
                                 if not tool_calls_dict:
                                     if cli_args.exit and consecutive_no_tool_turns == 0:
@@ -1585,15 +1589,20 @@ async def run_chat():
                                     name = tc_data["function"]["name"]
                                     args_str = tc_data["function"]["arguments"]
                                     tc_id = tc_data["id"]
+
+                                    state_dir = os.path.join(SESSION_DIR, "state")
+                                    tool_totals_before = config.get_tool_totals(state_dir)
+                                    call_num = tool_totals_before.get("total_calls", 0) + 1
                                     
                                     # --- Intercept and self-heal bad JSON ---
                                     try:
                                         args = json.loads(args_str)
                                     except json.JSONDecodeError:
                                         error_msg = "SYSTEM ERROR: You provided invalid JSON arguments for this tool call. Please check your syntax (watch out for unescaped quotes or missing brackets) and try again."
-                                        print(f"{COLOR_RED}Error decoding JSON. Intercepting and asking Brain to retry...{COLOR_RESET}")
-                                        log_event("TOOL CALL", f"Requesting: {name}\nArgs: [MALFORMED JSON]\n{args_str}")
-                                        log_event("TOOL RESULT (0.00s)", error_msg, text_color=COLOR_RED)
+                                        print(f"{COLOR_RED}Error decoding JSON (Tool #{call_num}: {name}). Intercepting and asking Brain to retry...{COLOR_RESET}")
+                                        config.log_tool_usage(state_dir, name, caller="brain", duration_seconds=0.0, is_error=True)
+                                        log_event(f"TOOL CALL #{call_num} ({name})", f"Requesting: {name}\nArgs: [MALFORMED JSON]\n{args_str}")
+                                        log_event(f"TOOL RESULT #{call_num} ({name}) (0.00s)", error_msg, text_color=COLOR_RED)
                                         
                                         messages = load_history()
                                         messages.append({
@@ -1607,11 +1616,7 @@ async def run_chat():
 
                                     # Hide massive JSON strings from console if in minimal/standard
                                     hide_args = config.VERBOSITY_MODE in ["minimal", "standard"]
-                                    log_event("TOOL CALL", f"Requesting: {name}\nArgs: {json.dumps(args, indent=2)}", hide_console=hide_args)
-
-                                    state_dir = os.path.join(SESSION_DIR, "state")
-                                    tool_totals_before = config.get_tool_totals(state_dir)
-                                    call_num = tool_totals_before.get("total_calls", 0) + 1
+                                    log_event(f"TOOL CALL #{call_num} ({name})", f"Requesting: {name}\nArgs: {json.dumps(args, indent=2)}", hide_console=hide_args)
 
                                     if config.VERBOSITY_MODE != "silent":
                                         pfx = f"▶ Tool #{call_num}: "
@@ -1782,16 +1787,16 @@ async def run_chat():
 
                                     # --- SUBAGENT HIDDEN THOUGHTS & ARTIFACTS LOGGING ---
                                     subagent_specs = [
-                                        ("CODER", r"<___CODER_THOUGHTS___>(.*?)</___CODER_THOUGHTS___>", r"<___CODER_CODE___>(.*?)</___CODER_CODE___>", "GENERATED CODE / EDIT"),
-                                        ("ADVISER", r"<___ADVISER_THOUGHTS___>(.*?)</___ADVISER_THOUGHTS___>", r"<___ADVISER_REPORT___>(.*?)</___ADVISER_REPORT___>", "ADVISER REPORT"),
-                                        ("ANALYST", r"<___ANALYST_THOUGHTS___>(.*?)</___ANALYST_THOUGHTS___>", r"<___ANALYST_REPORT___>(.*?)</___ANALYST_REPORT___>", "ANALYST REPORT"),
-                                        ("ARCHITECT", r"<___ARCHITECT_THOUGHTS___>(.*?)</___ARCHITECT_THOUGHTS___>", r"<___ARCHITECT_SKILL___>(.*?)</___ARCHITECT_SKILL___>", "GENERATED SKILL"),
-                                        ("SUMMARIZER", r"<___SUMMARIZER_THOUGHTS___>(.*?)</___SUMMARIZER_THOUGHTS___>", r"<___SUMMARIZER_OUTPUT___>(.*?)</___SUMMARIZER_OUTPUT___>", "SUMMARIZER OUTPUT"),
-                                        ("DECIDER", None, r"<___DECIDER_RULING___>(.*?)</___DECIDER_RULING___>", "RULING"),
-                                        ("UNIVERSAL SUB-AGENT", r"<___UNIVERSAL_THOUGHTS___>(.*?)</___UNIVERSAL_THOUGHTS___>", r"<___UNIVERSAL_OUTPUT___(?:\s+model=\"([^\"]*)\")?>(.*?)</___UNIVERSAL_OUTPUT___>", "RAW OUTPUT"),
+                                        ("CODER", "coder", r"<___CODER_THOUGHTS___>(.*?)</___CODER_THOUGHTS___>", r"<___CODER_CODE___>(.*?)</___CODER_CODE___>", "GENERATED CODE / EDIT"),
+                                        ("ADVISER", "adviser", r"<___ADVISER_THOUGHTS___>(.*?)</___ADVISER_THOUGHTS___>", r"<___ADVISER_REPORT___>(.*?)</___ADVISER_REPORT___>", "ADVISER REPORT"),
+                                        ("ANALYST", "analyst", r"<___ANALYST_THOUGHTS___>(.*?)</___ANALYST_THOUGHTS___>", r"<___ANALYST_REPORT___>(.*?)</___ANALYST_REPORT___>", "ANALYST REPORT"),
+                                        ("ARCHITECT", "architect", r"<___ARCHITECT_THOUGHTS___>(.*?)</___ARCHITECT_THOUGHTS___>", r"<___ARCHITECT_SKILL___>(.*?)</___ARCHITECT_SKILL___>", "GENERATED SKILL"),
+                                        ("SUMMARIZER", "summarizer", r"<___SUMMARIZER_THOUGHTS___>(.*?)</___SUMMARIZER_THOUGHTS___>", r"<___SUMMARIZER_OUTPUT___>(.*?)</___SUMMARIZER_OUTPUT___>", "SUMMARIZER OUTPUT"),
+                                        ("DECIDER", "decider", None, r"<___DECIDER_RULING___>(.*?)</___DECIDER_RULING___>", "RULING"),
+                                        ("UNIVERSAL SUB-AGENT", "universal_llm", r"<___UNIVERSAL_THOUGHTS___>(.*?)</___UNIVERSAL_THOUGHTS___>", r"<___UNIVERSAL_OUTPUT___(?:\s+model=\"([^\"]*)\")?>(.*?)</___UNIVERSAL_OUTPUT___>", "RAW OUTPUT"),
                                     ]
 
-                                    for agent_label, thought_pattern, content_pattern, content_label in subagent_specs:
+                                    for agent_label, agent_key, thought_pattern, content_pattern, content_label in subagent_specs:
                                         agent_thoughts = ""
                                         agent_content = ""
                                         model_tag = ""
@@ -1814,7 +1819,9 @@ async def run_chat():
 
                                         if agent_thoughts or agent_content:
                                             time_str = datetime.now().strftime("%H:%M:%S")
-                                            display_label = f"{agent_label}{model_tag}"
+                                            sub_call_num = totals_after.get(agent_key, {}).get("calls", 0)
+                                            sub_num_tag = f" #{sub_call_num}" if sub_call_num > 0 else ""
+                                            display_label = f"{agent_label}{sub_num_tag}{model_tag}"
                                             log_text = f"\n[{time_str}] === {display_label} (HIDDEN) ===\n"
 
                                             hide_subagent = config.VERBOSITY_MODE in ["silent", "minimal", "standard"]
@@ -1839,7 +1846,7 @@ async def run_chat():
                                     
                                     # Hide massive output dumps from console if in minimal/standard
                                     hide_output = config.VERBOSITY_MODE in ["minimal", "standard"]
-                                    log_event(f"TOOL RESULT #{call_num} ({tool_duration:.2f}s)", output, text_color=out_color, hide_console=hide_output)
+                                    log_event(f"TOOL RESULT #{call_num} ({name}) ({tool_duration:.2f}s)", output, text_color=out_color, hide_console=hide_output)
                                     
                                     if hide_output and config.VERBOSITY_MODE != "silent":
                                         if name in ["commission_architect", "consult_adviser", "fast_decision", "query_universal_llm", "analyze_files", "forge_and_register_plugin", "execute_rest_call"]:
@@ -1847,7 +1854,7 @@ async def run_chat():
                                         else:
                                             print(f"{COLOR_DARK_GREEN}✓ Tool #{call_num} '{name}' completed ({tool_duration:.2f}s).{COLOR_RESET}")
 
-                                    if name == "compress_and_store_context":
+                                    if name == "compress_and_store_context" and output.startswith("SUCCESS:"):
                                         print(f"\n{COLOR_ORANGE}[SYSTEM] Memory compression cycle complete. Waking up with pristine context...{COLOR_RESET}")
                                         messages = load_history()
                                         if len(messages) <= 1:
@@ -1935,7 +1942,9 @@ async def run_chat():
                                 for agent, details in totals.items():
                                     if agent == "_grand_total":
                                         continue
-                                    part = f"{agent}: {details['total']:,}"
+                                    calls_cnt = details.get("calls", 0)
+                                    calls_tag = f" (#{calls_cnt})" if calls_cnt > 0 else ""
+                                    part = f"{agent}{calls_tag}: {details['total']:,}"
                                     if details['thinking'] > 0:
                                         part += f" ({details['thinking']:,} thinking)"
                                     totals_parts.append(part)
@@ -1955,13 +1964,14 @@ async def run_chat():
                             else:
                                 breakdown_str = ""
 
+                            brain_turns_total = totals.get("brain", {}).get("calls", 0) if totals else 0
                             turn_total_time = time.time() - turn_start_time
                             max_ctx = getattr(config, "MAX_CONTEXT_TOKENS", 120000)
                             tokens_for_ctx = last_actual_prompt_tokens if last_actual_prompt_tokens > 0 else current_token_estimate
                             ctx_pct = (tokens_for_ctx / max_ctx * 100) if max_ctx else 0.0
 
                             tools_summary_line = (
-                                f"[Session Tools: {total_calls} calls{breakdown_str} | "
+                                f"[Brain Turns: {brain_turns_total} | Session Tools: {total_calls} calls{breakdown_str} | "
                                 f"Turn Time: {turn_total_time:.1f}s (LLM: {turn_llm_time:.1f}s, Tools: {turn_tool_time:.1f}s) | "
                                 f"Context: {ctx_pct:.1f}% ({tokens_for_ctx:,}/{max_ctx:,})]"
                             )

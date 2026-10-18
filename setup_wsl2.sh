@@ -414,7 +414,8 @@ EOF
             fi
 
             if [ "$apply_wsl" = true ]; then
-                cat <<EOF >> /etc/wsl.conf
+                if ! grep -q "^\[automount\]" /etc/wsl.conf 2>/dev/null; then
+                    cat <<EOF >> /etc/wsl.conf
 
 [user]
 default=${TARGET_USER}
@@ -426,8 +427,11 @@ enabled = false
 enabled = false
 appendWindowsPath = false
 EOF
-                wsl_needs_shutdown=true
-                log_done "Wrote security hardening to /etc/wsl.conf."
+                    wsl_needs_shutdown=true
+                    log_done "Wrote security hardening to /etc/wsl.conf."
+                else
+                    log_done "/etc/wsl.conf already contains security hardening."
+                fi
             fi
         else
             log_info "Installing for standard account '${TARGET_USER}'. Skipping automount/interop hardening to preserve existing user login and Windows mounts."
@@ -447,25 +451,17 @@ EOF
         fi
     fi
 
-    # 6. Ensure proper workspace ownership & traversal permissions
+    # 6. Ensure proper workspace ownership & isolation
     log_info "Ensuring workspace permissions for ${TARGET_USER}..."
-    chown -R "${TARGET_USER}:${TARGET_USER}" "$SCRIPT_DIR" 2>/dev/null || true
-
-    # Ensure parent directories allow traversal (+x) so TARGET_USER can reach SCRIPT_DIR
-    local parent_dir="$(dirname "$SCRIPT_DIR")"
-    while [ -n "$parent_dir" ] && [ "$parent_dir" != "/" ] && [ "$parent_dir" != "." ]; do
-        chmod a+x "$parent_dir" 2>/dev/null || true
-        parent_dir="$(dirname "$parent_dir")"
-    done
-
-    # If TARGET_USER is 'agent' and workspace is outside /home/agent, create a helpful symlink
     local target_home="$(get_user_home "$TARGET_USER")"
-    if [ "$TARGET_USER" = "agent" ] && [ "$SCRIPT_DIR" != "$target_home"/* ] && [ "$SCRIPT_DIR" != "$target_home" ]; then
-        if [ ! -e "$target_home/ai_workspace" ]; then
-            ln -s "$SCRIPT_DIR" "$target_home/ai_workspace" 2>/dev/null || true
-            chown -h "${TARGET_USER}:${TARGET_USER}" "$target_home/ai_workspace" 2>/dev/null || true
-            log_done "Created convenient symlink $target_home/ai_workspace -> $SCRIPT_DIR"
-        fi
+    if [ "$TARGET_USER" = "agent" ] && [[ "$SCRIPT_DIR" != "$target_home"/* ]] && [ "$SCRIPT_DIR" != "$target_home" ]; then
+        mkdir -p "$target_home/ai_workspace"
+        cp -a "$SCRIPT_DIR/." "$target_home/ai_workspace/"
+        SCRIPT_DIR="$target_home/ai_workspace"
+        chown -R "${TARGET_USER}:${TARGET_USER}" "$SCRIPT_DIR" 2>/dev/null || true
+        log_done "Copied workspace into isolated $SCRIPT_DIR for user '${TARGET_USER}'."
+    else
+        chown -R "${TARGET_USER}:${TARGET_USER}" "$SCRIPT_DIR" 2>/dev/null || true
     fi
 
     log_done "Phase 1 (System Configuration) completed successfully!"
@@ -949,7 +945,6 @@ EOF
     log_step "Creating necessary session and IO folders..."
     mkdir -p "$SCRIPT_DIR/my_host_input"
     mkdir -p "$SCRIPT_DIR/sessions"
-    mkdir -p "$SCRIPT_DIR/plugins"
     mkdir -p "$SCRIPT_DIR/logs"
     log_done "Folders initialized."
 

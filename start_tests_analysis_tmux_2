@@ -22,7 +22,7 @@ tmux send-keys -t forge_swarm "pixi run python chat_overseer.py -x -f markdown -
 
 # 5. Pane 3 (Bottom-Right): Agent 4 in MD Mode (Splits the top-right pane)
 tmux split-window -v -t forge_swarm:0.2
-tmux send-keys -t forge_swarm "pixi run python chat_overseer.py -x -f markdown -v standard -s 'Agent_8' -p 'In the input folder, you find a folder with 3 images. I want you to describe each of them. Make a plan to how to identify objects on the images. Ask Adviser for ideas. Execute the plan.'; echo -e '\n--- TEST COMPLETE, STARTING ANALYSIS ---' ; pixi run python chat_overseer.py -x -f markdown -v minimal -s 'Agent_8' -p '${ANALYZE_PROMPT}'" C-m
+tmux send-keys -t forge_swarm "pixi run python chat_overseer.py -x -f markdown -v standard -s 'Agent_8' -p 'In the input folder, you find a folder with 4 images. I want you to describe each of them. Make a plan to how to identify objects on the images. Ask Adviser for ideas. Execute the plan.'; echo -e '\n--- TEST COMPLETE, STARTING ANALYSIS ---' ; pixi run python chat_overseer.py -x -f markdown -v minimal -s 'Agent_8' -p '${ANALYZE_PROMPT}'" C-m
 
 # 6. Balance the panes into a perfect 2x2 grid
 tmux select-layout -t forge_swarm tiled
