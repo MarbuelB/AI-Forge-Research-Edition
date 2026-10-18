@@ -240,7 +240,7 @@ def save_failure_trace(subagent_name: str, payload: dict) -> str:
     """Saves a failure trace / post-mortem diagnostic artifact to state/ for full observability."""
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"failure_{subagent_name}_{timestamp}.json"
         filepath = os.path.join(STATE_DIR, filename)
         save_json(filepath, payload)
@@ -453,7 +453,7 @@ def read_file_slice(
         end_idx = len(selected)
         content = "".join(selected)
 
-    is_partial = (len(content) < file_size)
+    is_partial = (start_idx > 1 or end_idx < total_lines)
     return content, start_idx, end_idx, total_lines, is_partial
 
 
@@ -703,7 +703,7 @@ async def consult_adviser(current_plan: str, encountered_problems: str, context_
         config.log_token_usage(STATE_DIR, "adviser", tokens_in, tokens_out, thinking_tokens)
         
         # 5. Format the filename to start with the date (e.g., 20260503_204530_advice.md)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"{timestamp}_advice.md"
         filepath = os.path.join(STATE_DIR, filename)
         
@@ -1012,7 +1012,8 @@ async def query_universal_llm(
     extra_body: dict = None,
     extra_headers: dict = None,
     context_filepaths: list[str] = None,
-    media_filepaths: list[str] = None
+    media_filepaths: list[str] = None,
+    output_filepath: str = None
 ) -> str:
     """Auxiliary backup tool to query an external LLM endpoint for experiments, second opinions, or cloud models via LiteLLM.
     Use ONLY when primary specialized sub-agents (Coder, Analyst, Adviser, Decider, Architect) cannot perform the task.
@@ -1020,7 +1021,7 @@ async def query_universal_llm(
     Actions:
     - 'list_endpoints': Lists pre-configured endpoint presets from llm_config.
     - 'list_models': Lists available models on 'endpoint'.
-    - 'chat': Sends prompt to 'model' on 'endpoint' with optional parameters (temperature, max_tokens, reasoning_effort, context_filepaths, media_filepaths, etc.).
+    - 'chat': Sends prompt to 'model' on 'endpoint' with optional parameters (temperature, max_tokens, reasoning_effort, context_filepaths, media_filepaths, output_filepath, etc.).
     """
     if action == "list_endpoints":
         presets = getattr(config, "UNIVERSAL_ENDPOINTS", {})
@@ -1050,6 +1051,15 @@ async def query_universal_llm(
     elif action == "chat":
         if not model or not user_prompt:
             return "Error: You must provide a 'model' name and a 'user_prompt' to use the chat action."
+
+        resolved_out = None
+        if output_filepath:
+            candidate_out = output_filepath if os.path.isabs(output_filepath) else os.path.join(WORKSPACE_DIR, output_filepath.lstrip("/"))
+            resolved_out = os.path.realpath(candidate_out)
+            allowed_out_dirs = [os.path.realpath(OUTPUTS_DIR), os.path.realpath(SANDBOX_DIR)]
+            if not any(os.path.commonpath([resolved_out, d]) == d for d in allowed_out_dirs):
+                return f"SYSTEM ERROR: output_filepath '{output_filepath}' must be inside {OUTPUTS_DIR} or {SANDBOX_DIR}."
+            os.makedirs(os.path.dirname(resolved_out), exist_ok=True)
 
         target_url, target_key, timeout_val = resolve_universal_endpoint(endpoint, api_key, timeout_seconds)
 
@@ -1125,10 +1135,20 @@ async def query_universal_llm(
 
             finish_reason = response.choices[0].finish_reason or "unknown"
 
-            result_str = f"--- RESPONSE FROM {effective_model} ({target_url}) ---\n"
-            if thinking:
+            saved_note = ""
+            display_body = content
+            if resolved_out:
+                saved_text = content if content.strip() else thinking
+                with open(resolved_out, "w", encoding="utf-8") as f:
+                    f.write(saved_text)
+                saved_note = f"[Saved full response to: {resolved_out} ({len(saved_text):,} chars)]\n"
+                if len(content) > 2000:
+                    display_body = content[:1500] + f"\n\n... [Truncated inline preview; full {len(content):,}-char response saved to {resolved_out}]"
+
+            result_str = f"--- RESPONSE FROM {effective_model} ({target_url}) ---\n{saved_note}"
+            if thinking and not resolved_out:
                 result_str += f"<thinking>\n{thinking}\n</thinking>\n\n"
-            result_str += content
+            result_str += display_body
 
             if not content.strip() and not thinking:
                 result_str += f"\n[SYSTEM WARNING: Empty response. Finish Reason: '{finish_reason}']"
@@ -1197,7 +1217,7 @@ async def execute_rest_call(
 
     rest_calls_dir = os.path.join(STATE_DIR, "rest_calls")
     os.makedirs(rest_calls_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     req_archive_path = os.path.join(rest_calls_dir, f"req_{timestamp}.json")
 
     allowed_roots = [d for d in [WORKSPACE_DIR, "/app/workspace", "/app/host_input", "/app"] if os.path.exists(d)]
@@ -1582,7 +1602,7 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
         # --- THE POINTER APPROACH (Context Protection) ---
         if len(output) > 10000:
             # Generate a clean timestamped filename
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             temp_file_name = f"cmd_output_{timestamp}.txt"
             os.makedirs(SANDBOX_DIR, exist_ok=True)
             temp_file_path = os.path.join(SANDBOX_DIR, temp_file_name)
@@ -1670,7 +1690,7 @@ def write_file(filepath: str, content: str, mode: str = "w", force: bool = False
                         f"Existing file is {existing_size} bytes, but incoming content is only {len(content)} bytes ({int(len(content)/existing_size*100)}%). "
                         f"If you intended to append, call write_file with mode='a'. If you intentionally wish to overwrite with shorter content, pass force=True (the previous version will still be backed up to archive/).")
 
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S_%f")
             filename = os.path.basename(resolved_path)
             backup_dir = "/app/workspace/archive"
             os.makedirs(backup_dir, exist_ok=True)
@@ -1738,7 +1758,7 @@ def store_memory(category: str, category_description: str, title: str, short_des
         memories[category]["category_description"] = category_description
         
     safe_title = re.sub(r'[^a-zA-Z0-9_]', '', title) or "memory"
-    timestamp_prefix = datetime.now().strftime("%Y%m%d%H%M%S")
+    timestamp_prefix = datetime.now().strftime("%Y%m%d%H%M%S_%f")
     filename = f"{timestamp_prefix}_{safe_title}.md"
     filepath = os.path.join(MEMORIES_DIR, filename)
     
@@ -2055,6 +2075,9 @@ async def compress_and_store_context() -> str:
         return f"FAILED during Targeted Handoff Synthesis Phase. Error: {str(e)}{trace_note}"
 
 
+_WORKSPACE_STATE_LOCK = asyncio.Lock()
+
+
 @mcp.tool()
 async def forge_and_register_plugin(
     category: str, 
@@ -2226,7 +2249,7 @@ async def forge_and_register_plugin(
                     if check.returncode != 0: is_valid = False; err_msg = check.stderr
             elif target_lang == "rust":
                 # Flawless validation: Provisions an isolated cargo scratchpad project to resolve external crates automatically
-                scratch_dir = "/app/workspace/sandbox/.check_rust"
+                scratch_dir = f"/app/workspace/sandbox/.check_rust_{safe_name}"
                 os.makedirs(os.path.join(scratch_dir, "src"), exist_ok=True)
                 
                 # Parse optional crate dependencies from comments (e.g., // REQUIRES: serde_json = "1.0")
@@ -2280,6 +2303,8 @@ edition = "2021"
                     smoke_cmd = ["tsx", filename, "--help"]
 
                 if smoke_cmd:
+                    stray_help = os.path.join(PLUGINS_DIR, "--help")
+                    had_help = os.path.exists(stray_help)
                     try:
                         smoke_res = await asyncio.to_thread(
                             subprocess.run, smoke_cmd, cwd=PLUGINS_DIR, env=smoke_env,
@@ -2295,13 +2320,12 @@ edition = "2021"
                         pass
                     except Exception:
                         pass
+                    finally:
+                        if not had_help and os.path.exists(stray_help):
+                            try: os.remove(stray_help)
+                            except Exception: pass
 
             if is_valid:
-                registry = load_json(TOOL_REGISTRY_FILE)
-                if category not in registry: registry[category] = {"category_description": category_description, "tools": {}}
-                registry[category]["tools"][plugin_name] = {"path": file_path, "description": plugin_description, "language": target_lang, "usage_objective": objective}
-                save_json(TOOL_REGISTRY_FILE, registry)
-
                 bin_dir = os.path.join(PLUGINS_DIR, "bin")
                 os.makedirs(bin_dir, exist_ok=True)
                 bin_path = os.path.join(bin_dir, safe_name)
@@ -2318,7 +2342,7 @@ edition = "2021"
                         shutil.copy2(bin_path, f"{file_path}_bin")
                     except Exception:
                         pass
-                    run_hint = f"execute_bash('g++ -std=c++17 {file_path} -o {file_path}_bin && {file_path}_bin')"
+                    run_hint = f"execute_bash('{file_path}_bin')"
                 elif target_lang == "rust":
                     project_dir = f"/app/workspace/sandbox/{safe_name}_project"
                     try:
@@ -2328,25 +2352,25 @@ edition = "2021"
                         shutil.copy2(file_path, os.path.join(project_dir, "src", "main.rs"))
                     except Exception:
                         pass
-                    cargo_deps_escaped = deps_block.replace('"', '\\"').replace('\n', '\\n')
-                    run_hint = (
-                        f"execute_bash('mkdir -p /app/workspace/sandbox/{safe_name}_project/src && "
-                        f"printf \"[package]\\nname = \\\"{safe_name}\\\"\\nversion = \\\"0.1.0\\\"\\nedition = \\\"2021\\\"\\n\\n[dependencies]\\n{cargo_deps_escaped}\" > /app/workspace/sandbox/{safe_name}_project/Cargo.toml && "
-                        f"cp {file_path} /app/workspace/sandbox/{safe_name}_project/src/main.rs && "
-                        f"cd /app/workspace/sandbox/{safe_name}_project && cargo run')"
-                    )
+                    run_hint = f"execute_bash('cd /app/workspace/sandbox/{safe_name}_project && cargo run -q --')"
 
-                if os.path.exists("/app/workspace/.git"):
-                    try:
-                        proc_add = await asyncio.create_subprocess_exec("git", "add", file_path, cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                        await proc_add.communicate()
-                        proc_diff = await asyncio.create_subprocess_exec("git", "diff", "--cached", "--quiet", cwd=WORKSPACE_DIR)
-                        if (await proc_diff.wait()) != 0:
-                            clean_desc = re.sub(r'[\r\n\x00-\x1f]+', ' ', plugin_description).strip()[:40]
-                            proc_commit = await asyncio.create_subprocess_exec("git", "commit", "-m", f"feat(coder): forge {target_lang} plugin {safe_name} - {clean_desc}", cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                            await proc_commit.communicate()
-                    except Exception:
-                        pass
+                async with _WORKSPACE_STATE_LOCK:
+                    registry = load_json(TOOL_REGISTRY_FILE)
+                    if category not in registry: registry[category] = {"category_description": category_description, "tools": {}}
+                    registry[category]["tools"][plugin_name] = {"path": file_path, "description": plugin_description, "language": target_lang, "usage_objective": objective}
+                    save_json(TOOL_REGISTRY_FILE, registry)
+
+                    if os.path.exists("/app/workspace/.git"):
+                        try:
+                            proc_add = await asyncio.create_subprocess_exec("git", "add", file_path, cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                            await proc_add.communicate()
+                            proc_diff = await asyncio.create_subprocess_exec("git", "diff", "--cached", "--quiet", cwd=WORKSPACE_DIR)
+                            if (await proc_diff.wait()) != 0:
+                                clean_desc = re.sub(r'[\r\n\x00-\x1f]+', ' ', plugin_description).strip()[:40]
+                                proc_commit = await asyncio.create_subprocess_exec("git", "commit", "-m", f"feat(coder): forge {target_lang} plugin {safe_name} - {clean_desc}", cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                                await proc_commit.communicate()
+                        except Exception:
+                            pass
 
                 code_lines = len(code.splitlines())
                 report = f"SUCCESS (Attempt {attempt+1}): {language.upper()} Asset '{plugin_name}' saved to registry.\n"
@@ -2677,7 +2701,7 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
 
         # Archive backup snapshot
         filename = os.path.basename(real_target)
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S_%f")
         backup_path = f"/app/workspace/archive/{filename}.{timestamp}.surgical.bak"
         with open(backup_path, "w", encoding="utf-8") as f:
             f.write(current_code)
@@ -2690,17 +2714,18 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
 
         # Dynamic Git Commit Tracking Checkpoint
         if os.path.exists("/app/workspace/.git"):
-            try:
-                proc_add = await asyncio.create_subprocess_exec("git", "add", real_target, cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                await proc_add.communicate()
-                proc_diff = await asyncio.create_subprocess_exec("git", "diff", "--cached", "--quiet", cwd=WORKSPACE_DIR)
-                diff_rc = await proc_diff.wait()
-                if diff_rc != 0:
-                    clean_obj = re.sub(r'[\r\n\x00-\x1f]+', ' ', edit_objective).strip()[:40]
-                    proc_commit = await asyncio.create_subprocess_exec("git", "commit", "-m", f"feat(coder): surgical patch applied ({len(edits_list)} edits) for {clean_obj}", cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                    await proc_commit.communicate()
-            except Exception:
-                pass
+            async with _WORKSPACE_STATE_LOCK:
+                try:
+                    proc_add = await asyncio.create_subprocess_exec("git", "add", real_target, cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                    await proc_add.communicate()
+                    proc_diff = await asyncio.create_subprocess_exec("git", "diff", "--cached", "--quiet", cwd=WORKSPACE_DIR)
+                    diff_rc = await proc_diff.wait()
+                    if diff_rc != 0:
+                        clean_obj = re.sub(r'[\r\n\x00-\x1f]+', ' ', edit_objective).strip()[:40]
+                        proc_commit = await asyncio.create_subprocess_exec("git", "commit", "-m", f"feat(coder): surgical patch applied ({len(edits_list)} edits) for {clean_obj}", cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                        await proc_commit.communicate()
+                except Exception:
+                    pass
 
         registry = load_json(TOOL_REGISTRY_FILE)
         blueprint_hint = ""
@@ -2786,113 +2811,113 @@ async def query_sqlite_db(db_path: str, query: str, parameters: list = None, sea
             else:
                 parameters.append(vector_blob)
         
-        # --- Database Execution ---
-        db_dir = os.path.dirname(db_path)
-        if db_dir:
-            os.makedirs(db_dir, exist_ok=True)
-            
-        conn = sqlite3.connect(db_path)
-        conn.set_authorizer(sqlite_authorizer)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        is_bulk_operation = False
-        is_multi_statement = False
-        multi_stmt_rowcount = 0
-        
-        try:
-            if parameters:
-                # Detect Bulk Insert (List of Lists)
-                if len(parameters) > 0 and isinstance(parameters[0], list):
-                    cursor.executemany(query, parameters)
-                    is_bulk_operation = True
-                else:
-                    cursor.execute(query, parameters)
-            else:
+        # --- Database Execution (offloaded to thread to avoid blocking the async event loop) ---
+        def _exec_sqlite():
+            c = None
+            try:
+                db_dir = os.path.dirname(db_path)
+                if db_dir:
+                    os.makedirs(db_dir, exist_ok=True)
+                    
+                c = sqlite3.connect(db_path)
+                c.set_authorizer(sqlite_authorizer)
+                c.execute("PRAGMA journal_mode=WAL")
+                c.enable_load_extension(True)
+                sqlite_vec.load(c)
+                c.row_factory = sqlite3.Row
+                cursor = c.cursor()
+                
+                is_bulk_operation = False
+                is_multi_statement = False
+                multi_stmt_rowcount = 0
+                
                 try:
-                    cursor.execute(query)
-                except Exception as e:
-                    # Catch multi-statement attempts and execute statements sequentially via cursor.execute()
-                    if "one statement at a time" in str(e).lower() or "can only execute one statement" in str(e).lower():
-                        forbidden_patterns = [r'\bdrop\s+table\b', r'\bdelete\s+from\b', r'\btruncate\b']
-                        if any(re.search(pat, query.lower()) for pat in forbidden_patterns):
-                            return "SYSTEM ERROR: Destructive database modifications (DROP/DELETE) are blocked in multi-statement queries."
-                        
-                        statements = []
-                        buf = ""
-                        for part in re.split(r'(;)', query):
-                            buf += part
-                            if part == ";" and sqlite3.complete_statement(buf):
+                    if parameters:
+                        if len(parameters) > 0 and isinstance(parameters[0], list):
+                            cursor.executemany(query, parameters)
+                            is_bulk_operation = True
+                        else:
+                            cursor.execute(query, parameters)
+                    else:
+                        try:
+                            cursor.execute(query)
+                        except Exception as e:
+                            if "one statement at a time" in str(e).lower() or "can only execute one statement" in str(e).lower():
+                                forbidden_patterns = [r'\bdrop\s+table\b', r'\bdelete\s+from\b', r'\btruncate\b']
+                                if any(re.search(pat, query.lower()) for pat in forbidden_patterns):
+                                    return "SYSTEM ERROR: Destructive database modifications (DROP/DELETE) are blocked in multi-statement queries."
+                                
+                                statements = []
+                                buf = ""
+                                for part in re.split(r'(;)', query):
+                                    buf += part
+                                    if part == ";" and sqlite3.complete_statement(buf):
+                                        if re.sub(r'--[^\n]*|/\*[\s\S]*?\*/', '', buf).rstrip(';').strip():
+                                            statements.append(buf.strip())
+                                        buf = ""
                                 if re.sub(r'--[^\n]*|/\*[\s\S]*?\*/', '', buf).rstrip(';').strip():
                                     statements.append(buf.strip())
-                                buf = ""
-                        if re.sub(r'--[^\n]*|/\*[\s\S]*?\*/', '', buf).rstrip(';').strip():
-                            statements.append(buf.strip())
 
-                        is_multi_statement = True
-                        for stmt in statements:
-                            cursor.execute(stmt)
-                            if cursor.description is None and cursor.rowcount and cursor.rowcount > 0:
-                                multi_stmt_rowcount += cursor.rowcount
-                    else:
-                        raise e
+                                is_multi_statement = True
+                                for stmt in statements:
+                                    cursor.execute(stmt)
+                                    if cursor.description is None and cursor.rowcount and cursor.rowcount > 0:
+                                        multi_stmt_rowcount += cursor.rowcount
+                            else:
+                                raise e
 
-        except Exception as db_exec_error:
-            # Force structural rollbacks immediately if transaction validation fails to avoid frozen journal locks
-            if conn:
-                conn.rollback()
-            raise db_exec_error
-                        
-        # --- Output Formatting & CONTEXT PROTECTION ---
-        if is_bulk_operation or cursor.description is None:
-            # executemany and non-SELECT statements don't return fetchable rows
-            rowcount = multi_stmt_rowcount if is_multi_statement else cursor.rowcount
-            result_str = f"Operation executed successfully. Rows affected/processed: {rowcount}"
-        else:
-            rows = cursor.fetchall()
-            if not rows:
-                result_str = "Query executed successfully. 0 rows returned."
-            else:
-                MAX_ROWS = 50
-                warning_msg = ""
-                if len(rows) > MAX_ROWS:
-                    warning_msg = f"\n\n... [SYSTEM WARNING: The query returned {len(rows)} rows, but only the first {MAX_ROWS} are shown to protect context. Use 'LIMIT' to paginate.]"
-                    rows = rows[:MAX_ROWS]
-                
-                data = []
-                for row in rows:
-                    row_dict = {}
-                    for k in row.keys():
-                        v = row[k]
-                        if isinstance(v, (bytes, bytearray)) and len(v) > 64:
-                            row_dict[k] = f"<BLOB {len(v)} bytes>"
-                        else:
-                            row_dict[k] = v
-                    data.append(row_dict)
-
-                result_str = json.dumps(data, indent=2, default=str)
-                if len(result_str) > 20000 and len(data) > 1:
-                    while len(result_str) > 20000 and len(data) > 1:
-                        data = data[:max(1, len(data) // 2)]
-                        result_str = json.dumps(data, indent=2, default=str)
-                    result_str += f"\n\n... [SYSTEM WARNING: Output was truncated to {len(data)} rows to stay within 20,000 characters. Refine your query or use LIMIT.]"
+                except Exception as db_exec_error:
+                    if c:
+                        c.rollback()
+                    raise db_exec_error
+                                
+                if is_bulk_operation or cursor.description is None:
+                    rowcount = multi_stmt_rowcount if is_multi_statement else cursor.rowcount
+                    res_str = f"Operation executed successfully. Rows affected/processed: {rowcount}"
                 else:
-                    result_str += warning_msg
-                    
-        conn.commit()
-        logger.info(f"[query_sqlite_db] Success on '{os.path.basename(db_path)}' ({query[:80].strip()})")
-        return result_str
+                    rows = cursor.fetchall()
+                    if not rows:
+                        res_str = "Query executed successfully. 0 rows returned."
+                    else:
+                        MAX_ROWS = 50
+                        warning_msg = ""
+                        if len(rows) > MAX_ROWS:
+                            warning_msg = f"\n\n... [SYSTEM WARNING: The query returned {len(rows)} rows, but only the first {MAX_ROWS} are shown to protect context. Use 'LIMIT' to paginate.]"
+                            rows = rows[:MAX_ROWS]
+                        
+                        data = []
+                        for row in rows:
+                            row_dict = {}
+                            for k in row.keys():
+                                v = row[k]
+                                if isinstance(v, (bytes, bytearray)) and len(v) > 64:
+                                    row_dict[k] = f"<BLOB {len(v)} bytes>"
+                                else:
+                                    row_dict[k] = v
+                            data.append(row_dict)
+
+                        res_str = json.dumps(data, indent=2, default=str)
+                        if len(res_str) > 20000 and len(data) > 1:
+                            while len(res_str) > 20000 and len(data) > 1:
+                                data = data[:max(1, len(data) // 2)]
+                                res_str = json.dumps(data, indent=2, default=str)
+                            res_str += f"\n\n... [SYSTEM WARNING: Output was truncated to {len(data)} rows to stay within 20,000 characters. Refine your query or use LIMIT.]"
+                        else:
+                            res_str += warning_msg
+                            
+                c.commit()
+                logger.info(f"[query_sqlite_db] Success on '{os.path.basename(db_path)}' ({query[:80].strip()})")
+                return res_str
+            finally:
+                if c:
+                    c.close()
+
+        return await asyncio.to_thread(_exec_sqlite)
 
     except Exception as e:
         clean_q = query[:120].replace('\n', ' ').strip()
         logger.error(f"[query_sqlite_db] Error on '{os.path.basename(db_path)}' query [{clean_q}]: {str(e)}")
         return f"SYSTEM ERROR: Database Exception on query [{clean_q}]: {str(e)}"
-    finally:
-        if conn:
-            conn.close() # GUARANTEES the lock is released!
 
 
 @mcp.tool()
@@ -3218,7 +3243,7 @@ async def fetch_webpage(url: str) -> str:
                 # Create a safe filename based on the domain name
                 parsed_url = urllib.parse.urlparse(url)
                 safe_domain = re.sub(r'[^a-zA-Z0-9]', '_', parsed_url.hostname or "webpage")
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                 temp_file_name = f"web_{safe_domain}_{timestamp}.txt"
                 os.makedirs(SANDBOX_DIR, exist_ok=True)
                 temp_file_path = os.path.join(SANDBOX_DIR, temp_file_name)
@@ -3610,7 +3635,7 @@ async def analyze_files(
             combined_text += "\n\n[SYSTEM NOTICE: Analyst generation was cut short because it reached the max_tokens limit. Consider requesting a more concise format or auditing specific sections.]"
         
         # --- 3. AUTO-SAVE THE FULL COMBINED REPORT (pure report output) ---
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"{timestamp}_analyst_report.md"
         filepath = os.path.join(STATE_DIR, filename)
         

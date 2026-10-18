@@ -261,14 +261,18 @@ def compact_historical_tool_outputs(messages, protect_recent: int = None, min_ch
     if min_chars is None:
         min_chars = config.TOOL_PRUNE_MIN_CHARS
 
-    # 1. Identify all tool output messages by role
+    # 1. Identify all tool output messages by role, and those large enough to be prunable
     tool_indices = [idx for idx, msg in enumerate(messages) if msg.get("role") == "tool"]
+    prunable_indices = [
+        idx for idx in tool_indices
+        if len(str(messages[idx].get("content", ""))) > min_chars or COMPACTION_MARKER in str(messages[idx].get("content", ""))
+    ]
     
-    if len(tool_indices) <= protect_recent:
+    if len(prunable_indices) <= protect_recent:
         return messages, 0
     
-    # 2. Protect the most recent N tool calls; all older tool calls are pruning candidates
-    protected_tool_indices = set(tool_indices[-protect_recent:]) if protect_recent > 0 else set()
+    # 2. Protect the most recent N prunable tool calls; all older large tool calls are pruning candidates
+    protected_tool_indices = set(prunable_indices[-protect_recent:]) if protect_recent > 0 else set()
     
     manifest_path = os.path.join(SESSION_DIR, "sandbox/history_tool_outputs/manifest.json")
     manifest = {}
@@ -321,15 +325,27 @@ def compact_historical_tool_outputs(messages, protect_recent: int = None, min_ch
             except Exception:
                 pass
                 
-            # Extract high-signal preview (first non-empty line + exit status if present)
-            lines = [line.strip() for line in content.splitlines() if line.strip()]
-            first_line = lines[0][:140] if lines else ""
-            last_line = lines[-1][:140] if len(lines) > 1 else ""
+            # Extract high-signal head + tail preview (preserving exit status & key start/end findings)
+            raw_lines = [line.strip() for line in content.splitlines() if line.strip()]
+            status_line = ""
+            body_lines = []
+            for ln in raw_lines:
+                if not status_line and ln.lower().startswith("exit code:"):
+                    status_line = ln[:100]
+                elif ln.lower() == "output:":
+                    continue
+                else:
+                    body_lines.append(ln)
+            body_text = "\n".join(body_lines)
+            head_snip = body_text[:300].replace("\n", " | ")
+            tail_snip = body_text[-300:].replace("\n", " | ") if len(body_text) > 350 else ""
             preview_items = []
-            if first_line:
-                preview_items.append(f"Preview: {first_line}")
-            if last_line and last_line != first_line and any(k in last_line.lower() for k in ["exit code", "error", "success", "done", "status"]):
-                preview_items.append(f"Status: {last_line}")
+            if status_line:
+                preview_items.append(f"Status: {status_line}")
+            if head_snip:
+                preview_items.append(f"Head Preview: {head_snip}")
+            if tail_snip and tail_snip != head_snip:
+                preview_items.append(f"Tail Preview: ... {tail_snip}")
             preview_text = ("\n".join(preview_items) + "\n") if preview_items else ""
             
             compacted_body = (
@@ -338,7 +354,7 @@ def compact_historical_tool_outputs(messages, protect_recent: int = None, min_ch
                 f"Archived on disk: /app/workspace/{rel_path}\n"
                 f"{preview_text}"
                 f"[NOTE FOR BRAIN: Full verbatim output is preserved on disk. "
-                f"To inspect complete output, use execute_bash ('head -n 50 /app/workspace/{rel_path}') or analyze_files.]"
+                f"To inspect complete output, use execute_bash ('cat /app/workspace/{rel_path}') or analyze_files.]"
             )
             msg_copy = copy.copy(msg)
             msg_copy["content"] = compacted_body
@@ -674,10 +690,11 @@ async def run_chat():
                         git commit -m "chore: initial sandbox tracking initialization" > /dev/null 2>&1
                     fi
                     
-                    # 4. APPLICATION PROTECTION: Lock down standard library and user site-packages
+                    # 4. APPLICATION PROTECTION: Lock down standard library, user site-packages, and /app root
                     mkdir -p /home/agent/.local/lib/python3.14/site-packages
                     chmod -R a-w /home/agent/.local/ 2>/dev/null
                     chmod -R a-w /app/__pycache__ 2>/dev/null
+                    chmod a-w /app 2>/dev/null
                     
                     # 5. HARDENING: Freeze the Pixi environment binary path to block PATH hijacking
                     chmod -R a-w /app/.pixi/envs/default/bin/ 2>/dev/null
@@ -1585,25 +1602,113 @@ async def run_chat():
 
                                 consecutive_no_tool_turns = 0
 
-                                for tc_data in assistant_message["tool_calls"]:
-                                    name = tc_data["function"]["name"]
-                                    args_str = tc_data["function"]["arguments"]
-                                    tc_id = tc_data["id"]
+                                state_dir = os.path.join(SESSION_DIR, "state")
+                                next_call_num = config.get_tool_totals(state_dir).get("total_calls", 0) + 1
 
-                                    state_dir = os.path.join(SESSION_DIR, "state")
-                                    tool_totals_before = config.get_tool_totals(state_dir)
-                                    call_num = tool_totals_before.get("total_calls", 0) + 1
-                                    
-                                    # --- Intercept and self-heal bad JSON ---
+                                # Partition tool calls into concurrent execution waves
+                                parsed_tool_items = []
+                                for tc_data in assistant_message["tool_calls"]:
+                                    t_name = tc_data["function"]["name"]
+                                    t_args_str = tc_data["function"]["arguments"]
+                                    t_id = tc_data["id"]
+                                    c_num = next_call_num
+                                    next_call_num += 1
                                     try:
-                                        args = json.loads(args_str)
+                                        t_args = json.loads(t_args_str)
+                                        if not isinstance(t_args, dict):
+                                            t_args = {}
+                                        parsed_tool_items.append({
+                                            "name": t_name, "args": t_args, "args_str": t_args_str,
+                                            "tc_id": t_id, "call_num": c_num, "malformed": False
+                                        })
                                     except json.JSONDecodeError:
+                                        parsed_tool_items.append({
+                                            "name": t_name, "args": {}, "args_str": t_args_str,
+                                            "tc_id": t_id, "call_num": c_num, "malformed": True
+                                        })
+
+                                file_writers = {"forge_and_register_plugin", "surgical_code_edit", "write_file", "commission_architect"}
+                                file_consumers = {"execute_bash", "analyze_files", "consult_adviser", "load_skill"}
+
+                                def _is_file_writer(it):
+                                    nm = it["name"]
+                                    ag = it["args"] if isinstance(it["args"], dict) else {}
+                                    return (
+                                        nm in file_writers
+                                        or (nm == "query_universal_llm" and bool(ag.get("output_filepath")))
+                                        or (nm == "execute_rest_call" and bool(ag.get("response_filepath")))
+                                    )
+
+                                def _is_file_consumer(it):
+                                    nm = it["name"]
+                                    ag = it["args"] if isinstance(it["args"], dict) else {}
+                                    return nm in file_consumers or bool(ag.get("context_filepaths")) or bool(ag.get("media_filepaths"))
+
+                                def _target_resource(it):
+                                    nm = it["name"]
+                                    ag = it["args"] if isinstance(it["args"], dict) else {}
+                                    if nm in ("write_file", "surgical_code_edit") and ag.get("filepath"):
+                                        return f"file:{os.path.normpath(str(ag['filepath']).strip())}"
+                                    if nm == "query_universal_llm" and ag.get("output_filepath"):
+                                        return f"file:{os.path.normpath(str(ag['output_filepath']).strip())}"
+                                    if nm == "execute_rest_call" and ag.get("response_filepath"):
+                                        return f"file:{os.path.normpath(str(ag['response_filepath']).strip())}"
+                                    if nm == "forge_and_register_plugin" and ag.get("plugin_name"):
+                                        return f"plugin:{str(ag['plugin_name']).strip().lower()}"
+                                    if nm == "commission_architect" and ag.get("skill_name"):
+                                        return f"skill:{str(ag['skill_name']).strip().lower()}"
+                                    if nm in ("query_sqlite_db", "batch_generate_embeddings") and ag.get("db_path"):
+                                        return f"db:{os.path.normpath(str(ag['db_path']).strip())}"
+                                    if nm == "manage_plan":
+                                        return "state:active_plan"
+                                    if nm in ("store_memory", "read_memory", "view_memory_registry"):
+                                        return "state:memory_registry" if nm == "store_memory" else ""
+                                    return ""
+
+                                def _can_join_wave(current_wave, candidate):
+                                    if not current_wave:
+                                        return True
+                                    if len(current_wave) >= 4:
+                                        return False
+                                    for item in (current_wave[-1], candidate):
+                                        if item["malformed"]:
+                                            return False
+                                        iname = item["name"]
+                                        if iname in ("compress_and_store_context", "manage_external_mcp"):
+                                            return False
+                                        if iname in ext_tool_router and ext_tool_router[iname].get("require_confirmation", False):
+                                            return False
+                                    wave_names = {w["name"] for w in current_wave}
+                                    cname = candidate["name"]
+                                    if cname == "execute_bash" and "execute_bash" in wave_names:
+                                        return False
+                                    if (_is_file_consumer(candidate) and any(_is_file_writer(w) for w in current_wave)) or (_is_file_writer(candidate) and any(_is_file_consumer(w) for w in current_wave)):
+                                        return False
+                                    cand_res = _target_resource(candidate)
+                                    if cand_res and any(_target_resource(w) == cand_res for w in current_wave):
+                                        return False
+                                    return True
+
+                                tool_waves = []
+                                for item in parsed_tool_items:
+                                    if not tool_waves or not _can_join_wave(tool_waves[-1], item):
+                                        tool_waves.append([item])
+                                    else:
+                                        tool_waves[-1].append(item)
+
+                                compress_triggered = False
+                                for wave in tool_waves:
+                                    if len(wave) == 1 and wave[0]["malformed"]:
+                                        m_item = wave[0]
+                                        name = m_item["name"]
+                                        call_num = m_item["call_num"]
+                                        args_str = m_item["args_str"]
+                                        tc_id = m_item["tc_id"]
                                         error_msg = "SYSTEM ERROR: You provided invalid JSON arguments for this tool call. Please check your syntax (watch out for unescaped quotes or missing brackets) and try again."
                                         print(f"{COLOR_RED}Error decoding JSON (Tool #{call_num}: {name}). Intercepting and asking Brain to retry...{COLOR_RESET}")
                                         config.log_tool_usage(state_dir, name, caller="brain", duration_seconds=0.0, is_error=True)
                                         log_event(f"TOOL CALL #{call_num} ({name})", f"Requesting: {name}\nArgs: [MALFORMED JSON]\n{args_str}")
                                         log_event(f"TOOL RESULT #{call_num} ({name}) (0.00s)", error_msg, text_color=COLOR_RED)
-                                        
                                         messages = load_history()
                                         messages.append({
                                             "role": "tool",
@@ -1612,271 +1717,291 @@ async def run_chat():
                                             "content": error_msg
                                         })
                                         save_history(messages)
-                                        continue 
+                                        continue
 
-                                    # Hide massive JSON strings from console if in minimal/standard
+                                    if len(wave) > 1 and config.VERBOSITY_MODE != "silent":
+                                        print(f"\n{COLOR_CYAN}[⚡ Parallel Wave: Executing {len(wave)} tools concurrently (Tools #{wave[0]['call_num']}–#{wave[-1]['call_num']})]{COLOR_RESET}")
+
                                     hide_args = config.VERBOSITY_MODE in ["minimal", "standard"]
-                                    log_event(f"TOOL CALL #{call_num} ({name})", f"Requesting: {name}\nArgs: {json.dumps(args, indent=2)}", hide_console=hide_args)
+                                    for w_item in wave:
+                                        name = w_item["name"]
+                                        args = w_item["args"]
+                                        call_num = w_item["call_num"]
+                                        log_event(f"TOOL CALL #{call_num} ({name})", f"Requesting: {name}\nArgs: {json.dumps(args, indent=2)}", hide_console=hide_args)
 
-                                    if config.VERBOSITY_MODE != "silent":
-                                        pfx = f"▶ Tool #{call_num}: "
-                                        if name == "forge_and_register_plugin":
-                                            print(f"\n{COLOR_ORANGE}{pfx}Routing to Coder for plugin forging...{COLOR_RESET}")
-                                        elif name == "compress_and_store_context":
-                                            print(f"\n{COLOR_ORANGE}{pfx}Triggering Memory Manager Pipeline... Awaiting response...{COLOR_RESET}")
-                                        elif name == "consult_adviser":
-                                            print(f"\n{COLOR_ORANGE}{pfx}Consulting Senior Adviser... Awaiting strategic report...{COLOR_RESET}")
-                                        elif name == "fast_decision":
-                                            print(f"\n{COLOR_ORANGE}{pfx}Routing to The Decider for rapid ruling...{COLOR_RESET}")
-                                        elif name == "query_universal_llm":
-                                            target_model = args.get("model", "")
-                                            target_ep = args.get("endpoint", "")
-                                            ep_str = f" ({target_model}" + (f" on {target_ep}" if target_ep else "") + ")" if target_model else ""
-                                            print(f"\n{COLOR_ORANGE}{pfx}Spawning Universal Sub-Agent{ep_str}... Awaiting response...{COLOR_RESET}")
-                                        elif name == "execute_rest_call":
-                                            target_url = args.get("url", "")
-                                            print(f"\n{COLOR_ORANGE}{pfx}Dispatching REST call ({target_url})...{COLOR_RESET}")
-                                        elif name == "analyze_files":
-                                            print(f"\n{COLOR_ORANGE}{pfx}Passing files to The Analyst... Awaiting report...{COLOR_RESET}")
-                                        elif name == "commission_architect":
-                                            print(f"\n{COLOR_ORANGE}{pfx}Waking up the Architect to draft skill...{COLOR_RESET}")
-                                        elif name == "manage_external_mcp":
-                                            action_tag = args.get("action", "")
-                                            srv_tag = args.get("server_name", "")
-                                            print(f"\n{COLOR_CYAN}{pfx}Managing external MCP tool suites ({action_tag} {srv_tag})...{COLOR_RESET}")
-                                        elif name in ext_tool_router:
-                                            srv_id = ext_tool_router[name]["server_id"]
-                                            print(f"\n{COLOR_CYAN}{pfx}Routing to external host MCP '{srv_id}': {name}...{COLOR_RESET}")
-                                        elif hide_args:
-                                            # If we hid the JSON args, print a clean 1-liner so the user knows it's doing something!
-                                            print(f"{COLOR_ORANGE}{pfx}Running tool: {name}...{COLOR_RESET}")
-                                            
-                                    start = time.time()
-                                    totals_before = config.get_token_totals(state_dir)
-                                    
-                                    try:
-                                        if name == "manage_external_mcp":
-                                            output = await handle_manage_external_mcp(args)
-                                            result = None
-                                        elif name in ext_tool_router:
-                                            target = ext_tool_router[name]
-                                            srv_id = target["server_id"]
-                                            orig_name = target["original_name"]
-                                            if target.get("require_confirmation", False):
-                                                if cli_args.exit:
-                                                    output = f"SYSTEM ERROR: Tool '{name}' requires human confirmation, but running in unattended batch mode (-x). Execution stopped/denied."
-                                                    print(f"\n{COLOR_RED}[SECURITY GATE] {output}{COLOR_RESET}")
-                                                    log_event("SYSTEM", output)
-                                                    result = None
-                                                else:
-                                                    print(f"\n{COLOR_RED}[SECURITY GATE] The Brain requests to execute external tool '{name}' on '{srv_id}'.{COLOR_RESET}")
-                                                    print(f"{COLOR_YELLOW}Arguments: {json.dumps(args, indent=2)}{COLOR_RESET}")
-                                                    try:
-                                                        confirm = await asyncio.to_thread(input, f"{COLOR_CYAN}Allow execution on host? [y/N]: {COLOR_RESET}")
-                                                    except (EOFError, KeyboardInterrupt):
-                                                        confirm = "n"
-                                                    if confirm.strip().lower() not in ["y", "yes"]:
-                                                        output = f"SYSTEM NOTICE: Execution of external tool '{name}' was DENIED by the user for security reasons."
-                                                        print(f"{COLOR_YELLOW}{output}{COLOR_RESET}")
+                                        if config.VERBOSITY_MODE != "silent":
+                                            pfx = f"▶ Tool #{call_num}: "
+                                            if name == "forge_and_register_plugin":
+                                                print(f"\n{COLOR_ORANGE}{pfx}Routing to Coder for plugin forging...{COLOR_RESET}")
+                                            elif name == "compress_and_store_context":
+                                                print(f"\n{COLOR_ORANGE}{pfx}Triggering Memory Manager Pipeline... Awaiting response...{COLOR_RESET}")
+                                            elif name == "consult_adviser":
+                                                print(f"\n{COLOR_ORANGE}{pfx}Consulting Senior Adviser... Awaiting strategic report...{COLOR_RESET}")
+                                            elif name == "fast_decision":
+                                                print(f"\n{COLOR_ORANGE}{pfx}Routing to The Decider for rapid ruling...{COLOR_RESET}")
+                                            elif name == "query_universal_llm":
+                                                target_model = args.get("model", "")
+                                                target_ep = args.get("endpoint", "")
+                                                ep_str = f" ({target_model}" + (f" on {target_ep}" if target_ep else "") + ")" if target_model else ""
+                                                print(f"\n{COLOR_ORANGE}{pfx}Spawning Universal Sub-Agent{ep_str}... Awaiting response...{COLOR_RESET}")
+                                            elif name == "execute_rest_call":
+                                                target_url = args.get("url", "")
+                                                print(f"\n{COLOR_ORANGE}{pfx}Dispatching REST call ({target_url})...{COLOR_RESET}")
+                                            elif name == "analyze_files":
+                                                print(f"\n{COLOR_ORANGE}{pfx}Passing files to The Analyst... Awaiting report...{COLOR_RESET}")
+                                            elif name == "commission_architect":
+                                                print(f"\n{COLOR_ORANGE}{pfx}Waking up the Architect to draft skill...{COLOR_RESET}")
+                                            elif name == "manage_external_mcp":
+                                                action_tag = args.get("action", "")
+                                                srv_tag = args.get("server_name", "")
+                                                print(f"\n{COLOR_CYAN}{pfx}Managing external MCP tool suites ({action_tag} {srv_tag})...{COLOR_RESET}")
+                                            elif name in ext_tool_router:
+                                                srv_id = ext_tool_router[name]["server_id"]
+                                                print(f"\n{COLOR_CYAN}{pfx}Routing to external host MCP '{srv_id}': {name}...{COLOR_RESET}")
+                                            elif hide_args:
+                                                print(f"{COLOR_ORANGE}{pfx}Running tool: {name}...{COLOR_RESET}")
+
+                                    async def _execute_wave_item(w_item):
+                                        name = w_item["name"]
+                                        args = w_item["args"]
+                                        t_start = time.time()
+                                        try:
+                                            if name == "manage_external_mcp":
+                                                output = await handle_manage_external_mcp(args)
+                                                result = None
+                                            elif name in ext_tool_router:
+                                                target = ext_tool_router[name]
+                                                srv_id = target["server_id"]
+                                                orig_name = target["original_name"]
+                                                if target.get("require_confirmation", False):
+                                                    if cli_args.exit:
+                                                        output = f"SYSTEM ERROR: Tool '{name}' requires human confirmation, but running in unattended batch mode (-x). Execution stopped/denied."
+                                                        print(f"\n{COLOR_RED}[SECURITY GATE] {output}{COLOR_RESET}")
                                                         log_event("SYSTEM", output)
                                                         result = None
                                                     else:
-                                                        result = await call_external_tool(target, orig_name, args)
-                                            else:
-                                                result = await call_external_tool(target, orig_name, args)
-                                        else:
-                                            result = await session.call_tool(name, args)
-
-                                        if result is not None:
-                                            if result.content and len(result.content) > 0 and hasattr(result.content[0], "text"):
-                                                output = result.content[0].text
-                                            elif result.content and len(result.content) > 0:
-                                                output = str(result.content[0])
-                                            else:
-                                                output = "SUCCESS: Tool executed with no output."
-                                    except Exception as tool_err:
-                                        output = f"SYSTEM ERROR: Tool execution failed: {str(tool_err)}"
-                                    
-                                    tool_duration = time.time() - start
-                                    turn_tool_time += tool_duration
-
-                                    # --- FAILURE STREAK TRACKER (REFINED) ---
-                                    # Determine if the output looks like a true execution failure
-                                    is_error = False
-                                    output_lower = output.lower()
-                                    if "system error:" in output_lower or "traceback (most recent" in output_lower or "error executing" in output_lower or "unknown tool" in output_lower or "tool not found" in output_lower or "validation error" in output_lower:
-                                        is_error = True
-                                    elif "exit code:" in output_lower and "exit code: 0" not in output_lower:
-                                        # Distinguish benign inspection status codes from true execution errors
-                                        cmd_str = str(args.get("command", "")).strip() if isinstance(args, dict) else ""
-                                        first_word = cmd_str.split()[0] if cmd_str.split() else ""
-                                        # grep, diff, test return 1 for negative match or difference, not execution failure
-                                        if first_word in ["grep", "egrep", "fgrep", "rg", "diff", "cmp", "test", "[", "pgrep"] and "exit code: 1" in output_lower:
-                                            is_error = False
-                                        else:
-                                            is_error = True
-
-                                    config.log_tool_usage(
-                                        state_dir,
-                                        name,
-                                        caller="brain",
-                                        duration_seconds=tool_duration,
-                                        is_error=is_error
-                                    )
-
-                                    totals_after = config.get_token_totals(state_dir)
-                                    token_diff = config.get_totals_diff(totals_before, totals_after)
-                                    if token_diff and config.VERBOSITY_MODE != "silent":
-                                        diff_parts = []
-                                        for agent, details in token_diff.items():
-                                            part = f"{agent}: +{details['total']:,} ({details['prompt']:,} in, {details['completion']:,} out"
-                                            if details['thinking'] > 0:
-                                                part += f", {details['thinking']:,} thinking"
-                                            part += ")"
-                                            diff_parts.append(part)
-                                        print(f"{COLOR_YELLOW}[Tokens used: {', '.join(diff_parts)} | Time: {tool_duration:.2f}s | Tool #{call_num} ({name})]{COLOR_RESET}")
-
-                                    # Update the streak, tracking command variance so pivoting does not trigger false loops
-                                    cmd_fingerprint = json.dumps(args, sort_keys=True) if isinstance(args, dict) else str(args)
-                                    if is_error:
-                                        prev_cmd = tool_last_failed_args.get(name, "")
-                                        if prev_cmd and prev_cmd == cmd_fingerprint:
-                                            tool_failure_streaks[name] = tool_failure_streaks.get(name, 0) + 1
-                                        else:
-                                            tool_failure_streaks[name] = 1
-                                            tool_last_failed_args[name] = cmd_fingerprint
-                                    else:
-                                        tool_failure_streaks[name] = 0 # Reset on success!
-                                        tool_last_failed_args[name] = ""
-
-                                    # Trigger the intervention if stuck
-                                    if tool_failure_streaks.get(name, 0) >= 3:
-                                        intervention_msg = (
-                                            f"[CRITICAL SYSTEM ALERT: You have failed to use the '{name}' tool {tool_failure_streaks[name]} times in a row. "
-                                            f"YOU ARE STUCK IN A LOOP. You MUST STOP trying the exact same command. "
-                                            f"Reflect on why this is failing. Consider using 'consult_adviser' for a new strategy, "
-                                            f"or use 'fetch_webpage' to read the documentation for what you are trying to do.]"
-                                        )
-                                        # Append the warning directly to the output so the Brain reads it immediately
-                                        output += f"\n\n{intervention_msg}"
-                                        
-                                        if config.VERBOSITY_MODE != "silent":
-                                            print(f"\n{COLOR_RED}[SYSTEM: AI is stuck looping on {name}. Injecting forced intervention!]{COLOR_RESET}")
-                                        
-                                        log_event("SYSTEM", f"Forced intervention triggered for tool: {name}")
-
-                                    # --- CONSECUTIVE IDENTICAL TOOL CALL TRACKER (SOFT ADVISORY) ---
-                                    current_call_sig = (name, cmd_fingerprint)
-                                    if current_call_sig == last_tool_call_signature:
-                                        consecutive_identical_tool_calls += 1
-                                    else:
-                                        last_tool_call_signature = current_call_sig
-                                        consecutive_identical_tool_calls = 1
-
-                                    if consecutive_identical_tool_calls >= 5 and consecutive_identical_tool_calls % 5 == 0:
-                                        soft_loop_msg = config.PROMPTS["tool_loop_soft_warning"].format(
-                                            tool_name=name,
-                                            count=consecutive_identical_tool_calls
-                                        )
-                                        output += f"\n\n{soft_loop_msg}"
-                                        
-                                        if config.VERBOSITY_MODE != "silent":
-                                            print(f"\n{COLOR_YELLOW}[SYSTEM: Soft loop advisory for '{name}' ({consecutive_identical_tool_calls} identical calls in a row)]{COLOR_RESET}")
-                                        
-                                        log_event("SYSTEM", f"Soft loop advisory triggered for tool: {name} ({consecutive_identical_tool_calls} identical calls)")
-
-                                    # --- SUBAGENT HIDDEN THOUGHTS & ARTIFACTS LOGGING ---
-                                    subagent_specs = [
-                                        ("CODER", "coder", r"<___CODER_THOUGHTS___>(.*?)</___CODER_THOUGHTS___>", r"<___CODER_CODE___>(.*?)</___CODER_CODE___>", "GENERATED CODE / EDIT"),
-                                        ("ADVISER", "adviser", r"<___ADVISER_THOUGHTS___>(.*?)</___ADVISER_THOUGHTS___>", r"<___ADVISER_REPORT___>(.*?)</___ADVISER_REPORT___>", "ADVISER REPORT"),
-                                        ("ANALYST", "analyst", r"<___ANALYST_THOUGHTS___>(.*?)</___ANALYST_THOUGHTS___>", r"<___ANALYST_REPORT___>(.*?)</___ANALYST_REPORT___>", "ANALYST REPORT"),
-                                        ("ARCHITECT", "architect", r"<___ARCHITECT_THOUGHTS___>(.*?)</___ARCHITECT_THOUGHTS___>", r"<___ARCHITECT_SKILL___>(.*?)</___ARCHITECT_SKILL___>", "GENERATED SKILL"),
-                                        ("SUMMARIZER", "summarizer", r"<___SUMMARIZER_THOUGHTS___>(.*?)</___SUMMARIZER_THOUGHTS___>", r"<___SUMMARIZER_OUTPUT___>(.*?)</___SUMMARIZER_OUTPUT___>", "SUMMARIZER OUTPUT"),
-                                        ("DECIDER", "decider", None, r"<___DECIDER_RULING___>(.*?)</___DECIDER_RULING___>", "RULING"),
-                                        ("UNIVERSAL SUB-AGENT", "universal_llm", r"<___UNIVERSAL_THOUGHTS___>(.*?)</___UNIVERSAL_THOUGHTS___>", r"<___UNIVERSAL_OUTPUT___(?:\s+model=\"([^\"]*)\")?>(.*?)</___UNIVERSAL_OUTPUT___>", "RAW OUTPUT"),
-                                    ]
-
-                                    for agent_label, agent_key, thought_pattern, content_pattern, content_label in subagent_specs:
-                                        agent_thoughts = ""
-                                        agent_content = ""
-                                        model_tag = ""
-
-                                        if thought_pattern:
-                                            match_t = re.search(thought_pattern, output, re.DOTALL)
-                                            if match_t:
-                                                agent_thoughts = match_t.group(1).strip()
-                                                output = re.sub(thought_pattern, "", output, flags=re.DOTALL).strip()
-
-                                        if content_pattern:
-                                            match_c = re.search(content_pattern, output, re.DOTALL)
-                                            if match_c:
-                                                if len(match_c.groups()) == 2:
-                                                    model_tag = f" ({match_c.group(1)})" if match_c.group(1) else ""
-                                                    agent_content = match_c.group(2).strip()
+                                                        print(f"\n{COLOR_RED}[SECURITY GATE] The Brain requests to execute external tool '{name}' on '{srv_id}'.{COLOR_RESET}")
+                                                        print(f"{COLOR_YELLOW}Arguments: {json.dumps(args, indent=2)}{COLOR_RESET}")
+                                                        try:
+                                                            confirm = await asyncio.to_thread(input, f"{COLOR_CYAN}Allow execution on host? [y/N]: {COLOR_RESET}")
+                                                        except (EOFError, KeyboardInterrupt):
+                                                            confirm = "n"
+                                                        if confirm.strip().lower() not in ["y", "yes"]:
+                                                            output = f"SYSTEM NOTICE: Execution of external tool '{name}' was DENIED by the user for security reasons."
+                                                            print(f"{COLOR_YELLOW}{output}{COLOR_RESET}")
+                                                            log_event("SYSTEM", output)
+                                                            result = None
+                                                        else:
+                                                            result = await call_external_tool(target, orig_name, args)
                                                 else:
-                                                    agent_content = match_c.group(1).strip()
-                                                output = re.sub(content_pattern, "", output, flags=re.DOTALL).strip()
+                                                    result = await call_external_tool(target, orig_name, args)
+                                            else:
+                                                result = await session.call_tool(name, args)
 
-                                        if agent_thoughts or agent_content:
-                                            time_str = datetime.now().strftime("%H:%M:%S")
-                                            sub_call_num = totals_after.get(agent_key, {}).get("calls", 0)
-                                            sub_num_tag = f" #{sub_call_num}" if sub_call_num > 0 else ""
-                                            display_label = f"{agent_label}{sub_num_tag}{model_tag}"
-                                            log_text = f"\n[{time_str}] === {display_label} (HIDDEN) ===\n"
+                                            if result is not None:
+                                                if result.content and len(result.content) > 0 and hasattr(result.content[0], "text"):
+                                                    output = result.content[0].text
+                                                elif result.content and len(result.content) > 0:
+                                                    output = str(result.content[0])
+                                                else:
+                                                    output = "SUCCESS: Tool executed with no output."
+                                        except Exception as tool_err:
+                                            output = f"SYSTEM ERROR: Tool execution failed: {str(tool_err)}"
+                                        return output, (time.time() - t_start)
 
-                                            hide_subagent = config.VERBOSITY_MODE in ["silent", "minimal", "standard"]
+                                    wave_start_time = time.time()
+                                    totals_before = config.get_token_totals(state_dir)
+                                    wave_results = await asyncio.gather(*[_execute_wave_item(w_item) for w_item in wave])
+                                    wave_wall_duration = time.time() - wave_start_time
+                                    turn_tool_time += wave_wall_duration
+                                    totals_after = config.get_token_totals(state_dir)
+                                    wave_token_diff = config.get_totals_diff(totals_before, totals_after)
 
-                                            if not hide_subagent:
-                                                print(f"\n{COLOR_ORANGE}[{time_str}] === {display_label} (HIDDEN) ==={COLOR_RESET}")
+                                    subagent_call_cursors = {
+                                        ag: totals_before.get(ag, {}).get("calls", 0)
+                                        for ag in ("coder", "adviser", "analyst", "architect", "summarizer", "decider", "universal")
+                                    }
 
-                                            if agent_thoughts:
-                                                log_text += f"<thinking>\n{agent_thoughts}\n</thinking>\n\n"
-                                                if not hide_subagent:
-                                                    print(f"{COLOR_DIM}<thinking>\n{agent_thoughts}\n</thinking>{COLOR_RESET}")
+                                    for idx_in_wave, (w_item, (output, tool_duration)) in enumerate(zip(wave, wave_results)):
+                                        name = w_item["name"]
+                                        args = w_item["args"]
+                                        tc_id = w_item["tc_id"]
+                                        call_num = w_item["call_num"]
 
-                                            if agent_content:
-                                                log_text += f"--- {content_label} ---\n{agent_content}\n\n"
-                                                if not hide_subagent:
-                                                    print(f"--- {content_label} ---\n{agent_content}\n")
+                                        # --- FAILURE STREAK TRACKER (REFINED) ---
+                                        is_error = False
+                                        output_lower = output.lower()
+                                        if "system error:" in output_lower or "traceback (most recent" in output_lower or "error executing" in output_lower or "unknown tool" in output_lower or "tool not found" in output_lower or "validation error" in output_lower:
+                                            is_error = True
+                                        elif "exit code:" in output_lower and "exit code: 0" not in output_lower:
+                                            cmd_str = str(args.get("command", "")).strip() if isinstance(args, dict) else ""
+                                            first_word = cmd_str.split()[0] if cmd_str.split() else ""
+                                            if first_word in ["grep", "egrep", "fgrep", "rg", "diff", "cmp", "test", "[", "pgrep"] and "exit code: 1" in output_lower:
+                                                is_error = False
+                                            else:
+                                                is_error = True
 
-                                            with open(LOG_FILE, "a", encoding="utf-8") as f:
-                                                f.write(log_text.replace("\x00", ""))
+                                        config.log_tool_usage(
+                                            state_dir,
+                                            name,
+                                            caller="brain",
+                                            duration_seconds=tool_duration,
+                                            is_error=is_error
+                                        )
 
-                                    out_color = COLOR_ORANGE if name in ["forge_and_register_plugin", "compress_and_store_context", "commission_architect", "consult_adviser", "fast_decision", "query_universal_llm", "analyze_files", "execute_rest_call"] else COLOR_DARK_GREEN
-                                    
-                                    # Hide massive output dumps from console if in minimal/standard
-                                    hide_output = config.VERBOSITY_MODE in ["minimal", "standard"]
-                                    log_event(f"TOOL RESULT #{call_num} ({name}) ({tool_duration:.2f}s)", output, text_color=out_color, hide_console=hide_output)
-                                    
-                                    if hide_output and config.VERBOSITY_MODE != "silent":
-                                        if name in ["commission_architect", "consult_adviser", "fast_decision", "query_universal_llm", "analyze_files", "forge_and_register_plugin", "execute_rest_call"]:
-                                            print(f"{out_color}{output}{COLOR_RESET}")
+                                        if wave_token_diff and config.VERBOSITY_MODE != "silent" and (len(wave) == 1 or idx_in_wave == len(wave) - 1):
+                                            diff_parts = []
+                                            for agent, details in wave_token_diff.items():
+                                                part = f"{agent}: +{details['total']:,} ({details['prompt']:,} in, {details['completion']:,} out"
+                                                if details['thinking'] > 0:
+                                                    part += f", {details['thinking']:,} thinking"
+                                                part += ")"
+                                                diff_parts.append(part)
+                                            tool_label = f"Tool #{call_num} ({name})" if len(wave) == 1 else f"Parallel Wave #{wave[0]['call_num']}–#{wave[-1]['call_num']}"
+                                            time_val = tool_duration if len(wave) == 1 else wave_wall_duration
+                                            print(f"{COLOR_YELLOW}[Tokens used: {', '.join(diff_parts)} | Time: {time_val:.2f}s | {tool_label}]{COLOR_RESET}")
+
+                                        # Update the streak, tracking command variance so pivoting does not trigger false loops
+                                        cmd_fingerprint = json.dumps(args, sort_keys=True) if isinstance(args, dict) else str(args)
+                                        if is_error:
+                                            prev_cmd = tool_last_failed_args.get(name, "")
+                                            if prev_cmd and prev_cmd == cmd_fingerprint:
+                                                tool_failure_streaks[name] = tool_failure_streaks.get(name, 0) + 1
+                                            else:
+                                                tool_failure_streaks[name] = 1
+                                                tool_last_failed_args[name] = cmd_fingerprint
                                         else:
-                                            print(f"{COLOR_DARK_GREEN}✓ Tool #{call_num} '{name}' completed ({tool_duration:.2f}s).{COLOR_RESET}")
+                                            tool_failure_streaks[name] = 0
+                                            tool_last_failed_args[name] = ""
 
-                                    if name == "compress_and_store_context" and output.startswith("SUCCESS:"):
-                                        print(f"\n{COLOR_ORANGE}[SYSTEM] Memory compression cycle complete. Waking up with pristine context...{COLOR_RESET}")
-                                        messages = load_history()
-                                        if len(messages) <= 1:
+                                        if tool_failure_streaks.get(name, 0) >= 3:
+                                            intervention_msg = (
+                                                f"[CRITICAL SYSTEM ALERT: You have failed to use the '{name}' tool {tool_failure_streaks[name]} times in a row. "
+                                                f"YOU ARE STUCK IN A LOOP. You MUST STOP trying the exact same command. "
+                                                f"Reflect on why this is failing. Consider using 'consult_adviser' for a new strategy, "
+                                                f"or use 'fetch_webpage' to read the documentation for what you are trying to do.]"
+                                            )
+                                            output += f"\n\n{intervention_msg}"
+                                            if config.VERBOSITY_MODE != "silent":
+                                                print(f"\n{COLOR_RED}[SYSTEM: AI is stuck looping on {name}. Injecting forced intervention!]{COLOR_RESET}")
+                                            log_event("SYSTEM", f"Forced intervention triggered for tool: {name}")
+
+                                        # --- CONSECUTIVE IDENTICAL TOOL CALL TRACKER (SOFT ADVISORY) ---
+                                        current_call_sig = (name, cmd_fingerprint)
+                                        if current_call_sig == last_tool_call_signature:
+                                            consecutive_identical_tool_calls += 1
+                                        else:
+                                            last_tool_call_signature = current_call_sig
+                                            consecutive_identical_tool_calls = 1
+
+                                        if consecutive_identical_tool_calls >= 5 and consecutive_identical_tool_calls % 5 == 0:
+                                            soft_loop_msg = config.PROMPTS["tool_loop_soft_warning"].format(
+                                                tool_name=name,
+                                                count=consecutive_identical_tool_calls
+                                            )
+                                            output += f"\n\n{soft_loop_msg}"
+                                            if config.VERBOSITY_MODE != "silent":
+                                                print(f"\n{COLOR_YELLOW}[SYSTEM: Soft loop advisory for '{name}' ({consecutive_identical_tool_calls} identical calls in a row)]{COLOR_RESET}")
+                                            log_event("SYSTEM", f"Soft loop advisory triggered for tool: {name} ({consecutive_identical_tool_calls} identical calls)")
+
+                                        # --- SUBAGENT HIDDEN THOUGHTS & ARTIFACTS LOGGING ---
+                                        subagent_specs = [
+                                            ("CODER", "coder", r"<___CODER_THOUGHTS___>(.*?)</___CODER_THOUGHTS___>", r"<___CODER_CODE___>(.*?)</___CODER_CODE___>", "GENERATED CODE / EDIT"),
+                                            ("ADVISER", "adviser", r"<___ADVISER_THOUGHTS___>(.*?)</___ADVISER_THOUGHTS___>", r"<___ADVISER_REPORT___>(.*?)</___ADVISER_REPORT___>", "ADVISER REPORT"),
+                                            ("ANALYST", "analyst", r"<___ANALYST_THOUGHTS___>(.*?)</___ANALYST_THOUGHTS___>", r"<___ANALYST_REPORT___>(.*?)</___ANALYST_REPORT___>", "ANALYST REPORT"),
+                                            ("ARCHITECT", "architect", r"<___ARCHITECT_THOUGHTS___>(.*?)</___ARCHITECT_THOUGHTS___>", r"<___ARCHITECT_SKILL___>(.*?)</___ARCHITECT_SKILL___>", "GENERATED SKILL"),
+                                            ("SUMMARIZER", "summarizer", r"<___SUMMARIZER_THOUGHTS___>(.*?)</___SUMMARIZER_THOUGHTS___>", r"<___SUMMARIZER_OUTPUT___>(.*?)</___SUMMARIZER_OUTPUT___>", "SUMMARIZER OUTPUT"),
+                                            ("DECIDER", "decider", None, r"<___DECIDER_RULING___>(.*?)</___DECIDER_RULING___>", "RULING"),
+                                            ("UNIVERSAL SUB-AGENT", "universal", r"<___UNIVERSAL_THOUGHTS___>(.*?)</___UNIVERSAL_THOUGHTS___>", r"<___UNIVERSAL_OUTPUT___(?:\s+model=\"([^\"]*)\")?>(.*?)</___UNIVERSAL_OUTPUT___>", "RAW OUTPUT"),
+                                        ]
+
+                                        for agent_label, agent_key, thought_pattern, content_pattern, content_label in subagent_specs:
+                                            agent_thoughts = ""
+                                            agent_content = ""
+                                            model_tag = ""
+
+                                            if thought_pattern:
+                                                match_t = re.search(thought_pattern, output, re.DOTALL)
+                                                if match_t:
+                                                    agent_thoughts = match_t.group(1).strip()
+                                                    output = re.sub(thought_pattern, "", output, flags=re.DOTALL).strip()
+
+                                            if content_pattern:
+                                                match_c = re.search(content_pattern, output, re.DOTALL)
+                                                if match_c:
+                                                    if len(match_c.groups()) == 2:
+                                                        model_tag = f" ({match_c.group(1)})" if match_c.group(1) else ""
+                                                        agent_content = match_c.group(2).strip()
+                                                    else:
+                                                        agent_content = match_c.group(1).strip()
+                                                    output = re.sub(content_pattern, "", output, flags=re.DOTALL).strip()
+
+                                            if agent_thoughts or agent_content:
+                                                time_str = datetime.now().strftime("%H:%M:%S")
+                                                if len(wave) == 1:
+                                                    sub_call_num = totals_after.get(agent_key, {}).get("calls", 0)
+                                                else:
+                                                    subagent_call_cursors[agent_key] = subagent_call_cursors.get(agent_key, 0) + 1
+                                                    sub_call_num = subagent_call_cursors[agent_key]
+                                                sub_num_tag = f" #{sub_call_num}" if sub_call_num > 0 else ""
+                                                display_label = f"{agent_label}{sub_num_tag}{model_tag}"
+                                                log_text = f"\n[{time_str}] === {display_label} (HIDDEN) ===\n"
+
+                                                hide_subagent = config.VERBOSITY_MODE in ["silent", "minimal", "standard"]
+
+                                                if not hide_subagent:
+                                                    print(f"\n{COLOR_ORANGE}[{time_str}] === {display_label} (HIDDEN) ==={COLOR_RESET}")
+
+                                                if agent_thoughts:
+                                                    log_text += f"<thinking>\n{agent_thoughts}\n</thinking>\n\n"
+                                                    if not hide_subagent:
+                                                        print(f"{COLOR_DIM}<thinking>\n{agent_thoughts}\n</thinking>{COLOR_RESET}")
+
+                                                if agent_content:
+                                                    log_text += f"--- {content_label} ---\n{agent_content}\n\n"
+                                                    if not hide_subagent:
+                                                        print(f"--- {content_label} ---\n{agent_content}\n")
+
+                                                with open(LOG_FILE, "a", encoding="utf-8") as f:
+                                                    f.write(log_text.replace("\x00", ""))
+
+                                        out_color = COLOR_ORANGE if name in ["forge_and_register_plugin", "compress_and_store_context", "commission_architect", "consult_adviser", "fast_decision", "query_universal_llm", "analyze_files", "execute_rest_call"] else COLOR_DARK_GREEN
+                                        
+                                        hide_output = config.VERBOSITY_MODE in ["minimal", "standard"]
+                                        log_event(f"TOOL RESULT #{call_num} ({name}) ({tool_duration:.2f}s)", output, text_color=out_color, hide_console=hide_output)
+                                        
+                                        if hide_output and config.VERBOSITY_MODE != "silent":
+                                            if name in ["commission_architect", "consult_adviser", "fast_decision", "query_universal_llm", "analyze_files", "forge_and_register_plugin", "execute_rest_call"]:
+                                                print(f"{out_color}{output}{COLOR_RESET}")
+                                            else:
+                                                print(f"{COLOR_DARK_GREEN}✓ Tool #{call_num} '{name}' completed ({tool_duration:.2f}s).{COLOR_RESET}")
+
+                                        if name == "compress_and_store_context" and output.startswith("SUCCESS:"):
+                                            print(f"\n{COLOR_ORANGE}[SYSTEM] Memory compression cycle complete. Waking up with pristine context...{COLOR_RESET}")
+                                            messages = load_history()
+                                            if len(messages) <= 1:
+                                                messages.append({
+                                                    "role": "user",
+                                                    "content": output
+                                                })
+                                                save_history(messages)
+                                            last_actual_prompt_tokens = 0
+                                            last_history_len = 0
+                                            consecutive_tool_chains = 0
+                                            compress_triggered = True
+                                            break
+                                        else:
+                                            messages = load_history()
                                             messages.append({
-                                                "role": "user",
+                                                "role": "tool",
+                                                "tool_call_id": tc_id,
+                                                "name": name,
                                                 "content": output
                                             })
                                             save_history(messages)
-                                        last_actual_prompt_tokens = 0
-                                        last_history_len = 0
-                                        consecutive_tool_chains = 0
-                                        break
 
-                                    else:
-                                        messages = load_history()
-                                        messages.append({
-                                            "role": "tool",
-                                            "tool_call_id": tc_id,
-                                            "name": name,
-                                            "content": output
-                                        })
-                                        save_history(messages)
+                                    if compress_triggered:
+                                        break
 
                                 # --- ESCALATING LOOP DETECTION (CHECK) ---
                                 consecutive_tool_chains += 1

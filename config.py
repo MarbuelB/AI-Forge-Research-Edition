@@ -21,8 +21,8 @@ MAX_PLUGIN_RETRIES = 3
 MAX_CONTEXT_TOKENS = 120000 # The max tokens you want the active history to reach - there is hard limit on OpenAI call, we have to prevent hitting that!
 
 # --- TOOL OUTPUT PRUNING SETTINGS ---
-TOOL_PRUNE_PROTECT_RECENT_CALLS = 10  # Keep the N most recent tool calls 100% intact
-TOOL_PRUNE_MIN_CHARS = 500            # Only prune tool outputs exceeding this character length
+TOOL_PRUNE_PROTECT_RECENT_CALLS = 10  # Keep the N most recent prunable tool calls 100% intact
+TOOL_PRUNE_MIN_CHARS = 1500           # Only prune tool outputs exceeding this character length
 
 # --- SESSION MANAGEMENT ---
 # Set to None for a fresh, empty session every time. 
@@ -60,8 +60,8 @@ PROMPTS = {
 - When you solve a novel, complex, or multi-step engineering problem, codify it for future reuse by calling `commission_architect(skill_name="...", objective="...", brain_notes="...", context_filepaths=[...])`.
 9. AUXILIARY BACKUP ESCAPE HATCHES (`query_universal_llm`, `execute_rest_call`):
 - Do NOT use these as your default communication or orchestration channels. Use them STRICTLY as auxiliary backups or escape hatches when specialized sub-agents cannot handle the task.
-- `query_universal_llm`: Use when you need a second opinion, model benchmarking, or need to query external cloud models via `'litellm_proxy'` (e.g. `'claude-haiku-5.5'`, `'gemini-3.8-flash'`, or `'gpt-6-luna'`). Actions: `list_endpoints`, `list_models`, `chat`.
-- `execute_rest_call`: Use for ad-hoc HTTP queries to external APIs, custom microservices, or multipart payloads (e.g. Whisper transcription). Loopback addresses (`localhost`, `127.0.0.1`) are mapped to `host.containers.internal`.
+- `query_universal_llm`: Use when you need a second opinion, model benchmarking, or need to query external cloud models via `'litellm_proxy'` (e.g. `'claude-haiku-5.5'`, `'gemini-3.8-flash'`, or `'gpt-6-luna'`). Actions: `list_endpoints`, `list_models`, `chat`. Pass `output_filepath` to save large responses directly to disk (`/app/workspace/outputs` or `/app/workspace/sandbox`).
+- `execute_rest_call`: Use for ad-hoc HTTP queries to external APIs, custom microservices, or multipart payloads (e.g. Whisper transcription). Loopback addresses (`localhost`, `127.0.0.1`) are mapped to `host.containers.internal`. Pass `response_filepath` to stream large payloads to disk.
 10. DATABASES & VECTOR SEARCH (`query_sqlite_db`, `batch_generate_embeddings`):
 - Two-Table Relational Schema: `sqlite-vec` virtual tables cannot store plain text. When creating a vector database, you MUST use a Two-Table Schema:
   1. Metadata table: `CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, content TEXT);`
@@ -77,7 +77,7 @@ PROMPTS = {
 - Connect or disconnect Model Context Protocol (MCP) servers (SSE or stdio) to dynamically expand your toolset.
 - When connected, tools persist across turns in this session until you call `manage_external_mcp(action="disconnect", server_name="...")`.
 12. AUTONOMOUS EXECUTION LOOP:
-- When executing steps, provide concise reasoning and invoke the required tool call in the SAME turn. Never yield with conversational narration alone while work remains.
+- When executing steps, provide concise reasoning and invoke the required tool call(s) in the SAME turn. Independent tool calls emitted in the same turn execute concurrently. Never yield with conversational narration alone while work remains.
 - Drive relentlessly until all deliverables are fully produced and verified on disk.
 - Only output a response without tool calls when: (1) all tasks are 100% complete and you are presenting the final summary, or (2) you are blocked and need clarifying input from the user.
 
