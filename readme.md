@@ -1,6 +1,6 @@
-# AI-Forge-Research-Edition: The Autonomous Self-Evolving AI Scientist Framework
+# SMRTk: Sandboxed Multi-agent Research Toolkit
 
-A zero-trust AI architecture utilizing a multi-agent system to dynamically forge local tools, featuring persistent sessions, WSL2 isolation, GPU acceleration, and auto-healing debugging loops.
+A zero-trust AI architecture utilizing a multi-agent system to dynamically create local tools, featuring persistent sessions, WSL2 isolation, GPU acceleration, and auto-healing debugging loops.
 
 Rather than relying on a static set of pre-programmed tools, this framework empowers an AI to write, compile, debug, and execute its own multi-language tools (Python, JavaScript, TypeScript, Rust, C++) on the fly using the Model Context Protocol (MCP). By separating the "Brain" (logical reasoning) from the "Coder" (code generation), the "Summarizer" (memory management), the "Adviser" (strategic correction), the "Analyst" (data/vision mining), the "Architect" (SOP codification), and the "Decider" (rapid reflex & snap rulings), the system acts as a persistent, self-expanding AI operating system capable of acting as an autonomous researcher—scraping the web, downloading massive datasets, testing hypotheses, training machine learning models, and rendering publication-ready reports while safely bridging massive LLMs with your local hardware.
 
@@ -564,7 +564,7 @@ You can use `tmux` to launch a multi-agent swarm in a 2x2 split-pane dashboard. 
 
 Alternatively, paste this chained command into your terminal to boot 4 independent researchers at once:
 
-    tmux new-session -d -s forge_swarm \; \
+    tmux new-session -d -s smrtk_swarm \; \
       send-keys "pixi run python overseer.py -f text -s 'Swarm_Text_1'" C-m \; \
       split-window -h \; \
       send-keys "pixi run python overseer.py -f text -s 'Swarm_Text_2'" C-m \; \
@@ -574,7 +574,7 @@ Alternatively, paste this chained command into your terminal to boot 4 independe
       split-window -v \; \
       send-keys "pixi run python overseer.py -f markdown -s 'Swarm_MD_1'" C-m \; \
       select-layout tiled \; \
-      attach-session -t forge_swarm
+      attach-session -t smrtk_swarm
 
 **Pro-Tip for Swarm Management:** Enable mouse support in your tmux configuration (`echo "set -g mouse on" >> ~/.tmux.conf`) so you can simply click between your agents, drag the window borders to resize their panels, and use your mouse wheel to independently scroll through their individual reasoning logs!
 

@@ -66,7 +66,7 @@ PROMPTS = {
 - Two-Table Relational Schema: `sqlite-vec` virtual tables cannot store plain text. When creating a vector database, you MUST use a Two-Table Schema:
   1. Metadata table: `CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, content TEXT);`
   2. Linked vector table (dimensions MUST be {EMBEDDING_CONFIG['dimensions']}):
-     `CREATE VIRTUAL TABLE docs_vec USING vec0(embedding float[{EMBEDDING_CONFIG['dimensions']} distance_metric=cosine]);`
+     `CREATE VIRTUAL TABLE docs_vec USING vec0(embedding float[{EMBEDDING_CONFIG['dimensions']}] distance_metric=cosine);`
 - Bulk Embedding Ingestion:
   Step 1: Insert records into the standard metadata table using `query_sqlite_db`.
   Step 2: Compute and store embeddings using `batch_generate_embeddings`. Supply a `source_query` selecting un-embedded rows:
@@ -136,7 +136,7 @@ You operate in an isolated, rootless container sandbox. You have explicit permis
    conn.enable_load_extension(False)
    Without `sqlite_vec.load(conn)`, vector functions (vec_version, vec_distance_cosine) will throw 'no such function'.
 6. STRICT TYPING & INFERENCE: For strictly typed or compiled languages (Rust, C++), do NOT rely on implicit compiler type inference for generic methods (e.g., generic random generation or serialization methods). ALWAYS provide explicit type annotations, type turbofishes (e.g., `rng.gen::<f64>()`), or explicit primitives to guarantee zero trait ambiguity during compilation passes.
-7. HARDWARE LIMITS: You have access to an NVIDIA GPU. If you write machine learning code (e.g., PyTorch), you MUST strictly cap process VRAM limits to 50% to avoid crashing the execution host.
+7. HARDWARE & GPU LIMITS: Always check device availability dynamically (e.g., `torch.cuda.is_available()`) and fall back cleanly to CPU if no GPU is present. When an NVIDIA GPU is used, strictly cap process VRAM limits to 50% to avoid crashing the execution host.
 8. STDOUT: The script or program component must print its final descriptive results directly to the console stream.
 9. ROBUSTNESS: Include basic error handling structures (e.g., try/catch or result match patterns) to catch unhandled runtime panics cleanly.
 10. PRODUCTION CODE HYGIENE & NO THOUGHT LEAKAGE:

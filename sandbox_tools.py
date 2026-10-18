@@ -1300,7 +1300,7 @@ async def execute_rest_call(
                         msg["content"] = orig_content + [b for b in blocks if b.get("type") != "text" or b.get("text")]
                 break
 
-    req_headers = {"User-Agent": "AI-Forge-Overseer/1.0"}
+    req_headers = {"User-Agent": "Sandbox-Overseer/1.0"}
     if data_payload is not None and not opened_files:
         req_headers["Content-Type"] = "application/json"
     if headers and isinstance(headers, dict):
@@ -1442,7 +1442,7 @@ async def execute_rest_call(
 
 @mcp.tool()
 async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
-    """Executes a bash command STRICTLY inside the sandbox directory. 
+    """Executes a bash command inside the isolated container (working directory defaults to '/app/workspace/sandbox'). 
     'timeout_seconds' defaults to 180. Increase it up to 600 if you expect a long-running process like a massive download or large database search.
     Do NOT use destructive commands! Move files to the archive folder instead.
     DO NOT use this to author scripts or execute multi-line inline programs (use create_tool instead)."""
@@ -1471,8 +1471,8 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
         logger.warning(f"[execute_bash] Security block: unquoted variable indirection to rm/unlink rejected: {command}")
         return "SYSTEM ERROR: Destructive commands (rm, unlink, shred, truncate, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
 
-    # Tokenize statements by shell operators (; && || | \n &)
-    statements = re.split(r';|&&|\|\||\||\n|&', command)
+    # Tokenize statements by unquoted shell operators (; && || | \n &)
+    statements = re.findall(r'(?:[^;&|\n"\']+|"[^"\\]*(?:\\.[^"\\]*)*"|\'[^\'\\]*(?:\\.[^\'\\]*)*\')+', command)
     for raw_stmt in statements:
         raw_stmt = raw_stmt.strip()
         if not raw_stmt or raw_stmt.startswith('#'):
@@ -1647,7 +1647,7 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
 def write_file(filepath: str, content: str, mode: str = "w", force: bool = False) -> str:
     """Writes text content to a file in 'outputs' or 'sandbox' directory.
     - mode: 'w' (default) to overwrite, or 'a' to append content to an existing file.
-    - force: Set to True to intentionally overwrite when the new content is <40% of the existing file size (a .bak backup is still saved).
+    - force: Set to True to intentionally overwrite when the existing file is >1,000 bytes and the new content is <40% of the existing file size (a .bak backup is still saved).
     When mode='w' and the file already exists, an archive backup is automatically created.
     Use this instead of bash 'echo' or 'cat' to write markdown, or text files safely.
     You can only write to 'outputs' or 'sandbox' directories.
@@ -1765,6 +1765,9 @@ def store_memory(category: str, category_description: str, title: str, short_des
     filename = f"{timestamp_prefix}_{safe_title}.md"
     filepath = os.path.join(MEMORIES_DIR, filename)
     
+    if isinstance(detailed_markdown, str) and "\\n" in detailed_markdown and "\n" not in detailed_markdown:
+        detailed_markdown = detailed_markdown.replace("\\n", "\n").replace("\\t", "\t")
+        
     os.makedirs(MEMORIES_DIR, exist_ok=True)
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(detailed_markdown)
@@ -2470,6 +2473,7 @@ async def edit_code(filepath: str, edit_objective: str) -> str:
         "2. TARGET INTEGRITY: If the edit objective instructs you to modify, replace, or delete specific lines, functions, or symbols that DO NOT exist in the provided source code, you MUST NOT hallucinate, invent, or append them. Do NOT substitute an unrelated search block. Set 'status' to 'target_not_found', explain what was missing in 'explanation', and return an empty 'edits' array (`\"edits\": []`).\n"
         "3. MINIMAL SCOPE: Change ONLY the lines necessary to satisfy the objective. Do not alter surrounding formatting or unrelated logic.\n"
         "4. ORDER OF EDITS: If multiple separate locations need changes (e.g. imports at top, flags in main), provide multiple discrete edit items in 'edits' in the order they appear in the file. Do NOT lump unrelated sections into one giant search block.\n"
+        "5. SHEBANG PRESERVATION: If the file starts with a '#!' shebang on line 1, always keep the shebang on line 1 and place any new top-of-file comments or imports after it.\n"
         "Output ONLY a valid, single JSON block wrapped inside a standard markdown json code block token. No conversational filler text."
     )
 

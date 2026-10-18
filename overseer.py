@@ -705,9 +705,9 @@ async def run_chat():
                     chmod -R a-w /app/.pixi/envs/default/bin/ 2>/dev/null
                     chmod a-w /app/.pixi /app/.pixi/envs /app/.pixi/envs/default /app/.pixi/envs/default/lib/python*/site-packages 2>/dev/null
                     
-                    # 6. CORRECT ENVIRONMENT ALIGNMENT: Prepend framework paths while preserving Pixi site-packages
+                    # 6. CORRECT ENVIRONMENT ALIGNMENT: Prepend framework paths while appending custom tool dirs to PATH
                     export PYTHONPATH=/app:/app/workspace/custom_packages:$PYTHONPATH
-                    export PATH=/app/workspace/tools:/app/workspace/tools/bin:$PATH
+                    export PATH=$PATH:/app/workspace/tools:/app/workspace/tools/bin
                     
                     # 7. Start the MCP server safely
                     cd /app/workspace

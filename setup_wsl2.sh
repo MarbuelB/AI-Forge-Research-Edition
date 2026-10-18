@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# AI-Forge-Research-Edition: Automated WSL2 & Environment Setup Script
+# SMRTk: Sandboxed Multi-agent Research Toolkit — Automated WSL2 & Environment Setup Script
 # ==============================================================================
 # This script automates the complete provisioning of a fresh WSL2 instance:
 #   Phase 1 (System/Root): Packages, NVIDIA GPU CDI, Agent user, subuid/gid, wsl.conf
@@ -73,7 +73,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo -e "${BOLD}AI-Forge WSL2 Automated Installer${RESET}"
+            echo -e "${BOLD}SMRTk WSL2 Automated Installer${RESET}"
             echo ""
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -155,7 +155,7 @@ prompt_yn() {
 # DIAGNOSTICS & HEALTH CHECK
 # ==============================================================================
 run_diagnostics() {
-    log_step "AI-Forge Environment Diagnostics"
+    log_step "SMRTk Environment Diagnostics"
     echo "--------------------------------------------------------"
 
     # 1. OS & Architecture
@@ -276,7 +276,7 @@ run_phase1_system() {
         if [ "$AUTO_CONFIRM" != true ]; then
             echo -e "You can choose your setup mode:"
             echo -e "  [1] Dedicated '${GREEN}agent${RESET}' user (Default & Recommended for maximum sandbox isolation)"
-            echo -e "  [2] Install AI-Forge for your existing account ('${CYAN}${CALLING_USER}${RESET}')"
+            echo -e "  [2] Install SMRTk for your existing account ('${CYAN}${CALLING_USER}${RESET}')"
             local setup_mode="1"
             prompt_input "Select setup mode [1 or 2]" "1" setup_mode
             if [ "$setup_mode" = "2" ]; then
@@ -510,7 +510,7 @@ run_phase2_user() {
     export PATH="$USER_HOME/.pixi/bin:$PATH"
 
     # 2. Install workspace dependencies
-    log_step "Installing AI-Forge workspace dependencies with Pixi..."
+    log_step "Installing SMRTk workspace dependencies with Pixi..."
     cd "$SCRIPT_DIR"
     if [ -f "pixi.toml" ]; then
         "$PIXI_BIN" install
@@ -769,11 +769,11 @@ EOF
 
     # Export LLM environment variables in ~/.bashrc
     if [ -f "$USER_HOME/.bashrc" ]; then
-        sed -i '/# AI-FORGE DEFAULT LLM CONFIGURATION/,/export DEFAULT_LLM_MODEL=/d' "$USER_HOME/.bashrc" 2>/dev/null || true
+        sed -i '/# SMRTK DEFAULT LLM CONFIGURATION/,/export DEFAULT_LLM_MODEL=/d' "$USER_HOME/.bashrc" 2>/dev/null || true
         cat <<EOF >> "$USER_HOME/.bashrc"
 
 # ==========================================
-# AI-FORGE DEFAULT LLM CONFIGURATION
+# SMRTK DEFAULT LLM CONFIGURATION
 # ==========================================
 export DEFAULT_LLM_NAME="${clean_model_name}"
 export DEFAULT_LLM_BASE_URL="${llm_base_url}"
@@ -965,13 +965,13 @@ EOF
 
 echo -e "${BOLD}${CYAN}"
 cat <<'EOF'
-    ___    ____   ______                       
-   /   |  /  _/  / ____/___  _________ ____    
-  / /| |  / /   / /_  / __ \/ ___/ __ `/ _ \   
- / ___ |_/ /   / __/ / /_/ / /  / /_/ /  __/   
-/_/  |_/___/  /_/    \____/_/   \__, /\___/    
-                               /____/          
-  Autonomous AI Scientist Framework - Setup
+   _____ __  _______  ________    
+  / ___//  |/  / __ \/_  __/ /__  
+  \__ \/ /|_/ / /_/ / / / / //_/  
+ ___/ / /  / / _, _/ / / / ,<     
+/____/_/  /_/_/ |_| /_/ /_/|_|    
+                                  
+  Sandboxed Multi-agent Research Toolkit - Setup
 EOF
 echo -e "${RESET}"
 
@@ -1020,7 +1020,7 @@ esac
 # ==============================================================================
 echo ""
 echo -e "${BOLD}${GREEN}======================================================================${RESET}"
-echo -e "${BOLD}${GREEN}           🎉 AI-FORGE ENVIRONMENT SETUP COMPLETE!                    ${RESET}"
+echo -e "${BOLD}${GREEN}           🎉 SMRTk ENVIRONMENT SETUP COMPLETE!                       ${RESET}"
 echo -e "${BOLD}${GREEN}======================================================================${RESET}"
 echo ""
 echo -e "${BOLD}Next Steps:${RESET}"

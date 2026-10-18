@@ -1,5 +1,5 @@
 """
-mock_mcp_server.py - Lightweight Mock MCP Server for AI-Forge Testing
+mock_mcp_server.py - Lightweight Mock MCP Server for SMRTk Testing
 ======================================================================
 Runs a minimal FastMCP SSE server on port 8888.
 Provides two test tools:

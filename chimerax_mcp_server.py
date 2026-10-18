@@ -1,5 +1,5 @@
 """
-chimerax_mcp_server.py - Lightweight ChimeraX FastMCP Bridge for AI-Forge
+chimerax_mcp_server.py - Lightweight ChimeraX FastMCP Bridge for SMRTk
 ========================================================================
 Runs a FastMCP server in WSL2 that connects to UCSF ChimeraX's REST API
 running on the host (e.g. Windows 11) or locally.
@@ -9,7 +9,7 @@ HOW IT WORKS:
    In ChimeraX's GUI command bar, run:
        remotecontrol rest start port 21049
 2. This bridge runs in WSL2 and exposes standardized MCP tools over SSE or stdio.
-3. Commands sent by AI-Forge are relayed to ChimeraX via:
+3. Commands sent by SMRTk are relayed to ChimeraX via:
        http://<HOST_IP>:21049/run?command=<cmd>
 4. Because any ChimeraX command (open, surface, color, matchmaker, alphafold,
    save, python) can be passed to /run, this bridge gives 100% full coverage
@@ -20,7 +20,7 @@ STARTING THIS SERVER:
     # or with custom ports/hosts:
     pixi run python chimerax_mcp_server.py --port 21050 --cx-port 21049
 
-CONNECTING IN AI-FORGE:
+CONNECTING IN SMRTK:
     /mcp on chimerax
 """
 
@@ -47,7 +47,7 @@ except ImportError:
 
 from fastmcp import FastMCP
 
-# Try importing host IP resolution from AI-Forge harness
+# Try importing host IP resolution from SMRTk harness
 try:
     from mcp_config import resolve_host_ip, HOST_IP
 except ImportError:
@@ -457,7 +457,7 @@ def get_status() -> str:
 # ==============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ChimeraX FastMCP Bridge for AI-Forge")
+    parser = argparse.ArgumentParser(description="ChimeraX FastMCP Bridge for SMRTk")
     parser.add_argument("--transport", choices=["sse", "stdio"], default="sse", help="Transport mode (default: sse)")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address for FastMCP server (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=21050, help="Port for FastMCP SSE server (default: 21050)")
