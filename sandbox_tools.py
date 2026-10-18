@@ -41,7 +41,7 @@ from fastmcp import FastMCP
 
 
 # --- CATCH CLI ARGUMENTS FROM PODMAN ---
-parser = argparse.ArgumentParser(description="Forge God Tools (Containerized)")
+parser = argparse.ArgumentParser(description="Sandbox Tools (Containerized)")
 parser.add_argument("--coder", type=int, help="Coder LLM profile index")
 parser.add_argument("--summarizer", type=int, help="Summarizer LLM profile index")
 parser.add_argument("--adviser", type=int, help="Adviser LLM profile index")
@@ -59,7 +59,7 @@ if args.analyst is not None: config.ACTIVE_ANALYST_PROFILE = args.analyst
 if args.architect is not None: config.ACTIVE_ARCHITECT_PROFILE = args.architect
 
 ## Start the MCP server
-mcp = FastMCP("TheForge")
+mcp = FastMCP("sandbox_mcp")
 
 
 # --- MCP STREAM PROTECTION & LOGGING ---
@@ -76,13 +76,14 @@ logging.basicConfig(
 logging.getLogger().handlers = [h for h in logging.getLogger().handlers if isinstance(h, logging.FileHandler)]
 for noisy_lib in ("httpx", "httpcore", "fastmcp", "openai"):
     logging.getLogger(noisy_lib).setLevel(logging.WARNING)
-logger = logging.getLogger("ForgeContainer")
+logger = logging.getLogger("SandboxMCP")
 
 
 WORKSPACE_DIR = "/app/workspace"
 STATE_DIR = os.path.join(WORKSPACE_DIR, "state")
 SANDBOX_DIR = os.path.join(WORKSPACE_DIR, "sandbox")
-PLUGINS_DIR = os.path.join(WORKSPACE_DIR, "plugins")
+OUTPUTS_DIR = os.path.join(WORKSPACE_DIR, "outputs")
+TOOLS_DIR = os.path.join(WORKSPACE_DIR, "tools")
 _LOADED_SKILLS = set()
 MEMORIES_DIR = os.path.join(WORKSPACE_DIR, "memories")
 HISTORIES_DIR = os.path.join(WORKSPACE_DIR, "histories")
@@ -549,7 +550,7 @@ def gather_agent_context(filepaths: list[str] = None, max_chars_per_file: int = 
                 mime_t, _ = mimetypes.guess_type(resolved_path)
                 mime_str = (mime_t or "").lower()
                 if mime_str and (mime_str.startswith("image/") or mime_str.startswith("audio/") or mime_str.startswith("video/") or mime_str == "application/pdf"):
-                    context_str += f"\n\n--- REFERENCE FILE: {os.path.basename(resolved_path)} ---\n[MULTIMODAL MEDIA FILE ({mime_str}): Pass via 'media_filepaths' in query_universal_llm or 'filepaths' in analyze_files to inspect visually/auditorily.]"
+                    context_str += f"\n\n--- REFERENCE FILE: {os.path.basename(resolved_path)} ---\n[MULTIMODAL MEDIA FILE ({mime_str}): Pass via 'media_filepaths' in query_auxiliary_llm or 'filepaths' in analyze_files to inspect visually/auditorily.]"
                     continue
 
                 content, start_idx, end_idx, total_lines, is_partial = read_file_slice(
@@ -582,7 +583,7 @@ def gather_agent_context(filepaths: list[str] = None, max_chars_per_file: int = 
 # --- MCP TOOLS ---
 @mcp.tool()
 def view_tool_registry(category: str = None, detailed: bool = False) -> str:
-    """Views the custom forged tools registry. 
+    """Views the custom tools registry. 
     - Pass NO arguments to see top-level categories. 
     - Pass a category string to see tools in that category (returns path, language, description, and exists status).
     - Set detailed=True to include the full original authoring objective.
@@ -947,10 +948,10 @@ async def fast_decision(
     return result_msg
 
 
-def resolve_universal_endpoint(endpoint_name_or_url: str = None, api_key: str = None, timeout_seconds: float = 300.0) -> tuple[str, str, float]:
+def resolve_auxiliary_endpoint(endpoint_name_or_url: str = None, api_key: str = None, timeout_seconds: float = 300.0) -> tuple[str, str, float]:
     """Resolves an endpoint name or URL to a concrete base_url, API key, and clamped timeout."""
-    presets = getattr(config, "UNIVERSAL_ENDPOINTS", {})
-    default_name = getattr(config, "DEFAULT_UNIVERSAL_ENDPOINT", "ollama")
+    presets = getattr(config, "AUXILIARY_ENDPOINTS", {})
+    default_name = getattr(config, "DEFAULT_AUXILIARY_ENDPOINT", "ollama")
     
     target_url = None
     target_key = api_key
@@ -992,7 +993,7 @@ def resolve_universal_endpoint(endpoint_name_or_url: str = None, api_key: str = 
 
 
 @mcp.tool()
-async def query_universal_llm(
+async def query_auxiliary_llm(
     action: str,
     endpoint: str = None,
     model: str = None,
@@ -1024,24 +1025,24 @@ async def query_universal_llm(
     - 'chat': Sends prompt to 'model' on 'endpoint' with optional parameters (temperature, max_tokens, reasoning_effort, context_filepaths, media_filepaths, output_filepath, etc.).
     """
     if action == "list_endpoints":
-        presets = getattr(config, "UNIVERSAL_ENDPOINTS", {})
-        default_name = getattr(config, "DEFAULT_UNIVERSAL_ENDPOINT", "ollama")
-        lines = ["--- PRE-CONFIGURED UNIVERSAL LLM ENDPOINTS ---"]
+        presets = getattr(config, "AUXILIARY_ENDPOINTS", {})
+        default_name = getattr(config, "DEFAULT_AUXILIARY_ENDPOINT", "ollama")
+        lines = ["--- PRE-CONFIGURED AUXILIARY LLM ENDPOINTS ---"]
         for ep_name, ep_data in presets.items():
             mark = " (DEFAULT)" if ep_name == default_name else ""
             lines.append(f"• '{ep_name}'{mark}: {ep_data.get('url')} - {ep_data.get('description', '')}")
-        lines.append("\nTip: Pass any preset name (or custom URL) to 'endpoint' in query_universal_llm.")
+        lines.append("\nTip: Pass any preset name (or custom URL) to 'endpoint' in query_auxiliary_llm.")
         return "\n".join(lines)
 
     elif action == "list_models":
-        target_url, target_key, timeout_val = resolve_universal_endpoint(endpoint, api_key, timeout_seconds)
+        target_url, target_key, timeout_val = resolve_auxiliary_endpoint(endpoint, api_key, timeout_seconds)
         try:
             client = AsyncOpenAI(base_url=target_url, api_key=target_key, timeout=timeout_val)
             models_response = await client.models.list()
             model_names = [m.id for m in models_response.data]
             return f"--- AVAILABLE MODELS AT '{target_url}' ---\n" + "\n".join(model_names)
         except Exception as e:
-            presets = getattr(config, "UNIVERSAL_ENDPOINTS", {})
+            presets = getattr(config, "AUXILIARY_ENDPOINTS", {})
             available_presets = ", ".join(presets.keys())
             return (
                 f"Failed to fetch model list from '{target_url}'. Error: {str(e)}\n"
@@ -1061,7 +1062,7 @@ async def query_universal_llm(
                 return f"SYSTEM ERROR: output_filepath '{output_filepath}' must be inside {OUTPUTS_DIR} or {SANDBOX_DIR}."
             os.makedirs(os.path.dirname(resolved_out), exist_ok=True)
 
-        target_url, target_key, timeout_val = resolve_universal_endpoint(endpoint, api_key, timeout_seconds)
+        target_url, target_key, timeout_val = resolve_auxiliary_endpoint(endpoint, api_key, timeout_seconds)
 
         effective_model = model.strip() if model else ""
 
@@ -1113,12 +1114,12 @@ async def query_universal_llm(
         payload_tokens = get_payload_tokens(api_args["messages"])
 
         if payload_tokens > safe_budget:
-            return (f"SYSTEM ERROR: The prompt and attached context files sent to the Universal Sub-Agent are too massive! "
+            return (f"SYSTEM ERROR: The prompt and attached context files sent to the Auxiliary LLM are too massive! "
                     f"Your payload is {payload_tokens} tokens, but the safety limit is {safe_budget}. "
                     f"Please refine your 'context_filepaths' selection.")
 
         if config.VERBOSITY_MODE != "silent":
-            sys.stderr.write(f"\n\033[93m[System: Sending prompt to Universal Sub-Agent ({effective_model} at {target_url}) (~{payload_tokens} estimated tokens, timeout: {timeout_val:.0f}s)...\033[0m\n")
+            sys.stderr.write(f"\n\033[93m[System: Sending prompt to Auxiliary LLM ({effective_model} at {target_url}) (~{payload_tokens} estimated tokens, timeout: {timeout_val:.0f}s)...\033[0m\n")
 
         try:
             client = AsyncOpenAI(base_url=target_url, api_key=target_key, timeout=timeout_val)
@@ -1131,7 +1132,7 @@ async def query_universal_llm(
             thinking_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) if response.usage and hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details else 0
             if thinking_tokens == 0 and thinking:
                 thinking_tokens = len(thinking) // 4
-            config.log_token_usage(STATE_DIR, "universal", tokens_in, tokens_out, thinking_tokens)
+            config.log_token_usage(STATE_DIR, "auxiliary", tokens_in, tokens_out, thinking_tokens)
 
             finish_reason = response.choices[0].finish_reason or "unknown"
 
@@ -1156,15 +1157,15 @@ async def query_universal_llm(
                 result_str += f"\n\n[SYSTEM NOTICE: Model reached max_tokens limit ({max_tokens}) during reasoning/generation. Output was truncated by the model, but all thinking and partial output are fully preserved above.]"
 
             if thinking:
-                result_str += f"\n<___UNIVERSAL_THOUGHTS___>\n{thinking}\n</___UNIVERSAL_THOUGHTS___>"
+                result_str += f"\n<___AUXILIARY_THOUGHTS___>\n{thinking}\n</___AUXILIARY_THOUGHTS___>"
             if content:
-                result_str += f"\n<___UNIVERSAL_OUTPUT___ model=\"{effective_model}\">\n{content}\n</___UNIVERSAL_OUTPUT___>"
+                result_str += f"\n<___AUXILIARY_OUTPUT___ model=\"{effective_model}\">\n{content}\n</___AUXILIARY_OUTPUT___>"
 
             return result_str
 
         except Exception as e:
-            trace_file = save_failure_trace("universal", {
-                "subagent": "universal",
+            trace_file = save_failure_trace("auxiliary", {
+                "subagent": "auxiliary",
                 "endpoint": target_url,
                 "model": effective_model,
                 "error": str(e),
@@ -1444,7 +1445,7 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
     """Executes a bash command STRICTLY inside the sandbox directory. 
     'timeout_seconds' defaults to 180. Increase it up to 600 if you expect a long-running process like a massive download or large database search.
     Do NOT use destructive commands! Move files to the archive folder instead.
-    DO NOT use this to author scripts or execute multi-line inline programs (use forge_and_register_plugin instead)."""
+    DO NOT use this to author scripts or execute multi-line inline programs (use create_tool instead)."""
     
     # 1. Catch empty inputs or incorrect types immediately
     if not command or not isinstance(command, str):
@@ -1460,15 +1461,15 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
 
     # Check for find -delete or find -exec rm / xargs rm
     if re.search(r'\bfind\b[^;&|\n]*\s+-delete\b', unquoted, re.IGNORECASE) or \
-       re.search(r'\bfind\b[^;&|\n]*\s+-exec(?:dir)?\s+(?:/bin/|/usr/bin/)?(?:rm|unlink|shred)\b', unquoted, re.IGNORECASE) or \
-       re.search(r'\bxargs\b[^;&|\n]*\s+(?:/bin/|/usr/bin/)?(?:rm|unlink|shred)\b', unquoted, re.IGNORECASE):
+       re.search(r'\bfind\b[^;&|\n]*\s+-exec(?:dir)?\s+(?:/bin/|/usr/bin/)?(?:rm|unlink|shred|truncate)\b', unquoted, re.IGNORECASE) or \
+       re.search(r'\bxargs\b[^;&|\n]*\s+(?:/bin/|/usr/bin/)?(?:rm|unlink|shred|truncate)\b', unquoted, re.IGNORECASE):
         logger.warning(f"[execute_bash] Security block: destructive find/xargs deletion rejected: {command}")
-        return "SYSTEM ERROR: Destructive commands (rm, unlink, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
+        return "SYSTEM ERROR: Destructive commands (rm, unlink, shred, truncate, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
 
-    # Check unquoted variable indirection assigning to rm / unlink / shred (e.g., R=rm, CMD=/bin/unlink)
-    if re.search(r'\b[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*(?:/bin/|/usr/bin/)?(?:rm|unlink|shred)\b', unquoted, re.IGNORECASE):
+    # Check unquoted variable indirection assigning to rm / unlink / shred / truncate (e.g., R=rm, CMD=/bin/unlink)
+    if re.search(r'\b[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*(?:/bin/|/usr/bin/)?(?:rm|unlink|shred|truncate)\b', unquoted, re.IGNORECASE):
         logger.warning(f"[execute_bash] Security block: unquoted variable indirection to rm/unlink rejected: {command}")
-        return "SYSTEM ERROR: Destructive commands (rm, unlink, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
+        return "SYSTEM ERROR: Destructive commands (rm, unlink, shred, truncate, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
 
     # Tokenize statements by shell operators (; && || | \n &)
     statements = re.split(r';|&&|\|\||\||\n|&', command)
@@ -1487,9 +1488,9 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
         while idx < len(tokens):
             tok = tokens[idx]
             # Check for variable assignment indirection (e.g., R="rm", CMD='unlink')
-            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*=(?:/bin/|/usr/bin/)?(?:rm|unlink|shred)$', tok, re.IGNORECASE):
+            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*=(?:/bin/|/usr/bin/)?(?:rm|unlink|shred|truncate)$', tok, re.IGNORECASE):
                 logger.warning(f"[execute_bash] Security block: variable indirection assignment rejected: {command}")
-                return "SYSTEM ERROR: Destructive commands (rm, unlink, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
+                return "SYSTEM ERROR: Destructive commands (rm, unlink, shred, truncate, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
 
             # Skip benign variable assignments (e.g., VAR=hello cmd)
             if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*=', tok):
@@ -1508,13 +1509,13 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
                 if tokens[idx + 1].lower() == 'rm':
                     if '--cached' not in [t.lower() for t in tokens]:
                         logger.warning(f"[execute_bash] Security block: git rm without --cached rejected: {command}")
-                        return "SYSTEM ERROR: Destructive commands (rm, unlink, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
+                        return "SYSTEM ERROR: Destructive commands (rm, unlink, shred, truncate, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
                     break
 
-            # Reject rm, unlink, shred as executable command binaries
-            if base_token in ('rm', 'unlink', 'shred'):
+            # Reject rm, unlink, shred, truncate as executable command binaries
+            if base_token in ('rm', 'unlink', 'shred', 'truncate'):
                 logger.warning(f"[execute_bash] Security block: destructive binary '{base_token}' rejected: {command}")
-                return "SYSTEM ERROR: Destructive commands (rm, unlink, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
+                return "SYSTEM ERROR: Destructive commands (rm, unlink, shred, truncate, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead."
 
             break
 
@@ -1526,12 +1527,14 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
         current_env = os.environ.copy()
         current_env["PYTHONPATH"] = f"/app/workspace/custom_packages:{current_env.get('PYTHONPATH', '')}"
 
-        # Prepend runtime bash interceptor functions for rm and unlink to guarantee defense-in-depth against variable indirection
+        # Prepend runtime bash interceptor functions for rm, unlink, and truncate to guarantee defense-in-depth against variable indirection
         safe_bash_payload = (
-            "rm() { echo 'SYSTEM ERROR: Destructive commands (rm, unlink, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead.' >&2; return 1; }; "
+            "rm() { echo 'SYSTEM ERROR: Destructive commands (rm, unlink, shred, truncate, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead.' >&2; return 1; }; "
             "export -f rm 2>/dev/null || true; "
-            "unlink() { echo 'SYSTEM ERROR: Destructive commands (rm, unlink, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead.' >&2; return 1; }; "
+            "unlink() { echo 'SYSTEM ERROR: Destructive commands (rm, unlink, shred, truncate, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead.' >&2; return 1; }; "
             "export -f unlink 2>/dev/null || true; "
+            "truncate() { echo 'SYSTEM ERROR: Destructive commands (rm, unlink, shred, truncate, -delete, git rm without --cached) are blocked by Anti-Deletion Protocol. Move files to /app/workspace/archive instead.' >&2; return 1; }; "
+            "export -f truncate 2>/dev/null || true; "
             + command
         )
 
@@ -1596,7 +1599,7 @@ async def execute_bash(command: str, timeout_seconds: int = 180) -> str:
         if is_inline_code:
             inline_advisory = (
                 "\n\n[SYSTEM DELEGATION ADVISORY: You authored or executed an inline script directly in bash. "
-                "For reliability, automated syntax checking, and persistence, delegate script creation and data tasks to the Coder via 'forge_and_register_plugin'.]"
+                "For reliability, automated syntax checking, and persistence, delegate script creation and data tasks to the Coder via 'create_tool'.]"
             )
 
         # --- THE POINTER APPROACH (Context Protection) ---
@@ -1648,7 +1651,7 @@ def write_file(filepath: str, content: str, mode: str = "w", force: bool = False
     When mode='w' and the file already exists, an archive backup is automatically created.
     Use this instead of bash 'echo' or 'cat' to write markdown, or text files safely.
     You can only write to 'outputs' or 'sandbox' directories.
-    IMPORTANT: For any source code files (Python, JS, TS, Rust, C++), you MUST use forge_and_register_plugin!
+    IMPORTANT: For any source code files (Python, JS, TS, Rust, C++), you MUST use create_tool!
     """
     
     filepath = filepath.strip() if filepath else ""
@@ -1656,7 +1659,7 @@ def write_file(filepath: str, content: str, mode: str = "w", force: bool = False
     forbidden_extensions = (".py", ".js", ".ts", ".rs", ".cpp", ".c", ".hpp", ".h", ".cc", ".cxx", ".mjs", ".cjs")
     if filepath.lower().endswith(forbidden_extensions):
         logger.warning(f"[write_file] Blocked direct write to forbidden source extension: '{filepath}'")
-        return f"SYSTEM ERROR: You are strictly FORBIDDEN from using write_file to create source code scripts directly. You MUST use 'forge_and_register_plugin' with the appropriate 'language' parameter so the Coder agent can generate and validate it safely."
+        return f"SYSTEM ERROR: You are strictly FORBIDDEN from using write_file to create source code scripts directly. You MUST use 'create_tool' with the appropriate 'language' parameter so the Coder agent can generate and validate it safely."
 
     # 1. Resolve the absolute path
     resolved_path = os.path.realpath(filepath)
@@ -1778,7 +1781,7 @@ def store_memory(category: str, category_description: str, title: str, short_des
 
 
 @mcp.tool()
-async def compress_and_store_context() -> str:
+async def compact_context() -> str:
     """Triggers the background Memory Manager to sequence a memory extraction followed by a targeted handoff history compression."""
     current_history = load_json(CURRENT_HISTORY_FILE)
     current_memories = load_json(MEMORY_REGISTRY_FILE)
@@ -1874,7 +1877,7 @@ async def compress_and_store_context() -> str:
 
     mem_sys_prompt = (
         "You are a data extractor. Analyze the mission objective, active plan, verified deliverables, and recent turns. "
-        "Extract NEW crucial long-term facts, completed objectives, database paths, or forged tools into the memory schema. "
+        "Extract NEW crucial long-term facts, completed objectives, database paths, or created tools into the memory schema. "
         "Write highly detailed markdown files for the 'detailed_markdown' field. "
         "CRITICAL: Cross-reference the provided CURRENT MEMORY REGISTRY. Do NOT extract or duplicate facts already saved in the registry!"
     )
@@ -1984,7 +1987,7 @@ async def compress_and_store_context() -> str:
         "1. Anchor strictly on the Original User Goal, the Master Plan, verified workspace deliverables, and recent actions.\n"
         "2. Format your response into exactly three structured sections:\n"
         "   ### 1. Accomplished Deliverables & Workspace State\n"
-        "   - List exact verified filepaths created on disk, tools forged, and biological/scientific findings established.\n"
+        "   - List exact verified filepaths created on disk, tools created, and biological/scientific findings established.\n"
         "   ### 2. Current Plan Status\n"
         "   - Specific checklist items completed vs. still pending in active_plan.md.\n"
         "   ### 3. Immediate Next Steps\n"
@@ -2079,25 +2082,25 @@ _WORKSPACE_STATE_LOCK = asyncio.Lock()
 
 
 @mcp.tool()
-async def forge_and_register_plugin(
+async def create_tool(
     category: str, 
     category_description: str, 
-    plugin_name: str, 
-    plugin_description: str, 
+    tool_name: str, 
+    tool_description: str, 
     objective: str, 
     language: str = "python",
     context_filepaths: list[str] = None  # ◄--- Universal Context Entrypoint
 ) -> str:
-    """Delegates code writing to the Coder LLM, validates compilation, and registers the plugin.
+    """Delegates code writing to the Coder LLM, validates compilation, and registers the tool.
     CRITICAL: Set 'language' explicitly to match your objective!
     - 'language': Target programming language: 'python' (default), 'rust', 'cpp', 'javascript', or 'typescript'.
       If your objective asks for Rust (cargo/rustc), you MUST pass language='rust'.
       If your objective asks for C++, you MUST pass language='cpp'.
       If your objective asks for TypeScript, you MUST pass language='typescript'.
-    - 'plugin_name': Base filename for the tool (without file extension, e.g. 'kmer_counter').
+    - 'tool_name': Base filename for the tool (without file extension, e.g. 'kmer_counter').
     - 'category': Grouping tag (e.g. 'bioinformatics', 'database', 'parsing').
     - 'category_description': Brief description of the category.
-    - 'plugin_description': Summary of what this tool does.
+    - 'tool_description': Summary of what this tool does.
     - 'objective': Detailed functional requirements, CLI arguments, I/O formats, and logic for the Coder.
     - 'context_filepaths': Optional list of absolute file paths for the Coder to read to adapt to existing schemas/code.
     """
@@ -2112,14 +2115,15 @@ async def forge_and_register_plugin(
     ext = lang_map[target_lang]["ext"]
     md_block = lang_map[target_lang]["block"]
 
-    safe_name = os.path.basename(plugin_name)
+    safe_name = os.path.basename(tool_name)
     for k_ext in [".py", ".js", ".ts", ".rs", ".cpp"]:
         if safe_name.endswith(k_ext): safe_name = safe_name[:-len(k_ext)]
     safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', safe_name)
-    if not safe_name: safe_name = "default_plugin_name"
+    if not safe_name: safe_name = "default_tool_name"
 
     filename = f"{safe_name}{ext}"
-    file_path = os.path.join(PLUGINS_DIR, filename)
+    os.makedirs(TOOLS_DIR, exist_ok=True)
+    file_path = os.path.join(TOOLS_DIR, filename)
     
     coder_sys = config.SYSTEM_PROMPTS["coder"]
 
@@ -2140,7 +2144,7 @@ async def forge_and_register_plugin(
                 f"Please refine your 'context_filepaths' selection or shorten 'objective'.")
     
     last_validation_error = "Unknown error (validation failed without output)"
-    for attempt in range(config.MAX_PLUGIN_RETRIES):
+    for attempt in range(config.MAX_TOOL_RETRIES):
         try:
             api_args = coder_profile["api_params"].copy()
             api_args["model"] = coder_profile["model"]
@@ -2203,10 +2207,10 @@ async def forge_and_register_plugin(
             is_valid = True
             err_msg = ""
             if target_lang == "python":
-                check = await asyncio.to_thread(subprocess.run, [sys.executable, "-m", "py_compile", filename], cwd=PLUGINS_DIR, capture_output=True, text=True)
+                check = await asyncio.to_thread(subprocess.run, [sys.executable, "-m", "py_compile", filename], cwd=TOOLS_DIR, capture_output=True, text=True)
                 if check.returncode != 0: is_valid = False; err_msg = check.stderr
             elif target_lang == "javascript":
-                check = await asyncio.to_thread(subprocess.run, ["node", "--check", filename], cwd=PLUGINS_DIR, capture_output=True, text=True)
+                check = await asyncio.to_thread(subprocess.run, ["node", "--check", filename], cwd=TOOLS_DIR, capture_output=True, text=True)
                 if check.returncode != 0: is_valid = False; err_msg = check.stderr
             elif target_lang == "typescript":
                 # Validates TypeScript syntax via esbuild transpilation over stdin + node --check
@@ -2218,7 +2222,7 @@ async def forge_and_register_plugin(
                         esbuild_bin = candidate
                 if esbuild_bin:
                     try:
-                        with open(os.path.join(PLUGINS_DIR, filename), "rb") as ts_file:
+                        with open(os.path.join(TOOLS_DIR, filename), "rb") as ts_file:
                             ts_bytes = ts_file.read()
                         eb_check = await asyncio.to_thread(
                             subprocess.run,
@@ -2245,7 +2249,7 @@ async def forge_and_register_plugin(
                         is_valid = False
                         err_msg = f"TypeScript syntax validation exception: {str(ts_err)}"
                 else:
-                    check = await asyncio.to_thread(subprocess.run, ["node", "--check", filename], cwd=PLUGINS_DIR, capture_output=True, text=True)
+                    check = await asyncio.to_thread(subprocess.run, ["node", "--check", filename], cwd=TOOLS_DIR, capture_output=True, text=True)
                     if check.returncode != 0: is_valid = False; err_msg = check.stderr
             elif target_lang == "rust":
                 # Flawless validation: Provisions an isolated cargo scratchpad project to resolve external crates automatically
@@ -2276,7 +2280,7 @@ edition = "2021"
                 with open(os.path.join(scratch_dir, "Cargo.toml"), "w", encoding="utf-8") as f:
                     f.write(cargo_toml_content)
                     
-                # Copies the forged target source file into the scratchpad context entrypoint
+                # Copies the created target source file into the scratchpad context entrypoint
                 shutil.copy2(file_path, os.path.join(scratch_dir, "src", "main.rs"))
                 
                 # Executes cargo check - verifies language tokens and syncs library assets simultaneously
@@ -2287,13 +2291,13 @@ edition = "2021"
 
             elif target_lang == "cpp":
                 # GNU compiler syntax check mode - parses headers and code templates without linking output files
-                check = await asyncio.to_thread(subprocess.run, ["g++", "-fsyntax-only", "-std=c++17", filename], cwd=PLUGINS_DIR, capture_output=True, text=True)
+                check = await asyncio.to_thread(subprocess.run, ["g++", "-fsyntax-only", "-std=c++17", filename], cwd=TOOLS_DIR, capture_output=True, text=True)
                 if check.returncode != 0: is_valid = False; err_msg = check.stderr
 
             # --- Behavioral Pre-Registration Smoke Test ---
             if is_valid and target_lang in ["python", "javascript", "typescript"]:
                 smoke_env = os.environ.copy()
-                smoke_env["PYTHONPATH"] = f"/app/workspace/custom_packages:{PLUGINS_DIR}:{smoke_env.get('PYTHONPATH', '')}"
+                smoke_env["PYTHONPATH"] = f"/app/workspace/custom_packages:{TOOLS_DIR}:{smoke_env.get('PYTHONPATH', '')}"
                 smoke_cmd = None
                 if target_lang == "python":
                     smoke_cmd = [sys.executable, filename, "--help"]
@@ -2303,11 +2307,11 @@ edition = "2021"
                     smoke_cmd = ["tsx", filename, "--help"]
 
                 if smoke_cmd:
-                    stray_help = os.path.join(PLUGINS_DIR, "--help")
+                    stray_help = os.path.join(TOOLS_DIR, "--help")
                     had_help = os.path.exists(stray_help)
                     try:
                         smoke_res = await asyncio.to_thread(
-                            subprocess.run, smoke_cmd, cwd=PLUGINS_DIR, env=smoke_env,
+                            subprocess.run, smoke_cmd, cwd=TOOLS_DIR, env=smoke_env,
                             capture_output=True, text=True, timeout=4
                         )
                         # Check if running generated an unhandled traceback or runtime crash
@@ -2315,7 +2319,7 @@ edition = "2021"
                         if smoke_res.returncode != 0 and ("traceback (most recent call last)" in combined_err or "referenceerror:" in combined_err or "typeerror:" in combined_err or "syntaxerror:" in combined_err):
                             is_valid = False
                             err_msg = f"Behavioral smoke test crashed during startup:\n{smoke_res.stderr or smoke_res.stdout}"
-                            logger.warning(f"[forge_and_register_plugin] Smoke test failed for '{plugin_name}': {err_msg[:200]}")
+                            logger.warning(f"[create_tool] Smoke test failed for '{tool_name}': {err_msg[:200]}")
                     except subprocess.TimeoutExpired:
                         pass
                     except Exception:
@@ -2326,7 +2330,7 @@ edition = "2021"
                             except Exception: pass
 
             if is_valid:
-                bin_dir = os.path.join(PLUGINS_DIR, "bin")
+                bin_dir = os.path.join(TOOLS_DIR, "bin")
                 os.makedirs(bin_dir, exist_ok=True)
                 bin_path = os.path.join(bin_dir, safe_name)
 
@@ -2338,7 +2342,7 @@ edition = "2021"
                     run_hint = f"execute_bash('tsx {file_path}')"
                 elif target_lang == "cpp":
                     try:
-                        await asyncio.to_thread(subprocess.run, ["g++", "-std=c++17", "-O2", file_path, "-o", bin_path], cwd=PLUGINS_DIR, capture_output=True, text=True, timeout=30)
+                        await asyncio.to_thread(subprocess.run, ["g++", "-std=c++17", "-O2", file_path, "-o", bin_path], cwd=TOOLS_DIR, capture_output=True, text=True, timeout=30)
                         shutil.copy2(bin_path, f"{file_path}_bin")
                     except Exception:
                         pass
@@ -2357,7 +2361,7 @@ edition = "2021"
                 async with _WORKSPACE_STATE_LOCK:
                     registry = load_json(TOOL_REGISTRY_FILE)
                     if category not in registry: registry[category] = {"category_description": category_description, "tools": {}}
-                    registry[category]["tools"][plugin_name] = {"path": file_path, "description": plugin_description, "language": target_lang, "usage_objective": objective}
+                    registry[category]["tools"][tool_name] = {"path": file_path, "description": tool_description, "language": target_lang, "usage_objective": objective}
                     save_json(TOOL_REGISTRY_FILE, registry)
 
                     if os.path.exists("/app/workspace/.git"):
@@ -2366,14 +2370,14 @@ edition = "2021"
                             await proc_add.communicate()
                             proc_diff = await asyncio.create_subprocess_exec("git", "diff", "--cached", "--quiet", cwd=WORKSPACE_DIR)
                             if (await proc_diff.wait()) != 0:
-                                clean_desc = re.sub(r'[\r\n\x00-\x1f]+', ' ', plugin_description).strip()[:40]
-                                proc_commit = await asyncio.create_subprocess_exec("git", "commit", "-m", f"feat(coder): forge {target_lang} plugin {safe_name} - {clean_desc}", cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                                clean_desc = re.sub(r'[\r\n\x00-\x1f]+', ' ', tool_description).strip()[:40]
+                                proc_commit = await asyncio.create_subprocess_exec("git", "commit", "-m", f"feat(coder): create {target_lang} tool {safe_name} - {clean_desc}", cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                                 await proc_commit.communicate()
                         except Exception:
                             pass
 
                 code_lines = len(code.splitlines())
-                report = f"SUCCESS (Attempt {attempt+1}): {language.upper()} Asset '{plugin_name}' saved to registry.\n"
+                report = f"SUCCESS (Attempt {attempt+1}): {language.upper()} Asset '{tool_name}' saved to registry.\n"
                 report += f"[File: {file_path} | Lines: {code_lines} | Size: {len(code):,} bytes]\n"
                 report += f"[Tokens: {tokens_in} in | {tokens_out} out]\n{deps_report}Execution Blueprint: {run_hint}"
                 if coder_thinking: report += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
@@ -2381,12 +2385,12 @@ edition = "2021"
                 return report
             else:
                 last_validation_error = err_msg.strip() if err_msg else "Syntax validation failed"
-                logger.warning(f"[forge_and_register_plugin] Attempt {attempt+1} validation failed for '{plugin_name}': {last_validation_error[:200]}")
+                logger.warning(f"[create_tool] Attempt {attempt+1} validation failed for '{tool_name}': {last_validation_error[:200]}")
                 if os.path.exists(file_path): os.remove(file_path)
-                save_failure_trace("coder_forge", {
+                save_failure_trace("coder_create_tool", {
                     "subagent": "coder",
-                    "action": "forge_and_register_plugin",
-                    "plugin_name": plugin_name,
+                    "action": "create_tool",
+                    "tool_name": tool_name,
                     "target_language": target_lang,
                     "attempt": attempt + 1,
                     "validation_error": last_validation_error,
@@ -2398,29 +2402,29 @@ edition = "2021"
                 messages.append({"role": "user", "content": f"Code validation failed. Error:\n{err_msg}\nPlease patch the syntax rules and return the raw block."})
                 
         except Exception as e:
-            logger.error(f"[forge_and_register_plugin] Exception on attempt {attempt+1} for '{plugin_name}': {str(e)}")
-            trace_file = save_failure_trace("coder_forge_exception", {
+            logger.error(f"[create_tool] Exception on attempt {attempt+1} for '{tool_name}': {str(e)}")
+            trace_file = save_failure_trace("coder_create_tool_exception", {
                 "subagent": "coder",
-                "action": "forge_and_register_plugin",
-                "plugin_name": plugin_name,
+                "action": "create_tool",
+                "tool_name": tool_name,
                 "attempt": attempt + 1,
                 "error": str(e),
                 "traceback": traceback.format_exc(),
                 "messages": messages
             })
             trace_note = f"\n[SYSTEM: Failure trace saved to '{trace_file}']" if trace_file else ""
-            return f"Fatal Forging Exception on attempt {attempt+1}: {str(e)}{trace_note}"
+            return f"Fatal Tool Creation Exception on attempt {attempt+1}: {str(e)}{trace_note}"
             
-    logger.error(f"[forge_and_register_plugin] Forging failed after {config.MAX_PLUGIN_RETRIES} attempts for '{plugin_name}': {last_validation_error[:200]}")
-    trace_file = save_failure_trace("coder_forge_final", {
+    logger.error(f"[create_tool] Tool creation failed after {config.MAX_TOOL_RETRIES} attempts for '{tool_name}': {last_validation_error[:200]}")
+    trace_file = save_failure_trace("coder_create_tool_final", {
         "subagent": "coder",
-        "action": "forge_and_register_plugin",
-        "plugin_name": plugin_name,
+        "action": "create_tool",
+        "tool_name": tool_name,
         "target_language": target_lang,
-        "attempts": config.MAX_PLUGIN_RETRIES,
+        "attempts": config.MAX_TOOL_RETRIES,
         "last_validation_error": last_validation_error
     })
-    fail_msg = f"FAILED: Coder could not validate artifact constraints after {config.MAX_PLUGIN_RETRIES} runs.\nLast Validation Error:\n{last_validation_error}"
+    fail_msg = f"FAILED: Coder could not validate artifact constraints after {config.MAX_TOOL_RETRIES} runs.\nLast Validation Error:\n{last_validation_error}"
     if trace_file:
         fail_msg += f"\n[SYSTEM: Failure trace saved to '{trace_file}']"
     if 'coder_thinking' in locals() and coder_thinking:
@@ -2431,11 +2435,11 @@ edition = "2021"
 
 
 @mcp.tool()
-async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
+async def edit_code(filepath: str, edit_objective: str) -> str:
     """Delegates a targeted code modification task directly to the Coder agent.
     The Coder will natively read the existing file from disk, isolate the target lines, 
     and output ONLY the precise text replacement blocks required to satisfy the objective.
-    Use this for modifying massive scripts to save context space.
+    Use this for modifying scripts or source files without rewriting the whole file.
     
     Parameters:
     - filepath: Absolute path to the file to modify.
@@ -2487,7 +2491,7 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
     safe_budget = int(max_context * 0.90)
     payload_tokens = get_payload_tokens(messages)
     if payload_tokens > safe_budget:
-        return (f"SYSTEM ERROR: The file '{filepath}' sent to the Coder for surgical edit is too massive! "
+        return (f"SYSTEM ERROR: The file '{filepath}' sent to the Coder for edit is too massive! "
                 f"Payload is {payload_tokens} tokens, but the safety limit is {safe_budget}. "
                 f"Consider splitting the file or editing smaller modules.")
 
@@ -2498,7 +2502,7 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
         api_args["response_format"] = {
             "type": "json_schema",
             "json_schema": {
-                "name": "surgical_edit_schema",
+                "name": "code_edit_schema",
                 "strict": True,
                 "schema": {
                     "type": "object",
@@ -2547,16 +2551,16 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
         try:
             edit_data = extract_json_payload(raw_json_str)
         except json.JSONDecodeError as e:
-            trace_file = save_failure_trace("coder_surgical_json", {
+            trace_file = save_failure_trace("coder_edit_json", {
                 "subagent": "coder",
-                "action": "surgical_code_edit",
+                "action": "edit_code",
                 "filepath": filepath,
                 "objective": edit_objective,
                 "error": f"JSON decode error: {str(e)}",
                 "raw_response": raw_json_str,
                 "coder_thinking": coder_thinking
             })
-            fail_msg = f"SYSTEM ERROR: Coder returned invalid JSON for surgical edit: {str(e)}"
+            fail_msg = f"SYSTEM ERROR: Coder returned invalid JSON for code edit: {str(e)}"
             if trace_file: fail_msg += f"\n[SYSTEM: Failure trace saved to '{trace_file}']"
             if coder_thinking: fail_msg += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
             fail_msg += f"\n<___CODER_CODE___>\n{raw_json_str}\n</___CODER_CODE___>"
@@ -2570,9 +2574,9 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
 
         if status in ("target_not_found", "error") or not edits_list:
             reason = explanation or ("Target code specified in objective not found in file." if status == "target_not_found" else "The Coder returned an empty edits list. No modifications applied.")
-            trace_file = save_failure_trace("coder_surgical_target_missing", {
+            trace_file = save_failure_trace("coder_edit_target_missing", {
                 "subagent": "coder",
-                "action": "surgical_code_edit",
+                "action": "edit_code",
                 "filepath": filepath,
                 "objective": edit_objective,
                 "status": status,
@@ -2580,7 +2584,7 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                 "raw_response": raw_json_str,
                 "coder_thinking": coder_thinking
             })
-            fail_msg = f"SYSTEM ERROR: The Coder could not apply surgical edit ({status}): {reason}"
+            fail_msg = f"SYSTEM ERROR: The Coder could not apply code edit ({status}): {reason}"
             if trace_file: fail_msg += f"\n[SYSTEM: Failure trace saved to '{trace_file}']"
             if coder_thinking: fail_msg += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
             fail_msg += f"\n<___CODER_CODE___>\n{raw_json_str}\n</___CODER_CODE___>"
@@ -2593,14 +2597,14 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
             s_block = edit_item.get("search_string", "")
             r_block = edit_item.get("replace_string", "")
             if not s_block:
-                logger.warning(f"[surgical_code_edit] Edit #{idx} in '{filepath}' provided empty search_string")
+                logger.warning(f"[edit_code] Edit #{idx} in '{filepath}' provided empty search_string")
                 return f"SYSTEM ERROR: Edit #{idx} provided an empty search_string. Aborting modifications for safety."
             match_count = working_code.count(s_block)
             if match_count > 1:
-                logger.warning(f"[surgical_code_edit] Non-unique search string in '{filepath}' on edit #{idx} ({match_count} occurrences)")
-                trace_file = save_failure_trace("coder_surgical_duplicate", {
+                logger.warning(f"[edit_code] Non-unique search string in '{filepath}' on edit #{idx} ({match_count} occurrences)")
+                trace_file = save_failure_trace("coder_edit_duplicate", {
                     "subagent": "coder",
-                    "action": "surgical_code_edit",
+                    "action": "edit_code",
                     "filepath": filepath,
                     "objective": edit_objective,
                     "edit_index": idx,
@@ -2618,7 +2622,7 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                 fail_msg += f"\n<___CODER_CODE___>\n{raw_json_str}\n</___CODER_CODE___>"
                 return fail_msg
             if s_block not in working_code:
-                logger.warning(f"[surgical_code_edit] Search string mismatch in '{filepath}' on edit #{idx}")
+                logger.warning(f"[edit_code] Search string mismatch in '{filepath}' on edit #{idx}")
                 # Provide diagnostic near-match context so the Coder can self-correct indentation/spacing immediately
                 file_lines = working_code.splitlines()
                 search_lines = s_block.splitlines()
@@ -2633,9 +2637,9 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                 diff_hint = ""
                 if near_lines:
                     diff_hint = f"\nClosest matching lines in file:\n```\n" + "\n".join(near_lines) + "\n```\n"
-                trace_file = save_failure_trace("coder_surgical_mismatch", {
+                trace_file = save_failure_trace("coder_edit_mismatch", {
                     "subagent": "coder",
-                    "action": "surgical_code_edit",
+                    "action": "edit_code",
                     "filepath": filepath,
                     "objective": edit_objective,
                     "edit_index": idx,
@@ -2665,24 +2669,24 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                 compile(updated_code, filepath, 'exec')
             except SyntaxError as e:
                 bad_line = f" ({e.text.strip()})" if e.text else ""
-                logger.error(f"[surgical_code_edit] Python syntax error in '{filepath}' on line {e.lineno}: {e.msg}{bad_line}")
-                trace_file = save_failure_trace("coder_surgical_syntax", {
+                logger.error(f"[edit_code] Python syntax error in '{filepath}' on line {e.lineno}: {e.msg}{bad_line}")
+                trace_file = save_failure_trace("coder_edit_syntax", {
                     "subagent": "coder",
-                    "action": "surgical_code_edit",
+                    "action": "edit_code",
                     "filepath": filepath,
                     "objective": edit_objective,
                     "error": f"SyntaxError line {e.lineno}: {e.msg}{bad_line}",
                     "coder_thinking": coder_thinking,
                     "raw_json_str": raw_json_str
                 })
-                fail_msg = f"SYSTEM ERROR: Surgical edit aborted because it introduces a Python syntax error on line {e.lineno}{bad_line}: {e.msg}. File on disk was NOT modified."
+                fail_msg = f"SYSTEM ERROR: Code edit aborted because it introduces a Python syntax error on line {e.lineno}{bad_line}: {e.msg}. File on disk was NOT modified."
                 if trace_file: fail_msg += f"\n[SYSTEM: Failure trace saved to '{trace_file}']"
                 if coder_thinking: fail_msg += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
                 fail_msg += f"\n<___CODER_CODE___>\n{raw_json_str}\n</___CODER_CODE___>"
                 return fail_msg
         elif ext in (".js", ".cpp", ".cc", ".cxx"):
             os.makedirs(SANDBOX_DIR, exist_ok=True)
-            tmp_chk_path = os.path.join(SANDBOX_DIR, f".surgical_check_{os.getpid()}{ext}")
+            tmp_chk_path = os.path.join(SANDBOX_DIR, f".edit_check_{os.getpid()}{ext}")
             try:
                 with open(tmp_chk_path, "w", encoding="utf-8") as tf:
                     tf.write(updated_code)
@@ -2690,7 +2694,7 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                 chk_res = await asyncio.to_thread(subprocess.run, chk_cmd, capture_output=True, text=True, timeout=15)
                 if chk_res.returncode != 0:
                     err_detail = (chk_res.stderr or chk_res.stdout or "Syntax validation failed").strip()
-                    fail_msg = f"SYSTEM ERROR: Surgical edit aborted because it introduces a syntax error:\n{err_detail}\nFile on disk was NOT modified."
+                    fail_msg = f"SYSTEM ERROR: Code edit aborted because it introduces a syntax error:\n{err_detail}\nFile on disk was NOT modified."
                     if coder_thinking: fail_msg += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
                     fail_msg += f"\n<___CODER_CODE___>\n{raw_json_str}\n</___CODER_CODE___>"
                     return fail_msg
@@ -2702,7 +2706,7 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
         # Archive backup snapshot
         filename = os.path.basename(real_target)
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S_%f")
-        backup_path = f"/app/workspace/archive/{filename}.{timestamp}.surgical.bak"
+        backup_path = f"/app/workspace/archive/{filename}.{timestamp}.edit.bak"
         with open(backup_path, "w", encoding="utf-8") as f:
             f.write(current_code)
 
@@ -2710,7 +2714,7 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
         with open(real_target, "w", encoding="utf-8") as f:
             f.write(updated_code)
 
-        logger.info(f"[surgical_code_edit] Successfully applied {len(edits_list)} edit(s) to '{real_target}'")
+        logger.info(f"[edit_code] Successfully applied {len(edits_list)} edit(s) to '{real_target}'")
 
         # Dynamic Git Commit Tracking Checkpoint
         if os.path.exists("/app/workspace/.git"):
@@ -2722,7 +2726,7 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                     diff_rc = await proc_diff.wait()
                     if diff_rc != 0:
                         clean_obj = re.sub(r'[\r\n\x00-\x1f]+', ' ', edit_objective).strip()[:40]
-                        proc_commit = await asyncio.create_subprocess_exec("git", "commit", "-m", f"feat(coder): surgical patch applied ({len(edits_list)} edits) for {clean_obj}", cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                        proc_commit = await asyncio.create_subprocess_exec("git", "commit", "-m", f"feat(coder): code patch applied ({len(edits_list)} edits) for {clean_obj}", cwd=WORKSPACE_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                         await proc_commit.communicate()
                 except Exception:
                     pass
@@ -2734,30 +2738,30 @@ async def surgical_code_edit(filepath: str, edit_objective: str) -> str:
                 if t_data.get("path") == filepath:
                     lang = t_data.get("language", "python")
                     if lang == "rust":
-                        blueprint_hint = "\nREMINDER: This is a Rust asset. You MUST copy this updated file from plugins into your sandbox Cargo project structure (src/main.rs) and re-run compilation."
+                        blueprint_hint = "\nREMINDER: This is a Rust asset. You MUST copy this updated file from tools into your sandbox Cargo project structure (src/main.rs) and re-run compilation."
                     elif lang == "cpp":
                         blueprint_hint = "\nREMINDER: This is a C++ asset. Ensure you re-compile the source file using g++ before executing the binary path."
 
         edit_summary_block = "\n\n".join(applied_blocks)
         explanation_note = f" Note: {explanation}" if explanation else ""
-        res = f"SUCCESS: Coder surgically applied {len(edits_list)} edit(s) to '{filepath}' to achieve the objective.{explanation_note} Backup generated: {backup_path}.{blueprint_hint}"
+        res = f"SUCCESS: Coder applied {len(edits_list)} edit(s) to '{filepath}' to achieve the objective.{explanation_note} Backup generated: {backup_path}.{blueprint_hint}"
         if coder_thinking:
             res += f"\n<___CODER_THOUGHTS___>\n{coder_thinking}\n</___CODER_THOUGHTS___>"
         res += f"\n<___CODER_CODE___>\n{edit_summary_block}\n</___CODER_CODE___>"
         return res
 
     except Exception as e:
-        logger.error(f"[surgical_code_edit] Exception on '{filepath}': {str(e)}")
-        trace_file = save_failure_trace("coder_surgical_exception", {
+        logger.error(f"[edit_code] Exception on '{filepath}': {str(e)}")
+        trace_file = save_failure_trace("coder_edit_exception", {
             "subagent": "coder",
-            "action": "surgical_code_edit",
+            "action": "edit_code",
             "filepath": filepath,
             "objective": edit_objective,
             "error": str(e),
             "traceback": traceback.format_exc()
         })
         trace_note = f"\n[SYSTEM: Failure trace saved to '{trace_file}']" if trace_file else ""
-        return f"SYSTEM ERROR: Surgical Coder sequence aborted. Error: {str(e)}{trace_note}"
+        return f"SYSTEM ERROR: Code edit sequence aborted. Error: {str(e)}{trace_note}"
 
 db_tool_desc = f"""Executes a SQL query against a specified SQLite database.
 'db_path' MUST be an absolute path (e.g., '/app/workspace/state/my_db.db').
@@ -3712,7 +3716,7 @@ def load_skill(skill_name: str = "") -> str:
     # If no skill name provided, return the catalog
     if not skill_name or not skill_name.strip():
         if not available_skills:
-            return "AVAILABLE SKILLS: None currently installed in /app/workspace/skills. Use commission_architect to build some."
+            return "AVAILABLE SKILLS: None currently installed in /app/workspace/skills. Use create_skill to build some."
         summary_lines = ["AVAILABLE SKILLS REGISTRY (Call load_skill(skill_name) to activate):"]
         for s_name, s_desc in available_skills.items():
             summary_lines.append(f"- {s_name}: {s_desc}")
@@ -3740,7 +3744,7 @@ def load_skill(skill_name: str = "") -> str:
 
 
 @mcp.tool()
-async def commission_architect(skill_name: str, objective: str, brain_notes: str, context_filepaths: list[str] = None) -> str:
+async def create_skill(skill_name: str, objective: str, brain_notes: str, context_filepaths: list[str] = None) -> str:
     """Use this immediately after solving a complex problem to permanently document it as a system skill.
     Passes raw notes to the Architect agent, who formats and saves it as a new Skill.
     'context_filepaths' can take target code implementations or terminal output histories to extract instructions from.

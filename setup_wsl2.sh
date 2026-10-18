@@ -34,7 +34,7 @@ log_err()   { echo -e "${RED}[ERROR]${RESET} $1" >&2; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_USER="agent"
 CUSTOM_USER=""
-IMAGE_NAME="ai-forge"
+IMAGE_NAME="sandbox-image"
 AUTO_CONFIRM=false
 
 # Detect calling user if run with sudo
@@ -1028,10 +1028,10 @@ echo ""
 echo -e "  ${BOLD}1. Launch the AI Overseer:${RESET}"
 echo -e "     (Your default LLM is already configured in ~/.bashrc and LiteLLM is running on port 4000)"
 echo -e "     Interactive Rich UI:"
-echo -e "       ${CYAN}cd $SCRIPT_DIR && pixi run python chat_overseer.py${RESET}"
+echo -e "       ${CYAN}cd $SCRIPT_DIR && pixi run python overseer.py${RESET}"
 echo ""
 echo -e "     Run a single headless task and auto-exit:"
-echo -e "       ${CYAN}cd $SCRIPT_DIR && pixi run python chat_overseer.py -x -p \"Check environment and view tool registry\"${RESET}"
+echo -e "       ${CYAN}cd $SCRIPT_DIR && pixi run python overseer.py -x -p \"Check environment and view tool registry\"${RESET}"
 echo ""
 echo -e "  ${BOLD}2. Swarm Dashboard (Multi-Agent Tmux Grid):${RESET}"
 echo -e "       ${CYAN}./start_tests_analysis_tmux_1${RESET}"

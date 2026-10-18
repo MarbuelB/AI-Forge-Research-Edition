@@ -79,10 +79,10 @@ from rich.panel import Panel
 import config
 
 # Can be run using arguments like this:
-# pixi run python chat_overseer.py -p "tell me what tools do you have" -f formatted -s "Test_2" --brain 2 --coder 3 --summarizer 3 --adviser 3 -x
+# pixi run python overseer.py -p "tell me what tools do you have" -f formatted -s "Test_2" --brain 2 --coder 3 --summarizer 3 --adviser 3 -x
 
 # --- CLI ARGUMENT PARSER ---
-parser = argparse.ArgumentParser(description="AI-Forge Overseer")
+parser = argparse.ArgumentParser(description="Sandbox Overseer")
 parser.add_argument("-p", "--prompt", type=str, help="Initial user prompt")
 parser.add_argument("-f", "--format", choices=["markdown", "text"], help="Console format override")
 parser.add_argument("-v", "--verbosity", choices=["silent", "minimal", "standard", "detailed"], help="Console verbosity override")
@@ -117,7 +117,7 @@ if cli_args.architect is not None: config.ACTIVE_ARCHITECT_PROFILE = cli_args.ar
 # Capture Prompt (from -p flag OR piped STDIN)
 cli_prompt = cli_args.prompt
 if not cli_prompt and not sys.stdin.isatty():
-    # This grabs piped text like: cat input.txt | python chat_overseer.py
+    # This grabs piped text like: cat input.txt | python overseer.py
     cli_prompt = sys.stdin.read().strip()
    
 # Mute the MCP client's internal info logs
@@ -159,7 +159,7 @@ SESSION_DIR = os.path.realpath(os.path.abspath(f"./sessions/{active_session}"))
 is_resuming = os.path.exists(SESSION_DIR)
 
 # Build the isolated folder structure
-for folder in ["logs", "plugins", "histories", "memories", "state", "sandbox", "outputs", "archive", "skills", "custom_packages"]:
+for folder in ["logs", "tools", "histories", "memories", "state", "sandbox", "outputs", "archive", "skills", "custom_packages"]:
     os.makedirs(f"{SESSION_DIR}/{folder}", exist_ok=True)
 os.makedirs(f"{SESSION_DIR}/state/rest_calls", exist_ok=True)
 
@@ -176,7 +176,7 @@ def build_skills_menu():
     """Scans the sandbox workspace for SKILL.md files and builds the menu."""
     skills_dir = os.path.join(SESSION_DIR, "skills")
     if not os.path.exists(skills_dir):
-        return "AVAILABLE SKILLS MENU:\n- None currently installed. Use commission_architect to build some."
+        return "AVAILABLE SKILLS MENU:\n- None currently installed. Use create_skill to build some."
 
     menu_lines = ["AVAILABLE SKILLS MENU (Use `load_skill` to read full instructions):"]
     for item in sorted(os.listdir(skills_dir)):
@@ -200,7 +200,7 @@ def build_skills_menu():
                 pass
                 
     if len(menu_lines) == 1:
-        return "AVAILABLE SKILLS MENU:\n- None currently installed. Use commission_architect to build some."
+        return "AVAILABLE SKILLS MENU:\n- None currently installed. Use create_skill to build some."
     return "\n".join(menu_lines)
 
 
@@ -557,7 +557,7 @@ async def run_chat():
     help_text = "Commands: '/exit' or '/quit' to quit | UI: '/text', '/markdown' | Verbosity: '/silent', '/minimal', '/standard', '/detailed' | MCP: '/mcp'"
     
     if is_resuming:
-        log_event("SYSTEM", f"Successfully restored '{active_session}'. Your forged tools are loaded.\n{help_text}")
+        log_event("SYSTEM", f"Successfully restored '{active_session}'. Your custom tools are loaded.\n{help_text}")
     else:
         log_event("SYSTEM", f"Started new workspace: '{active_session}'.\n{help_text}")
         
@@ -567,7 +567,7 @@ async def run_chat():
     # THE SELF-HEALING CONNECTION LOOP
     while not quit_app:
         global active_container_name
-        active_container_name = f"forge_sandbox_{active_session}_{os.getpid()}"
+        active_container_name = f"sandbox_{active_session}_{os.getpid()}"
         # Clear stale Podman WSL state before every single boot/reboot ---
         if config.VERBOSITY_MODE != "silent":
             print(f"{COLOR_CYAN}[SYSTEM] Sweeping stale Podman state...{COLOR_RESET}")
@@ -582,13 +582,13 @@ async def run_chat():
         try:
             # --- 1. DYNAMICALLY BUILD THE TARGET COMMAND ---
             # Start with the base command
-            god_tools_cmd = "pixi run --locked --manifest-path /app/pixi.toml -q python /app/god_tools.py"
+            sandbox_tools_cmd = "pixi run --locked --manifest-path /app/pixi.toml -q python /app/sandbox_tools.py"
             
-            if cli_args.coder is not None: god_tools_cmd += f" --coder {cli_args.coder}"
-            if cli_args.summarizer is not None: god_tools_cmd += f" --summarizer {cli_args.summarizer}"
-            if cli_args.adviser is not None: god_tools_cmd += f" --adviser {cli_args.adviser}"
-            if cli_args.analyst is not None: god_tools_cmd += f" --analyst {cli_args.analyst}"
-            if cli_args.architect is not None: god_tools_cmd += f" --architect {cli_args.architect}"
+            if cli_args.coder is not None: sandbox_tools_cmd += f" --coder {cli_args.coder}"
+            if cli_args.summarizer is not None: sandbox_tools_cmd += f" --summarizer {cli_args.summarizer}"
+            if cli_args.adviser is not None: sandbox_tools_cmd += f" --adviser {cli_args.adviser}"
+            if cli_args.analyst is not None: sandbox_tools_cmd += f" --analyst {cli_args.analyst}"
+            if cli_args.architect is not None: sandbox_tools_cmd += f" --architect {cli_args.architect}"
                     
             # Check if an init binary (catatonit / tini) is present on the host
             has_init = (
@@ -656,8 +656,8 @@ async def run_chat():
                     "-v", f"{os.path.abspath('./config.py')}:/app/config.py:ro,Z",
                     "-v", f"{os.path.abspath('./llm_config.py')}:/app/llm_config.py:ro,Z",
                     "-v", f"{os.path.abspath('./mcp_config.py')}:/app/mcp_config.py:ro,Z",
-                    "-v", f"{os.path.abspath('./god_tools.py')}:/app/god_tools.py:ro,Z",
-                    "-v", f"{os.path.abspath('./chat_overseer.py')}:/app/chat_overseer.py:ro,Z", # it can read own code
+                    "-v", f"{os.path.abspath('./sandbox_tools.py')}:/app/sandbox_tools.py:ro,Z",
+                    "-v", f"{os.path.abspath('./overseer.py')}:/app/overseer.py:ro,Z", # it can read own code
                     "-v", f"{os.path.abspath('./chimerax_mcp_server.py')}:/app/chimerax_mcp_server.py:ro,Z",
                     "-v", f"{os.path.abspath('./mock_mcp_server.py')}:/app/mock_mcp_server.py:ro,Z",
                     "-v", f"{os.path.abspath('./readme.md')}:/app/readme.md:ro,Z",
@@ -665,10 +665,10 @@ async def run_chat():
                     "-v", f"{os.path.abspath('./setup_wsl2.sh')}:/app/setup_wsl2.sh:ro,Z",
                     "-v", f"{config.HOST_INPUT_DIR}:/app/host_input:ro,Z,nosuid,nodev", # same for all sessions, read only
                     
-                    "ai-forge",
+                    "sandbox-image",
                     "bash", "-c", f"""
                     # 1. Initialize safe agent Git credentials quietly
-                    git config --global user.name "AI-Forge-Agent"
+                    git config --global user.name "Sandbox-Agent"
                     git config --global user.email "agent@sandbox.local"
 
                     # FIX 1: Explicitly tell Git never to print diagnostic hints to stdout
@@ -678,7 +678,7 @@ async def run_chat():
                     git config --global init.defaultBranch main
 
                     # 2. Ensure all isolated workspace subfolders exist
-                    mkdir -p /app/workspace/logs /app/workspace/plugins /app/workspace/histories /app/workspace/memories /app/workspace/state /app/workspace/state/rest_calls /app/workspace/sandbox /app/workspace/outputs /app/workspace/archive /app/workspace/skills /app/workspace/custom_packages
+                    mkdir -p /app/workspace/logs /app/workspace/tools /app/workspace/histories /app/workspace/memories /app/workspace/state /app/workspace/state/rest_calls /app/workspace/sandbox /app/workspace/outputs /app/workspace/archive /app/workspace/skills /app/workspace/custom_packages
 
                     # 3. Setup or detect an active Git repository in the workspace
                     if [ ! -d "/app/workspace/.git" ]; then
@@ -701,16 +701,17 @@ async def run_chat():
                     chmod -R a-w /app/__pycache__ 2>/dev/null
                     chmod a-w /app 2>/dev/null
                     
-                    # 5. HARDENING: Freeze the Pixi environment binary path to block PATH hijacking
+                    # 5. HARDENING: Freeze the Pixi environment directories and binary path to block tampering and PATH hijacking
                     chmod -R a-w /app/.pixi/envs/default/bin/ 2>/dev/null
+                    chmod a-w /app/.pixi /app/.pixi/envs /app/.pixi/envs/default /app/.pixi/envs/default/lib/python*/site-packages 2>/dev/null
                     
                     # 6. CORRECT ENVIRONMENT ALIGNMENT: Prepend framework paths while preserving Pixi site-packages
                     export PYTHONPATH=/app:/app/workspace/custom_packages:$PYTHONPATH
-                    export PATH=/app/workspace/plugins:/app/workspace/plugins/bin:$PATH
+                    export PATH=/app/workspace/tools:/app/workspace/tools/bin:$PATH
                     
                     # 7. Start the MCP server safely
                     cd /app/workspace
-                    {god_tools_cmd}
+                    {sandbox_tools_cmd}
                     """
             ])
 
@@ -1075,7 +1076,7 @@ async def run_chat():
                                 err_hint = ""
                                 target_loc = str(cfg.get('url', cfg.get('command', '')))
                                 if "127.0.0.1" in target_loc or "localhost" in target_loc:
-                                    err_hint = " Note: The Overseer runs on the host and looks for servers on the host network. If you are building new tools inside the container, do NOT use in-container MCP servers; use 'forge_and_register_plugin' to build and register tools natively instead."
+                                    err_hint = " Note: The Overseer runs on the host and looks for servers on the host network. If you are building new tools inside the container, do NOT use in-container MCP servers; use 'create_tool' to build and register tools natively instead."
                                 elif cfg.get("transport") == "stdio":
                                     err_hint = " Note: stdio commands execute on the host machine. Ensure the command binary is installed and executable on the host."
                                 return f"SYSTEM ERROR: Could not connect to '{server_name}' at {target_loc}. The server appears to be offline or unreachable.{err_hint}"
@@ -1313,8 +1314,8 @@ async def run_chat():
 
                                 if pct >= 0.80:
                                     warn_msg = f"[SYSTEM WARNING: Your context window is at ~{pct*100:.0f}%. "
-                                    if pct >= 0.90: warn_msg += "CRITICAL LIMIT REACHED. You MUST use the compress_and_store_context tool immediately.]"
-                                    else: warn_msg += "Consider finishing your current task and using the compress_and_store_context tool soon.]"
+                                    if pct >= 0.90: warn_msg += "CRITICAL LIMIT REACHED. You MUST use the compact_context tool immediately.]"
+                                    else: warn_msg += "Consider finishing your current task and using the compact_context tool soon.]"
                                     
                                     # Avoid appending duplicate warnings on consecutive tool turns
                                     if not any(m.get("content", "").startswith("[SYSTEM WARNING: Your context window is at") for m in messages[-2:]):
@@ -1632,7 +1633,7 @@ async def run_chat():
                                             "tc_id": t_id, "call_num": c_num, "malformed": True
                                         })
 
-                                file_writers = {"forge_and_register_plugin", "surgical_code_edit", "write_file", "commission_architect"}
+                                file_writers = {"create_tool", "edit_code", "write_file", "create_skill"}
                                 file_consumers = {"execute_bash", "analyze_files", "consult_adviser", "load_skill"}
 
                                 def _is_file_writer(it):
@@ -1640,7 +1641,7 @@ async def run_chat():
                                     ag = it["args"] if isinstance(it["args"], dict) else {}
                                     return (
                                         nm in file_writers
-                                        or (nm == "query_universal_llm" and bool(ag.get("output_filepath")))
+                                        or (nm == "query_auxiliary_llm" and bool(ag.get("output_filepath")))
                                         or (nm == "execute_rest_call" and bool(ag.get("response_filepath")))
                                     )
 
@@ -1652,15 +1653,15 @@ async def run_chat():
                                 def _target_resource(it):
                                     nm = it["name"]
                                     ag = it["args"] if isinstance(it["args"], dict) else {}
-                                    if nm in ("write_file", "surgical_code_edit") and ag.get("filepath"):
+                                    if nm in ("write_file", "edit_code") and ag.get("filepath"):
                                         return f"file:{os.path.normpath(str(ag['filepath']).strip())}"
-                                    if nm == "query_universal_llm" and ag.get("output_filepath"):
+                                    if nm == "query_auxiliary_llm" and ag.get("output_filepath"):
                                         return f"file:{os.path.normpath(str(ag['output_filepath']).strip())}"
                                     if nm == "execute_rest_call" and ag.get("response_filepath"):
                                         return f"file:{os.path.normpath(str(ag['response_filepath']).strip())}"
-                                    if nm == "forge_and_register_plugin" and ag.get("plugin_name"):
-                                        return f"plugin:{str(ag['plugin_name']).strip().lower()}"
-                                    if nm == "commission_architect" and ag.get("skill_name"):
+                                    if nm == "create_tool" and ag.get("tool_name"):
+                                        return f"tool:{str(ag['tool_name']).strip().lower()}"
+                                    if nm == "create_skill" and ag.get("skill_name"):
                                         return f"skill:{str(ag['skill_name']).strip().lower()}"
                                     if nm in ("query_sqlite_db", "batch_generate_embeddings") and ag.get("db_path"):
                                         return f"db:{os.path.normpath(str(ag['db_path']).strip())}"
@@ -1679,7 +1680,7 @@ async def run_chat():
                                         if item["malformed"]:
                                             return False
                                         iname = item["name"]
-                                        if iname in ("compress_and_store_context", "manage_external_mcp"):
+                                        if iname in ("compact_context", "manage_external_mcp"):
                                             return False
                                         if iname in ext_tool_router and ext_tool_router[iname].get("require_confirmation", False):
                                             return False
@@ -1736,25 +1737,25 @@ async def run_chat():
 
                                         if config.VERBOSITY_MODE != "silent":
                                             pfx = f"▶ Tool #{call_num}: "
-                                            if name == "forge_and_register_plugin":
-                                                print(f"\n{COLOR_ORANGE}{pfx}Routing to Coder for plugin forging...{COLOR_RESET}")
-                                            elif name == "compress_and_store_context":
+                                            if name == "create_tool":
+                                                print(f"\n{COLOR_ORANGE}{pfx}Routing to Coder for tool creation...{COLOR_RESET}")
+                                            elif name == "compact_context":
                                                 print(f"\n{COLOR_ORANGE}{pfx}Triggering Memory Manager Pipeline... Awaiting response...{COLOR_RESET}")
                                             elif name == "consult_adviser":
                                                 print(f"\n{COLOR_ORANGE}{pfx}Consulting Senior Adviser... Awaiting strategic report...{COLOR_RESET}")
                                             elif name == "fast_decision":
                                                 print(f"\n{COLOR_ORANGE}{pfx}Routing to The Decider for rapid ruling...{COLOR_RESET}")
-                                            elif name == "query_universal_llm":
+                                            elif name == "query_auxiliary_llm":
                                                 target_model = args.get("model", "")
                                                 target_ep = args.get("endpoint", "")
                                                 ep_str = f" ({target_model}" + (f" on {target_ep}" if target_ep else "") + ")" if target_model else ""
-                                                print(f"\n{COLOR_ORANGE}{pfx}Spawning Universal Sub-Agent{ep_str}... Awaiting response...{COLOR_RESET}")
+                                                print(f"\n{COLOR_ORANGE}{pfx}Spawning Auxiliary LLM{ep_str}... Awaiting response...{COLOR_RESET}")
                                             elif name == "execute_rest_call":
                                                 target_url = args.get("url", "")
                                                 print(f"\n{COLOR_ORANGE}{pfx}Dispatching REST call ({target_url})...{COLOR_RESET}")
                                             elif name == "analyze_files":
                                                 print(f"\n{COLOR_ORANGE}{pfx}Passing files to The Analyst... Awaiting report...{COLOR_RESET}")
-                                            elif name == "commission_architect":
+                                            elif name == "create_skill":
                                                 print(f"\n{COLOR_ORANGE}{pfx}Waking up the Architect to draft skill...{COLOR_RESET}")
                                             elif name == "manage_external_mcp":
                                                 action_tag = args.get("action", "")
@@ -1824,7 +1825,7 @@ async def run_chat():
 
                                     subagent_call_cursors = {
                                         ag: totals_before.get(ag, {}).get("calls", 0)
-                                        for ag in ("coder", "adviser", "analyst", "architect", "summarizer", "decider", "universal")
+                                        for ag in ("coder", "adviser", "analyst", "architect", "summarizer", "decider", "auxiliary")
                                     }
 
                                     for idx_in_wave, (w_item, (output, tool_duration)) in enumerate(zip(wave, wave_results)):
@@ -1848,7 +1849,7 @@ async def run_chat():
                                                 else:
                                                     is_error = True
                                         else:
-                                            if output_stripped.startswith(("system error:", "[system error:", "[architect error]", "error:", "error executing", "error writing", "error reading", "failed", "fatal forging exception", "llm query failed", "analyst failed", "unknown tool", "tool not found", "validation error", "syntax error")):
+                                            if output_stripped.startswith(("system error:", "[system error:", "[architect error]", "error:", "error executing", "error writing", "error reading", "failed", "fatal tool creation exception", "fatal forging exception", "llm query failed", "analyst failed", "unknown tool", "tool not found", "validation error", "syntax error")):
                                                 is_error = True
                                             elif "traceback (most recent" in output_lower and not output_stripped.startswith(("---", "success", "[")):
                                                 is_error = True
@@ -1924,7 +1925,7 @@ async def run_chat():
                                             ("ARCHITECT", "architect", r"<___ARCHITECT_THOUGHTS___>(.*?)</___ARCHITECT_THOUGHTS___>", r"<___ARCHITECT_SKILL___>(.*?)</___ARCHITECT_SKILL___>", "GENERATED SKILL"),
                                             ("SUMMARIZER", "summarizer", r"<___SUMMARIZER_THOUGHTS___>(.*?)</___SUMMARIZER_THOUGHTS___>", r"<___SUMMARIZER_OUTPUT___>(.*?)</___SUMMARIZER_OUTPUT___>", "SUMMARIZER OUTPUT"),
                                             ("DECIDER", "decider", None, r"<___DECIDER_RULING___>(.*?)</___DECIDER_RULING___>", "RULING"),
-                                            ("UNIVERSAL SUB-AGENT", "universal", r"<___UNIVERSAL_THOUGHTS___>(.*?)</___UNIVERSAL_THOUGHTS___>", r"<___UNIVERSAL_OUTPUT___(?:\s+model=\"([^\"]*)\")?>(.*?)</___UNIVERSAL_OUTPUT___>", "RAW OUTPUT"),
+                                            ("AUXILIARY LLM", "auxiliary", r"<___AUXILIARY_THOUGHTS___>(.*?)</___AUXILIARY_THOUGHTS___>", r"<___AUXILIARY_OUTPUT___(?:\s+model=\"([^\"]*)\")?>(.*?)</___AUXILIARY_OUTPUT___>", "RAW OUTPUT"),
                                         ]
 
                                         for agent_label, agent_key, thought_pattern, content_pattern, content_label in subagent_specs:
@@ -1977,18 +1978,18 @@ async def run_chat():
                                                 with open(LOG_FILE, "a", encoding="utf-8") as f:
                                                     f.write(log_text.replace("\x00", ""))
 
-                                        out_color = COLOR_ORANGE if name in ["forge_and_register_plugin", "compress_and_store_context", "commission_architect", "consult_adviser", "fast_decision", "query_universal_llm", "analyze_files", "execute_rest_call"] else COLOR_DARK_GREEN
+                                        out_color = COLOR_ORANGE if name in ["create_tool", "compact_context", "create_skill", "consult_adviser", "fast_decision", "query_auxiliary_llm", "analyze_files", "execute_rest_call"] else COLOR_DARK_GREEN
                                         
                                         hide_output = config.VERBOSITY_MODE in ["minimal", "standard"]
                                         log_event(f"TOOL RESULT #{call_num} ({name}) ({tool_duration:.2f}s)", output, text_color=out_color, hide_console=hide_output)
                                         
                                         if hide_output and config.VERBOSITY_MODE != "silent":
-                                            if name in ["commission_architect", "consult_adviser", "fast_decision", "query_universal_llm", "analyze_files", "forge_and_register_plugin", "execute_rest_call"]:
+                                            if name in ["create_skill", "consult_adviser", "fast_decision", "query_auxiliary_llm", "analyze_files", "create_tool", "execute_rest_call"]:
                                                 print(f"{out_color}{output}{COLOR_RESET}")
                                             else:
                                                 print(f"{COLOR_DARK_GREEN}✓ Tool #{call_num} '{name}' completed ({tool_duration:.2f}s).{COLOR_RESET}")
 
-                                        if name == "compress_and_store_context" and output.startswith("SUCCESS:"):
+                                        if name == "compact_context" and output.startswith("SUCCESS:"):
                                             print(f"\n{COLOR_ORANGE}[SYSTEM] Memory compression cycle complete. Waking up with pristine context...{COLOR_RESET}")
                                             messages = load_history()
                                             if len(messages) <= 1:

@@ -1,10 +1,10 @@
 """
-AI-Forge LLM Configuration
-===========================
+LLM Configuration
+=================
 This file defines:
   1. Role assignments (which profile each agent role uses).
   2. Embeddings endpoint & vector dimension configuration.
-  3. Universal LLM sandbox endpoint.
+  3. Auxiliary LLM sandbox endpoint.
   4. LLM_PROFILES list of available models and endpoints.
 
 Profiles can be addressed from:
@@ -37,13 +37,13 @@ EMBEDDING_CONFIG = {
     "timeout": 120.0,
 }
 
-# --- UNIVERSAL LLM SANDBOX & ENDPOINT PRESETS ---
-# Default endpoint used by the Universal LLM tool when 'endpoint' is omitted by the Brain.
-DEFAULT_UNIVERSAL_ENDPOINT = "ollama"
+# --- AUXILIARY LLM SANDBOX & ENDPOINT PRESETS ---
+# Default endpoint used by the Auxiliary LLM tool when 'endpoint' is omitted by the Brain.
+DEFAULT_AUXILIARY_ENDPOINT = "ollama"
 
 # Pre-configured zero-trust endpoints reachable from within the container.
 # Real cloud API keys live safely on the host proxy (LiteLLM) or local Ollama.
-UNIVERSAL_ENDPOINTS = {
+AUXILIARY_ENDPOINTS = {
     "ollama": {
         "url": "http://host.containers.internal:64165/v1",
         "default_api_key": "Ollama",
