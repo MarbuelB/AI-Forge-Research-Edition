@@ -560,9 +560,7 @@ If the session grows too long, the system will inject a dynamic warning promptin
 ### 🐝 Swarm Mode (Parallel Execution)
 Because the framework strictly isolates state, memory, and Podman execution environments (dynamically generating container names via Session IDs and OS Process IDs), you can run multiple autonomous agents simultaneously on the same machine without them colliding.
 
-You can use `tmux` to launch a multi-agent swarm in a 2x2 split-pane dashboard. Pre-configured benchmark test scripts (`./start_tests_analysis_tmux_1` and `./start_tests_analysis_tmux_2`) are included in the repository root to boot a 4-agent parallel benchmark suite with automated post-task self-analysis.
-
-Alternatively, paste this chained command into your terminal to boot 4 independent researchers at once:
+You can use `tmux` to launch a multi-agent swarm in a 2x2 split-pane dashboard. Paste this chained command into your terminal to boot 4 independent researchers at once:
 
     tmux new-session -d -s smrtk_swarm \; \
       send-keys "pixi run python overseer.py -f text -s 'Swarm_Text_1'" C-m \; \
@@ -577,6 +575,90 @@ Alternatively, paste this chained command into your terminal to boot 4 independe
       attach-session -t smrtk_swarm
 
 **Pro-Tip for Swarm Management:** Enable mouse support in your tmux configuration (`echo "set -g mouse on" >> ~/.tmux.conf`) so you can simply click between your agents, drag the window borders to resize their panels, and use your mouse wheel to independently scroll through their individual reasoning logs!
+
+---
+
+## 🧪 Automated Testing & Benchmark Suite (`run_tests.sh`)
+
+SMRTk includes an automated benchmark test runner ([`run_tests.sh`](run_tests.sh)) driven by a clean, human-maintainable tab-separated table ([`tests.tsv`](tests.tsv)). This allows you to run reproducible, multi-disciplinary benchmarks sequentially, inspect deterministic session artifacts, and optionally trigger post-task self-diagnostic reviews.
+
+### 📋 TSV Table Format (`tests.tsv`)
+
+Every row in `tests.tsv` defines an independent test case with 4 tab-separated columns:
+
+| Column | Field Name | Description | Example |
+| :---: | :--- | :--- | :--- |
+| **1** | `Session Name` | Deterministic session name used for folder naming (`sessions/Session_ID_<name>`) and output filenames. | `Test01_Tool_Registry_Embeddings` |
+| **2** | `Description` | Brief summary shown in `--list` output and CLI step headers. | `Tool registry inventory, adviser brainstorming...` |
+| **3** | `Main Prompt` | The complete instruction sent to the AI Overseer (`\n` encodes embedded newlines). | `What tools do you have? ...` |
+| **4** | `Follow-up Prompt` | Tailored evaluation or self-analysis prompt executed when `--analyze` is enabled. | `In sessions/{SESSION_ID}/logs/, find the log...` |
+
+#### Dynamic Prompt Variables & Path Architecture
+SMRTk mounts each session folder (`./sessions/Session_ID_<name>`) on the host directly to `/app/workspace` inside the rootless Podman sandbox container. This means:
+* **Host Perspective:** Files live in `./sessions/Session_ID_<name>/` (e.g. `logs/`, `outputs/`, `sandbox/`, `tools/`).
+* **Agent (Container) Perspective:** The agent operates inside `/app/workspace/` (e.g. `/app/workspace/logs/`, `/app/workspace/outputs/`, `/app/workspace/tools/`).
+
+To make writing tests effortless, both the main prompt and the follow-up prompt can include runtime placeholders that `run_tests.sh` automatically expands:
+* `{SESSION_NAME}` $\rightarrow$ The short name from column 1 (e.g. `Test01_Tool_Registry_Embeddings`), ideal for naming deliverables like `/app/workspace/outputs/{SESSION_NAME}.md`.
+* `{SESSION_ID}` $\rightarrow$ The deterministic session ID (e.g. `Session_ID_Test01_Tool_Registry_Embeddings`).
+* `{LOGS_DIR}` $\rightarrow$ `/app/workspace/logs` (native container log path).
+* `{OUTPUTS_DIR}` $\rightarrow$ `/app/workspace/outputs` (native container outputs path).
+* `{WORKSPACE_DIR}` $\rightarrow$ `/app/workspace` (container root workspace).
+* `{HOST_SESSION_DIR}` $\rightarrow$ `sessions/Session_ID_<name>` (host-relative session folder).
+
+> [!NOTE]
+> `run_tests.sh` also includes automatic path safety translation: if a prompt accidentally mentions `sessions/<Session_ID>/`, the runner automatically rewrites it to `/app/workspace/` before handing it to the container, preventing agent path confusion!
+
+Example follow-up prompt:
+```text
+In /app/workspace/logs/, find the log file describing past AI agent activity... Write your assessment to /app/workspace/outputs/analysis_{SESSION_NAME}.md.
+```
+
+### 🚀 How to Run Tests
+
+* **List all available tests:**
+  ```bash
+  ./run_tests.sh --list
+  ```
+
+* **Run all tests sequentially:**
+  ```bash
+  ./run_tests.sh
+  ```
+
+* **Run specific tests by index number:**
+  ```bash
+  ./run_tests.sh 1 5 10
+  ```
+
+* **Run specific tests by name or wildcard pattern:**
+  ```bash
+  ./run_tests.sh Test01* Test10*
+  ```
+
+* **Run tests with automated post-task self-analysis:**
+  ```bash
+  ./run_tests.sh --analyze 1 9
+  ```
+  When `--analyze` (or `-a`) is passed, the runner executes the main task, and if successful, immediately follows up by executing the tailored evaluation prompt from Column 4 in the exact same session so the agent can inspect its own logs and outputs.
+
+* **Dry-run preview (zero LLM token cost):**
+  ```bash
+  ./run_tests.sh --dry-run --analyze 1 2
+  ```
+  Previews the exact CLI commands, resolved session directories, and expanded prompts without starting containers or making API calls.
+
+* **Use a custom TSV file:**
+  ```bash
+  ./run_tests.sh --tsv custom_experiments.tsv
+  ```
+
+* **Console format and verbosity overrides:**
+  ```bash
+  ./run_tests.sh -f text -v detailed 1
+  ```
+
+---
 
 ## 📖 Monitoring & Logs
 
