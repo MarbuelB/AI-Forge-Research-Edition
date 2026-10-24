@@ -359,31 +359,46 @@ def save_session_skill_to_host(skill_name: str, pack_subpath: str):
 
 
 def build_skills_menu():
-    """Scans the sandbox workspace for SKILL.md files and builds the menu."""
+    """Scans the sandbox workspace for mounted SKILL.md files and appends a compact index of unmounted host packs."""
     skills_dir = os.path.join(SESSION_DIR, "skills")
-    if not os.path.exists(skills_dir):
-        return "AVAILABLE SKILLS MENU:\n- None currently installed. Use create_skill to build some."
+    mounted_names = set()
+    menu_lines = ["AVAILABLE SKILLS MENU (Mounted in /app/workspace/skills — call `load_skill(skill_name)` to read full instructions):"]
 
-    menu_lines = ["AVAILABLE SKILLS MENU (Use `load_skill` to read full instructions):"]
-    for item in sorted(os.listdir(skills_dir)):
-        skill_path = os.path.join(skills_dir, item, "SKILL.md")
-        # HOST PROTECTION: Reject symlinks pointing outside SESSION_DIR
-        try:
-            if os.path.commonpath([os.path.realpath(skill_path), SESSION_DIR]) != SESSION_DIR:
-                continue
-        except Exception:
-            continue
-        if os.path.exists(skill_path):
+    if os.path.exists(skills_dir):
+        for item in sorted(os.listdir(skills_dir)):
+            skill_path = os.path.join(skills_dir, item, "SKILL.md")
+            # HOST PROTECTION: Reject symlinks pointing outside SESSION_DIR
             try:
-                with open(skill_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                description = config.extract_skill_description(content)
-                menu_lines.append(f"- {item}: {description}")
+                if os.path.commonpath([os.path.realpath(skill_path), SESSION_DIR]) != SESSION_DIR:
+                    continue
             except Exception:
-                pass
-                
+                continue
+            if os.path.exists(skill_path):
+                try:
+                    with open(skill_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    description = config.extract_skill_description(content)
+                    menu_lines.append(f"- {item}: {description}")
+                    mounted_names.add(item)
+                except Exception:
+                    pass
+
     if len(menu_lines) == 1:
-        return "AVAILABLE SKILLS MENU:\n- None currently installed. Use create_skill to build some."
+        menu_lines.append("- None currently mounted in session. Use `manage_skills` to mount host packs, or `create_skill` to build new ones.")
+
+    # Append compact summary of unmounted host skill packs
+    host_skills = discover_host_skills()
+    unmounted_by_pack = {}
+    for s in host_skills:
+        if s["name"] not in mounted_names:
+            unmounted_by_pack.setdefault(s["pack"], []).append(s["name"])
+
+    if unmounted_by_pack:
+        menu_lines.append("\nUNMOUNTED HOST SKILL PACKS (Use `manage_skills(action='list'|'mount'|'unmount', target='...')` or call `load_skill(skill_name)` to auto-mount):")
+        for pack_name in sorted(unmounted_by_pack.keys()):
+            names_csv = ", ".join(unmounted_by_pack[pack_name])
+            menu_lines.append(f"- {pack_name}: {names_csv}")
+
     return "\n".join(menu_lines)
 
 
@@ -1079,6 +1094,111 @@ async def run_chat():
                             if verbose and config.VERBOSITY_MODE != "silent":
                                 print(f"\n{COLOR_YELLOW}[MCP SYSTEM: Disconnected external server '{srv_name}' ({server_id}). Removed tools: {tool_list_str}]{COLOR_RESET}")
 
+                    MANAGE_SKILLS_TOOL = {
+                        "type": "function",
+                        "function": {
+                            "name": "manage_skills",
+                            "description": "Meta-tool to inspect, mount (copy into /app/workspace/skills), unmount, or save skill packs between the host skills library (./skills) and the current session.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "action": {
+                                        "type": "string",
+                                        "enum": ["list", "mount", "unmount", "save"],
+                                        "description": "'list' to view host skill packs and descriptions; 'mount' to copy a pack/category/skill into the session; 'unmount' to remove a mounted pack/skill from the session; 'save' to export a session skill back to the host library."
+                                    },
+                                    "target": {
+                                        "type": "string",
+                                        "description": "Skill pack, category path, individual skill name, comma-separated list, or 'all' (e.g. 'Anthropic/development', 'development', 'mcp-builder', or 'all'). Optional for 'list'."
+                                    },
+                                    "pack": {
+                                        "type": "string",
+                                        "description": "Destination pack subpath under ./skills when action='save' (e.g. 'science/genomics' or 'custom')."
+                                    }
+                                },
+                                "required": ["action"]
+                            }
+                        }
+                    }
+
+                    async def handle_manage_skills(m_args):
+                        action = (m_args.get("action") or "").lower().strip()
+                        target = (m_args.get("target") or "").strip()
+                        pack_dest = (m_args.get("pack") or "").strip()
+
+                        if action in ("list", "status"):
+                            host_skills = discover_host_skills()
+                            skills_dir = os.path.join(SESSION_DIR, "skills")
+                            mounted_set = set()
+                            if os.path.exists(skills_dir):
+                                for item in os.listdir(skills_dir):
+                                    if os.path.exists(os.path.join(skills_dir, item, "SKILL.md")):
+                                        mounted_set.add(item)
+
+                            q = target.strip("/").lower()
+                            lines = ["=== HOST SKILLS LIBRARY ==="]
+                            packs = {}
+                            for s in host_skills:
+                                if q and q != "all":
+                                    rel_l = s["rel_path"].lower()
+                                    pack_l = s["pack"].lower()
+                                    if not (f"/{q}/" in f"/{rel_l}/" or (pack_l and f"/{q}/" in f"/{pack_l}/") or s["name"].lower() == q):
+                                        continue
+                                packs.setdefault(s["pack"], []).append(s)
+
+                            if not packs:
+                                lines.append(f"  (No matching host skills found{f' for {target!r}' if target else ''})")
+                            else:
+                                for pack_name in sorted(packs.keys()):
+                                    lines.append(f"\nPack: {pack_name}")
+                                    for s in packs[pack_name]:
+                                        st = "[MOUNTED]" if s["name"] in mounted_set else "[UNMOUNTED]"
+                                        lines.append(f"  - {s['name']} {st}: {s['description']}")
+
+                            host_names = {s["name"] for s in host_skills}
+                            session_only = sorted(mounted_set - host_names)
+                            if session_only and not q:
+                                lines.append("\nSession-Only Skills (in /app/workspace/skills):")
+                                for s_name in session_only:
+                                    lines.append(f"  - {s_name} [MOUNTED]")
+
+                            lines.append("\nUsage: Call manage_skills(action='mount', target='<pack_or_skill>') to copy into /app/workspace/skills, then load_skill('<skill_name>') to read full instructions.")
+                            return "\n".join(lines)
+
+                        elif action in ("mount", "connect", "on", "enable", "load"):
+                            if not target:
+                                return "SYSTEM ERROR: Provide 'target' (pack name, category, skill name, or 'all') to mount."
+                            installed, unmatched = install_host_skills(target, verbose=True)
+                            if not installed:
+                                return f"SYSTEM ERROR: No host skill or pack matched '{target}'. Call manage_skills(action='list') to view available packs."
+                            desc_lines = [f"  - {s['name']} ({s['pack']}): {s['description']}" for s in installed]
+                            unmatched_note = f"\n(Note: unmatched targets ignored: {', '.join(unmatched)})" if unmatched else ""
+                            return (
+                                f"SUCCESS: Mounted {len(installed)} skill(s) into /app/workspace/skills:\n"
+                                + "\n".join(desc_lines)
+                                + unmatched_note
+                                + "\n\nCall load_skill(skill_name) to read full instructions and bundled resource paths."
+                            )
+
+                        elif action in ("unmount", "disconnect", "off", "disable", "unload"):
+                            if not target:
+                                return "SYSTEM ERROR: Provide 'target' (pack name, skill name, or 'all') to unmount."
+                            removed, unmatched = uninstall_session_skills(target, verbose=True)
+                            if not removed:
+                                return f"NOTICE: No currently mounted session skill matched '{target}'."
+                            return f"SUCCESS: Unmounted {len(removed)} skill(s) from /app/workspace/skills: {', '.join(removed)}."
+
+                        elif action in ("save", "export"):
+                            if not target or not pack_dest:
+                                return "SYSTEM ERROR: Provide both 'target' (skill_name in /app/workspace/skills) and 'pack' (destination subpath under ./skills, e.g. 'science/genomics')."
+                            ok, res_msg = save_session_skill_to_host(target, pack_dest)
+                            if ok:
+                                return f"SUCCESS: Saved session skill '{target}' permanently to host library at './skills/{res_msg}'."
+                            return f"SYSTEM ERROR: {res_msg}"
+
+                        else:
+                            return f"SYSTEM ERROR: Unknown action '{action}'. Valid actions are 'list', 'mount', 'unmount', 'save'."
+
                     MANAGE_EXTERNAL_MCP_TOOL = {
                         "type": "function",
                         "function": {
@@ -1148,7 +1268,7 @@ async def run_chat():
                         return {}
 
                     def rebuild_openai_tools():
-                        combined = [MANAGE_EXTERNAL_MCP_TOOL] + list(sandbox_openai_tools)
+                        combined = [MANAGE_EXTERNAL_MCP_TOOL, MANAGE_SKILLS_TOOL] + list(sandbox_openai_tools)
                         for s_data in active_ext_servers.values():
                             combined.extend(s_data["tools"])
                         return combined
@@ -1968,7 +2088,7 @@ async def run_chat():
                                         if item["malformed"]:
                                             return False
                                         iname = item["name"]
-                                        if iname in ("compact_context", "manage_external_mcp"):
+                                        if iname in ("compact_context", "manage_external_mcp", "manage_skills"):
                                             return False
                                         if iname in ext_tool_router and ext_tool_router[iname].get("require_confirmation", False):
                                             return False
@@ -2049,6 +2169,10 @@ async def run_chat():
                                                 action_tag = args.get("action", "")
                                                 srv_tag = args.get("server_name", "")
                                                 print(f"\n{COLOR_CYAN}{pfx}Managing external MCP tool suites ({action_tag} {srv_tag})...{COLOR_RESET}")
+                                            elif name == "manage_skills":
+                                                action_tag = args.get("action", "")
+                                                tgt_tag = args.get("target", "")
+                                                print(f"\n{COLOR_CYAN}{pfx}Managing host skill packs ({action_tag} {tgt_tag})...{COLOR_RESET}")
                                             elif name in ext_tool_router:
                                                 srv_id = ext_tool_router[name]["server_id"]
                                                 print(f"\n{COLOR_CYAN}{pfx}Routing to external host MCP '{srv_id}': {name}...{COLOR_RESET}")
@@ -2062,6 +2186,9 @@ async def run_chat():
                                         try:
                                             if name == "manage_external_mcp":
                                                 output = await handle_manage_external_mcp(args)
+                                                result = None
+                                            elif name == "manage_skills":
+                                                output = await handle_manage_skills(args)
                                                 result = None
                                             elif name in ext_tool_router:
                                                 target = ext_tool_router[name]
@@ -2090,6 +2217,11 @@ async def run_chat():
                                                 else:
                                                     result = await call_external_tool(target, orig_name, args)
                                             else:
+                                                # Auto-mount host skill if load_skill is called for an unmounted host skill
+                                                if name == "load_skill" and isinstance(args, dict):
+                                                    req_skill = os.path.basename(str(args.get("skill_name") or "").strip())
+                                                    if req_skill and not os.path.exists(os.path.join(SESSION_DIR, "skills", req_skill, "SKILL.md")):
+                                                        install_host_skills(req_skill, verbose=True)
                                                 result = await session.call_tool(name, args)
 
                                             if result is not None:
