@@ -79,10 +79,10 @@ from rich.panel import Panel
 import config
 
 # Can be run using arguments like this:
-# pixi run python overseer.py -p "tell me what tools do you have" -f formatted -s "Test_2" --brain 2 --coder 3 --summarizer 3 --adviser 3 -x
+# pixi run python smrtk.py -p "tell me what tools do you have" -f formatted -s "Test_2" --brain 2 --coder 3 --summarizer 3 --adviser 3 -x
 
 # --- CLI ARGUMENT PARSER ---
-parser = argparse.ArgumentParser(description="Sandbox Overseer")
+parser = argparse.ArgumentParser(description="SMRTk (Sandboxed Multi-agent Research Toolkit)")
 parser.add_argument("-p", "--prompt", type=str, help="Initial user prompt")
 parser.add_argument("-f", "--format", choices=["markdown", "text"], help="Console format override")
 parser.add_argument("-v", "--verbosity", choices=["silent", "minimal", "standard", "detailed"], help="Console verbosity override")
@@ -97,6 +97,8 @@ parser.add_argument("--analyst", type=int, help="Analyst LLM profile index")
 parser.add_argument("--architect", type=int, help="Architect LLM profile index")
 parser.add_argument("--mcp", type=str, help="Comma-separated external MCP servers to enable (e.g. --mcp chimerax)")
 parser.add_argument("--all-mcp", action="store_true", help="Enable all configured external MCP servers")
+parser.add_argument("--skills", type=str, help="Comma-separated host skill packs or skills to load into session (e.g. --skills development,mcp-builder)")
+parser.add_argument("--all-skills", action="store_true", help="Load all available skills from ./skills into the session")
 
 cli_args = parser.parse_args()
 
@@ -117,7 +119,7 @@ if cli_args.architect is not None: config.ACTIVE_ARCHITECT_PROFILE = cli_args.ar
 # Capture Prompt (from -p flag OR piped STDIN)
 cli_prompt = cli_args.prompt
 if not cli_prompt and not sys.stdin.isatty():
-    # This grabs piped text like: cat input.txt | python overseer.py
+    # This grabs piped text like: cat input.txt | python smrtk.py
     cli_prompt = sys.stdin.read().strip()
    
 # Mute the MCP client's internal info logs
@@ -163,14 +165,198 @@ for folder in ["logs", "tools", "histories", "memories", "state", "sandbox", "ou
     os.makedirs(f"{SESSION_DIR}/{folder}", exist_ok=True)
 os.makedirs(f"{SESSION_DIR}/state/rest_calls", exist_ok=True)
 
-# Build the isolated folder structure for input/output folders
+# Build the isolated folder structure for input/output and host skills folders
 os.makedirs(config.HOST_INPUT_DIR, exist_ok=True)
+os.makedirs(config.HOST_SKILLS_DIR, exist_ok=True)
 
 # --- Pixi environment already baked into the podman container! ---
 
 # Point the log file to this specific session
 LOG_FILE = f"{SESSION_DIR}/logs/chat_log_{timestamp}.txt"
 CURRENT_HISTORY_FILE = f"{SESSION_DIR}/state/current_history.json"
+ACTIVE_SKILLS_FILE = f"{SESSION_DIR}/state/active_skills.json"
+
+
+def load_active_skills_state():
+    if os.path.exists(ACTIVE_SKILLS_FILE):
+        try:
+            with open(ACTIVE_SKILLS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_active_skills_state(state_data):
+    try:
+        with open(ACTIVE_SKILLS_FILE, "w", encoding="utf-8") as f:
+            json.dump(state_data, f, indent=2)
+    except Exception:
+        pass
+
+
+def discover_host_skills():
+    """Recursively scans config.HOST_SKILLS_DIR for folders containing SKILL.md."""
+    host_root = os.path.realpath(config.HOST_SKILLS_DIR)
+    discovered = []
+    if not os.path.exists(host_root):
+        return discovered
+
+    for root, dirs, files in os.walk(host_root):
+        dirs.sort()
+        if "SKILL.md" in files:
+            skill_md_path = os.path.join(root, "SKILL.md")
+            rel_path = os.path.relpath(root, host_root).replace("\\", "/")
+            skill_name = os.path.basename(root)
+            parent_rel = os.path.dirname(rel_path).replace("\\", "/")
+            pack_name = parent_rel if parent_rel and parent_rel != "." else "(root)"
+            try:
+                with open(skill_md_path, "r", encoding="utf-8") as f:
+                    desc = config.extract_skill_description(f.read())
+            except Exception:
+                desc = "No description provided."
+            discovered.append({
+                "name": skill_name,
+                "rel_path": rel_path,
+                "pack": pack_name,
+                "abs_path": root,
+                "description": desc,
+            })
+            # Do not descend into subdirectories of a skill folder
+            dirs[:] = []
+    return discovered
+
+
+def install_host_skills(targets_str: str, verbose: bool = True):
+    """Copies matching skill packs or individual skills from host ./skills into SESSION_DIR/skills."""
+    host_skills = discover_host_skills()
+    raw_targets = [t.strip().strip("/") for t in targets_str.split(",") if t.strip().strip("/")]
+    matched = []
+    unmatched = []
+    seen_names = set()
+
+    for t in raw_targets:
+        q = t.lower()
+        found_for_t = False
+        for s in host_skills:
+            rel_l = s["rel_path"].lower()
+            pack_l = s["pack"].lower()
+            name_l = s["name"].lower()
+            if (
+                q == "all"
+                or f"/{q}/" in f"/{rel_l}/"
+                or (pack_l and f"/{q}/" in f"/{pack_l}/")
+                or name_l == q
+            ):
+                found_for_t = True
+                if s["name"] not in seen_names:
+                    seen_names.add(s["name"])
+                    matched.append(s)
+        if not found_for_t:
+            unmatched.append(t)
+
+    if not matched:
+        return [], unmatched
+
+    skills_dir = os.path.join(SESSION_DIR, "skills")
+    os.makedirs(skills_dir, exist_ok=True)
+    state_data = load_active_skills_state()
+    installed = []
+
+    for s in matched:
+        dst_path = os.path.join(skills_dir, s["name"])
+        shutil.copytree(s["abs_path"], dst_path, dirs_exist_ok=True, symlinks=False)
+        state_data[s["name"]] = {
+            "pack": s["pack"],
+            "rel_path": s["rel_path"],
+            "loaded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        installed.append(s)
+
+    save_active_skills_state(state_data)
+    if verbose and config.VERBOSITY_MODE != "silent" and installed:
+        names_str = ", ".join(f"{s['name']} ({s['pack']})" for s in installed)
+        print(f"\n{COLOR_BRIGHT_GREEN}[SKILLS SYSTEM: Copied {len(installed)} skill(s) into session workspace: {names_str}]{COLOR_RESET}")
+    return installed, unmatched
+
+
+def uninstall_session_skills(targets_str: str, verbose: bool = True):
+    """Removes matching skills or skill packs from SESSION_DIR/skills (host ./skills stays untouched)."""
+    skills_dir = os.path.join(SESSION_DIR, "skills")
+    if not os.path.exists(skills_dir):
+        return [], [targets_str]
+
+    state_data = load_active_skills_state()
+    installed_names = sorted(
+        item for item in os.listdir(skills_dir)
+        if os.path.exists(os.path.join(skills_dir, item, "SKILL.md"))
+    )
+    raw_targets = [t.strip().strip("/") for t in targets_str.split(",") if t.strip().strip("/")]
+    to_remove = []
+    unmatched = []
+
+    for t in raw_targets:
+        q = t.lower()
+        found_for_t = False
+        for s_name in installed_names:
+            meta = state_data.get(s_name, {})
+            rel_l = meta.get("rel_path", s_name).lower()
+            pack_l = meta.get("pack", "").lower()
+            name_l = s_name.lower()
+            if (
+                q == "all"
+                or name_l == q
+                or f"/{q}/" in f"/{rel_l}/"
+                or (pack_l and f"/{q}/" in f"/{pack_l}/")
+            ):
+                found_for_t = True
+                if s_name not in to_remove:
+                    to_remove.append(s_name)
+        if not found_for_t:
+            unmatched.append(t)
+
+    removed = []
+    for s_name in to_remove:
+        target_dir = os.path.realpath(os.path.join(skills_dir, s_name))
+        if os.path.commonpath([target_dir, SESSION_DIR]) == SESSION_DIR and os.path.exists(target_dir):
+            shutil.rmtree(target_dir)
+            state_data.pop(s_name, None)
+            removed.append(s_name)
+
+    save_active_skills_state(state_data)
+    if verbose and config.VERBOSITY_MODE != "silent" and removed:
+        print(f"\n{COLOR_YELLOW}[SKILLS SYSTEM: Unloaded {len(removed)} skill(s) from session workspace: {', '.join(removed)}]{COLOR_RESET}")
+    return removed, unmatched
+
+
+def save_session_skill_to_host(skill_name: str, pack_subpath: str):
+    """Copies a session skill from SESSION_DIR/skills/<skill_name> into host ./skills/<pack_subpath>/<skill_name>."""
+    safe_skill = os.path.basename(skill_name.strip())
+    src_dir = os.path.realpath(os.path.join(SESSION_DIR, "skills", safe_skill))
+    if os.path.commonpath([src_dir, SESSION_DIR]) != SESSION_DIR or not os.path.exists(os.path.join(src_dir, "SKILL.md")):
+        return False, f"Skill '{safe_skill}' not found in current session (/app/workspace/skills)."
+
+    clean_pack = os.path.normpath(pack_subpath.strip().strip("/")).replace("\\", "/")
+    if not clean_pack or clean_pack.startswith(".."):
+        return False, f"Invalid pack path '{pack_subpath}'."
+
+    host_root = os.path.realpath(config.HOST_SKILLS_DIR)
+    dst_dir = os.path.realpath(os.path.join(host_root, clean_pack, safe_skill))
+    if os.path.commonpath([dst_dir, host_root]) != host_root:
+        return False, f"Invalid destination path '{pack_subpath}'."
+
+    os.makedirs(os.path.dirname(dst_dir), exist_ok=True)
+    shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True, symlinks=False)
+    rel_path = f"{clean_pack}/{safe_skill}"
+    state_data = load_active_skills_state()
+    state_data[safe_skill] = {
+        "pack": clean_pack,
+        "rel_path": rel_path,
+        "loaded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    save_active_skills_state(state_data)
+    return True, rel_path
+
 
 def build_skills_menu():
     """Scans the sandbox workspace for SKILL.md files and builds the menu."""
@@ -191,10 +377,7 @@ def build_skills_menu():
             try:
                 with open(skill_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                desc_match = re.search(r'description:\s*(.+)', content)
-                description = desc_match.group(1).strip() if desc_match else "No description provided."
-                # Strip excessive whitespace or control characters
-                description = re.sub(r'[\r\n\x00-\x1f]+', ' ', description)[:200]
+                description = config.extract_skill_description(content)
                 menu_lines.append(f"- {item}: {description}")
             except Exception:
                 pass
@@ -554,12 +737,20 @@ async def run_chat():
     tool_schemas_overhead = 0 # Estimate of token cost for registered tool schemas
     current_token_estimate = 0
     
-    help_text = "Commands: '/exit' or '/quit' to quit | UI: '/text', '/markdown' | Verbosity: '/silent', '/minimal', '/standard', '/detailed' | MCP: '/mcp'"
+    help_text = "Commands: '/exit' or '/quit' to quit | UI: '/text', '/markdown' | Verbosity: '/silent', '/minimal', '/standard', '/detailed' | MCP: '/mcp' | Skills: '/skills'"
     
     if is_resuming:
         log_event("SYSTEM", f"Successfully restored '{active_session}'. Your custom tools are loaded.\n{help_text}")
     else:
         log_event("SYSTEM", f"Started new workspace: '{active_session}'.\n{help_text}")
+
+    # Load initial host skills if requested via CLI (--skills or --all-skills)
+    if getattr(cli_args, "all_skills", False):
+        install_host_skills("all", verbose=True)
+    elif getattr(cli_args, "skills", None):
+        _, unmatched_cli_skills = install_host_skills(cli_args.skills, verbose=True)
+        if unmatched_cli_skills and config.VERBOSITY_MODE != "silent":
+            print(f"{COLOR_YELLOW}[SKILLS WARNING: Could not find host skill/pack for: {', '.join(unmatched_cli_skills)}]{COLOR_RESET}")
         
     skills_menu = build_skills_menu()
     system_prompt = f"{config.SYSTEM_PROMPTS['brain']}\n\n{skills_menu}"
@@ -657,7 +848,7 @@ async def run_chat():
                     "-v", f"{os.path.abspath('./llm_config.py')}:/app/llm_config.py:ro,Z",
                     "-v", f"{os.path.abspath('./mcp_config.py')}:/app/mcp_config.py:ro,Z",
                     "-v", f"{os.path.abspath('./sandbox_tools.py')}:/app/sandbox_tools.py:ro,Z",
-                    "-v", f"{os.path.abspath('./overseer.py')}:/app/overseer.py:ro,Z", # it can read own code
+                    "-v", f"{os.path.abspath('./smrtk.py')}:/app/smrtk.py:ro,Z", # it can read own code
                     "-v", f"{os.path.abspath('./chimerax_mcp_server.py')}:/app/chimerax_mcp_server.py:ro,Z",
                     "-v", f"{os.path.abspath('./mock_mcp_server.py')}:/app/mock_mcp_server.py:ro,Z",
                     "-v", f"{os.path.abspath('./readme.md')}:/app/readme.md:ro,Z",
@@ -1265,6 +1456,103 @@ async def run_chat():
                                 continue
                             else:
                                 print(f"\n{COLOR_RED}[MCP ERROR: Unknown command '{user_input}'. Usage: /mcp list | /mcp on <name> [<url>] | /mcp off <name>]{COLOR_RESET}")
+                                continue
+
+                        # --- 4b. DYNAMIC SKILLS COMMANDS ---
+                        if user_input.lower() == '/skill' or user_input.lower().startswith('/skill ') or user_input.lower() == '/skills' or user_input.lower().startswith('/skills '):
+                            parts = user_input.strip().split()
+                            if len(parts) == 1 or parts[1].lower() in ['list', 'status', 'help']:
+                                host_skills = discover_host_skills()
+                                skills_dir = os.path.join(SESSION_DIR, "skills")
+                                installed_set = set()
+                                if os.path.exists(skills_dir):
+                                    for item in os.listdir(skills_dir):
+                                        if os.path.exists(os.path.join(skills_dir, item, "SKILL.md")):
+                                            installed_set.add(item)
+
+                                print(f"\n{COLOR_CYAN}=== HOST SKILLS LIBRARY ({config.HOST_SKILLS_DIR}) ==={COLOR_RESET}")
+                                if not host_skills:
+                                    print(f"  {COLOR_DIM}(No skills found in {config.HOST_SKILLS_DIR}){COLOR_RESET}")
+                                else:
+                                    packs = {}
+                                    for s in host_skills:
+                                        packs.setdefault(s["pack"], []).append(s)
+                                    for pack_name in sorted(packs.keys()):
+                                        pack_items = packs[pack_name]
+                                        active_cnt = sum(1 for s in pack_items if s["name"] in installed_set)
+                                        total_cnt = len(pack_items)
+                                        if active_cnt == total_cnt:
+                                            p_tag = f"{COLOR_BRIGHT_GREEN}[ACTIVE {active_cnt}/{total_cnt}]{COLOR_RESET}"
+                                        elif active_cnt > 0:
+                                            p_tag = f"{COLOR_YELLOW}[PARTIAL {active_cnt}/{total_cnt}]{COLOR_RESET}"
+                                        else:
+                                            p_tag = f"{COLOR_DIM}[OFF 0/{total_cnt}]{COLOR_RESET}"
+                                        skill_labels = [
+                                            f"{COLOR_BRIGHT_GREEN}{s['name']}{COLOR_RESET}" if s["name"] in installed_set else s["name"]
+                                            for s in pack_items
+                                        ]
+                                        print(f"  {p_tag} {COLOR_CYAN}{pack_name}{COLOR_RESET}: {', '.join(skill_labels)}")
+
+                                host_skill_names = {s["name"] for s in host_skills}
+                                custom_session_skills = sorted(installed_set - host_skill_names)
+                                if custom_session_skills:
+                                    print(f"\n{COLOR_CYAN}=== SESSION-ONLY SKILLS (/app/workspace/skills) ==={COLOR_RESET}")
+                                    print(f"  {COLOR_BRIGHT_GREEN}[ACTIVE]{COLOR_RESET} {', '.join(custom_session_skills)}")
+
+                                print(f"{COLOR_DIM}Commands: /skills on <pack|skill|all> | /skills off <pack|skill|all> | /skills save <skill> <pack>{COLOR_RESET}\n")
+                                continue
+
+                            elif parts[1].lower() in ['on', 'enable', 'load']:
+                                if len(parts) < 3:
+                                    print(f"\n{COLOR_RED}[SKILLS ERROR: Missing pack or skill name. Usage: /skills on <pack|skill|all> (e.g. /skills on development or /skills on mcp-builder)]{COLOR_RESET}")
+                                    continue
+                                target_arg = ",".join(parts[2:])
+                                installed, unmatched = install_host_skills(target_arg, verbose=True)
+                                if unmatched:
+                                    print(f"{COLOR_YELLOW}[SKILLS WARNING: No matching host skill/pack found for: {', '.join(unmatched)}]{COLOR_RESET}")
+                                if installed:
+                                    loaded_names = [s["name"] for s in installed]
+                                    inject_note = (
+                                        f"[SYSTEM NOTICE: {len(installed)} skill(s) copied into /app/workspace/skills and added to your AVAILABLE SKILLS MENU: "
+                                        f"{', '.join(loaded_names)}. Call load_skill(skill_name) when relevant.]"
+                                    )
+                                    messages = load_history()
+                                    messages.append({"role": "user", "content": inject_note})
+                                    save_history(messages)
+                                    log_event("INJECTED CONTEXT TO BRAIN", inject_note)
+                                continue
+
+                            elif parts[1].lower() in ['off', 'disable', 'unload']:
+                                if len(parts) < 3:
+                                    print(f"\n{COLOR_RED}[SKILLS ERROR: Missing pack or skill name. Usage: /skills off <pack|skill|all> (e.g. /skills off development or /skills off all)]{COLOR_RESET}")
+                                    continue
+                                target_arg = ",".join(parts[2:])
+                                removed, unmatched = uninstall_session_skills(target_arg, verbose=True)
+                                if unmatched:
+                                    print(f"{COLOR_YELLOW}[SKILLS WARNING: No active session skill/pack matched: {', '.join(unmatched)}]{COLOR_RESET}")
+                                if removed:
+                                    inject_note = (
+                                        f"[SYSTEM NOTICE: {len(removed)} skill(s) unloaded from /app/workspace/skills: {', '.join(removed)}.]"
+                                    )
+                                    messages = load_history()
+                                    messages.append({"role": "user", "content": inject_note})
+                                    save_history(messages)
+                                    log_event("INJECTED CONTEXT TO BRAIN", inject_note)
+                                continue
+
+                            elif parts[1].lower() in ['save', 'export']:
+                                if len(parts) < 4:
+                                    print(f"\n{COLOR_RED}[SKILLS ERROR: Usage: /skills save <skill_name> <pack_subpath> (e.g. /skills save my_skill science)]{COLOR_RESET}")
+                                    continue
+                                ok, res_msg = save_session_skill_to_host(parts[2], parts[3])
+                                if ok:
+                                    print(f"\n{COLOR_BRIGHT_GREEN}[SKILLS SYSTEM: Saved session skill '{parts[2]}' permanently to host library at './skills/{res_msg}']{COLOR_RESET}")
+                                else:
+                                    print(f"\n{COLOR_RED}[SKILLS ERROR: {res_msg}]{COLOR_RESET}")
+                                continue
+
+                            else:
+                                print(f"\n{COLOR_RED}[SKILLS ERROR: Unknown command '{user_input}'. Usage: /skills list | /skills on <pack|skill|all> | /skills off <pack|skill|all> | /skills save <skill> <pack>]{COLOR_RESET}")
                                 continue
 
                         # --- 5. EMPTY INPUT CHECK ---

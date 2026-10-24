@@ -3711,9 +3711,7 @@ def load_skill(skill_name: str = "") -> str:
                 try:
                     with open(s_path, "r", encoding="utf-8") as f:
                         c = f.read()
-                    d_match = re.search(r'description:\s*(.+)', c)
-                    desc = d_match.group(1).strip() if d_match else "No description provided."
-                    available_skills[item] = re.sub(r'[\r\n\x00-\x1f]+', ' ', desc)[:200]
+                    available_skills[item] = config.extract_skill_description(c)
                 except Exception:
                     available_skills[item] = "Available (failed to parse description)."
 
@@ -3741,10 +3739,20 @@ def load_skill(skill_name: str = "") -> str:
     with open(skill_path, "r", encoding="utf-8") as f:
         content = f.read()
         
+    skill_dir = os.path.dirname(skill_path)
+    extra_items = [
+        e + ("/" if os.path.isdir(os.path.join(skill_dir, e)) else "")
+        for e in sorted(os.listdir(skill_dir))
+        if e not in ("SKILL.md", "LICENSE.txt") and not e.startswith(".")
+    ]
+    resource_note = (
+        f"\n[SKILL DIRECTORY: /app/workspace/skills/{safe_name} | Bundled resources: {', '.join(extra_items)}]"
+        if extra_items else f"\n[SKILL DIRECTORY: /app/workspace/skills/{safe_name}]"
+    )
     is_reload = safe_name in _LOADED_SKILLS
     _LOADED_SKILLS.add(safe_name)
     status_label = "RE-ACTIVATED" if is_reload else "ACTIVATED"
-    return f"--- SKILL {status_label}: {safe_name} ---\n{content}\n\n[SYSTEM: You must now strictly follow these instructions.]"
+    return f"--- SKILL {status_label}: {safe_name} ---{resource_note}\n{content}\n\n[SYSTEM: You must now strictly follow these instructions.]"
 
 
 @mcp.tool()

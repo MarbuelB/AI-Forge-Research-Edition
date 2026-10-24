@@ -209,9 +209,9 @@ main() {
         echo "----------------------------------------------------------------------"
 
         if [[ "$DRY_RUN" == true ]]; then
-            echo "[DRY-RUN] pixi run python overseer.py -x -f \"$FORMAT\" -v \"$VERBOSITY\" -s \"$name\" -p \"${prompt:0:80}...\""
+            echo "[DRY-RUN] pixi run python smrtk.py -x -f \"$FORMAT\" -v \"$VERBOSITY\" -s \"$name\" -p \"${prompt:0:80}...\""
             if [[ "$RUN_ANALYZE" == true && -n "$followup" ]]; then
-                echo "[DRY-RUN-FOLLOWUP] pixi run python overseer.py -x -f \"$FORMAT\" -v \"$VERBOSITY\" -s \"$name\" -p \"${followup:0:80}...\""
+                echo "[DRY-RUN-FOLLOWUP] pixi run python smrtk.py -x -f \"$FORMAT\" -v \"$VERBOSITY\" -s \"$name\" -p \"${followup:0:80}...\""
             fi
             RES_NAMES+=("$name")
             RES_STATUS+=("DRY_RUN")
@@ -224,7 +224,7 @@ main() {
         T_START=$(date +%s)
 
         # 1. Main prompt execution
-        pixi run python overseer.py -x -f "$FORMAT" -v "$VERBOSITY" -s "$name" -p "$prompt"
+        pixi run python smrtk.py -x -f "$FORMAT" -v "$VERBOSITY" -s "$name" -p "$prompt"
         local MAIN_EXIT=$?
 
         # 2. Optional follow-up prompt execution in same session
@@ -232,7 +232,7 @@ main() {
         if [[ "$RUN_ANALYZE" == true && -n "$followup" && $MAIN_EXIT -eq 0 ]]; then
             echo ""
             echo ">>> Running follow-up analysis for ${name}..."
-            pixi run python overseer.py -x -f "$FORMAT" -v "$VERBOSITY" -s "$name" -p "$followup"
+            pixi run python smrtk.py -x -f "$FORMAT" -v "$VERBOSITY" -s "$name" -p "$followup"
             FOLLOWUP_EXIT=$?
         fi
 

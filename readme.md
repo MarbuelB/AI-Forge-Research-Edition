@@ -83,7 +83,7 @@ LLMs occasionally make syntax errors when generating tools. The framework isolat
 To prevent overwhelming the AI with hundreds of tools and memories, knowledge is split into compact JSON indexes and detailed physical files:
 * **Tool Registry:** Custom tools are categorized in `/app/workspace/state/tool_registry.json` (stored in the persistent `state/` directory, keeping tool metadata strictly separated from code in `tools/`). The Brain navigates this in two steps: checking high-level categories via `view_tool_registry`, then diving into specific category descriptions to learn exact CLI usage (by default returns concise paths, descriptions, and file existence checks, reserving full authoring objectives for `detailed=True` to minimize context overhead).
 * **Memory Registry:** Long-term facts and summaries are indexed in `/app/workspace/state/memory_registry.json` with short descriptions and timestamps. The exhaustive details are saved as individual Markdown files (`.md`) in the `memories/` folder. The Brain can browse the lightweight index and only spend tokens to read the full file when explicitly needed via `read_memory`.
-* **Skills Registry:** Standard operating procedures are organized under `/app/workspace/skills/<skill_name>/SKILL.md`. Available skills are dynamically cataloged in the Brain's prompt, and the Brain can load and follow them on demand via `load_skill` without bloating initial context.
+* **Skills Registry & Host Skill Packs:** Standard operating procedures (SOPs) are organized as self-contained skill folders (`SKILL.md` with YAML frontmatter plus optional `scripts/`, `references/`, and `assets/` folders). Inside a session, active skills live under `/app/workspace/skills/<skill_name>/SKILL.md` and are dynamically cataloged in the Brain's system prompt (`AVAILABLE SKILLS MENU`) so the Brain can activate full instructions on demand via `load_skill` without bloating initial context. Reusable skill collections on the host live in `./skills/<source>/<category>/` (with source attributions and licenses maintained inside each respective subfolder). By default, no host skills are loaded into a new session; you can selectively copy skill packs or individual skills into a session at startup (`--skills`, `--all-skills`) or live in chat (`/skills on <pack|skill|all>`, `/skills off <pack|skill|all>`, `/skills save <skill> <pack>`), giving the container an isolated writable copy while keeping your master `./skills/` library untouched on the host.
 
 ### 4. Persistent Sessions & Isolated Environments
 Workspaces are strictly isolated. The system dynamically generates unique `Session_ID` folders. 
@@ -192,6 +192,13 @@ Beyond native sub-agent delegation (`query_auxiliary_llm`), the framework featur
 * **Multimodal Chat Injection (`media_filepaths`):** When dispatching chat completions JSON payloads, passing `media_filepaths` automatically base64-encodes local images, audio, video, or PDFs and injects them into the message structure without requiring manual base64 scripting.
 * **Token Usage Observability:** Automatically tracks input, output, and reasoning tokens in `state/token_usage.json` under the `rest_call` bucket when usage metrics are reported by the upstream API.
 
+### 16. Host Skills Library & On-Demand Skill Packs (`/skills`)
+SMRTk natively supports modular skill folders (`SKILL.md` with YAML frontmatter `name` & `description`, alongside optional `scripts/`, `references/`, and `assets/` subdirectories). Rather than loading every skill into every session by default (which would bloat the system prompt), SMRTk treats host skills similarly to external MCP servers:
+* **Hierarchical Host Library (`./skills/`):** Master skill collections live on the host under `./skills/` (`config.HOST_SKILLS_DIR`), organized into `<source>/<category>/<skill_name>` subfolders (e.g., `development`, `creative-design`, `enterprise-comms`, `science`). Source attributions and open-source license notices for external skill packs are always documented directly inside each respective `./skills/<source>/` subfolder (`NOTICE.md` / `LICENSE.txt`).
+* **Copy-on-Load Isolation (Host Library Untouched):** By default, a new session starts with zero pre-loaded host skills. When you load a pack or skill (via CLI flags or `/skills on`), the harness copies those skill directories into the session's isolated `./sessions/<Session_ID>/skills/` folder (visible inside the container at `/app/workspace/skills/`). The agent can freely execute bundled helper scripts, modify templates, or refine the `SKILL.md` inside its session without ever altering the master files in `./skills/` on the host.
+* **Flexible Target Matching:** You can load or unload an entire top-level source collection (`/skills on <source>`), a category subfolder (`/skills on <source>/<category>` or shorthand `/skills on development`), a single skill (`/skills on mcp-builder` or `/skills on webapp-testing`), a comma-separated list (`/skills on mcp-builder,webapp-testing`), or everything (`/skills on all`).
+* **Exporting Session Skills to Host (`/skills save`):** When the Architect agent creates a new skill during a session via `create_skill` (or improves an existing one), you can permanently promote it from the session back into your host library using `/skills save <skill_name> <pack_subpath>` (e.g. `/skills save my_pipeline science/genomics`).
+
 ---
 
 ## 🛡️ Sandboxing & Workspace Structure (Podman)
@@ -205,7 +212,7 @@ Beyond native sub-agent delegation (`query_auxiliary_llm`), the framework featur
 * **The I/O Airlock (Surgical Mounts):** The container cannot see your host filesystem. It communicates via strict bind mounts:
   * `/app/host_input`: Mapped to your local input folder (`my_host_input`). **Strictly Read-Only (ro)**. The AI cannot delete or corrupt your source data. You must manually drop files (e.g., CSVs, scripts, or documents) into this host folder before asking the AI to analyze them. 
   * `/app/workspace`: The unified execution directory mapped to the active `Session_ID` folder with isolated subfolders (`logs/`, `tools/`, `histories/`, `memories/`, `state/`, `state/rest_calls/`, `sandbox/`, `outputs/`, `archive/`, `skills/`, `custom_packages/`).
-  * `/app/*.py` & System Definitions: Core framework scripts, configurations, and documentation (`config.py`, `llm_config.py`, `mcp_config.py`, `sandbox_tools.py`, `overseer.py`, `chimerax_mcp_server.py`, `mock_mcp_server.py`, `readme.md`, `Containerfile`, `setup_wsl2.sh`) are dynamically mapped **Strictly Read-Only (ro)** directly into `/app/` at runtime, and the `/app` directory itself is locked read-only (`chmod a-w /app`) at container boot to prevent file planting or module shadowing. This provides the containerized agents full self-awareness of the framework's configuration and tooling without exposing host files to tampering.
+  * `/app/*.py` & System Definitions: Core framework scripts, configurations, and documentation (`config.py`, `llm_config.py`, `mcp_config.py`, `sandbox_tools.py`, `smrtk.py`, `chimerax_mcp_server.py`, `mock_mcp_server.py`, `readme.md`, `Containerfile`, `setup_wsl2.sh`) are dynamically mapped **Strictly Read-Only (ro)** directly into `/app/` at runtime, and the `/app` directory itself is locked read-only (`chmod a-w /app`) at container boot to prevent file planting or module shadowing. This provides the containerized agents full self-awareness of the framework's configuration and tooling without exposing host files to tampering.
 * **Workspace Isolation:** The `/app/workspace` is split to protect the AI's "mind" from its "hands":
   * `/sandbox`: The scratchpad where the AI actually executes bash commands and tests tools.
   * `/outputs`: The dedicated folder where the AI saves finished artifacts and generated files.
@@ -421,7 +428,7 @@ Save the core scripts into the root of your `ai_workspace` folder:
 1. `llm_config.py` (LLM endpoints, model parameters, role assignments, and Decider configuration).
 2. `config.py` (Core system prompts, memory limits, and runtime settings).
 3. `sandbox_tools.py` (The FastMCP server handling tool creation, subagent execution, `execute_rest_call`, and native tools like `fast_decision`).
-4. `overseer.py` (The main interactive async loop and container harness).
+4. `smrtk.py` (The main interactive async loop and container harness).
 5. `mcp_config.py` (External and host MCP server registrations, host IP discovery, and security gates).
 6. `chimerax_mcp_server.py` (FastMCP bridge server for UCSF ChimeraX molecular visualization).
 7. `mock_mcp_server.py` (Lightweight test FastMCP SSE server for verifying external MCP bridging).
@@ -492,9 +499,9 @@ Build the rootless image by running:
 ## 🚀 How to Run & Manage Sessions
 
 ### Starting a Chat & CLI Usage
-The Overseer can be launched as a standard interactive chat or driven entirely via command-line arguments. To start a basic interactive session:
+SMRTk can be launched as a standard interactive chat or driven entirely via command-line arguments. To start a basic interactive session:
 
-    pixi run python overseer.py
+    pixi run python smrtk.py
 
 **CLI Arguments & Headless Execution:**
 You can override configurations, pipe in files, and trigger headless background tasks using the built-in CLI flags:
@@ -506,6 +513,8 @@ You can override configurations, pipe in files, and trigger headless background 
 * `--brain`, `--coder`, `--summarizer`, `--adviser`, `--analyst`, `--architect`: Pass the index number of your LLM profiles to override the active models dynamically.
 * `--mcp`: Pass a comma-separated list of external MCP servers to activate on startup (e.g., `--mcp chimerax`).
 * `--all-mcp`: Activate all external MCP servers configured in `mcp_config.py`.
+* `--skills`: Pass a comma-separated list of host skill packs, category folders, or individual skills from `./skills/` to copy into the session on startup (e.g., `--skills development,webapp-testing`).
+* `--all-skills`: Copy all available skills from `./skills/` into the session on startup.
 
 **Interactive Slash Commands:**
 During a live chat, you can dynamically configure the session without restarting:
@@ -513,16 +522,17 @@ During a live chat, you can dynamically configure the session without restarting
 * **UI Format:** `/markdown` (rich panels) or `/text` (raw streaming).
 * **Verbosity:** `/silent`, `/minimal`, `/standard`, or `/detailed`.
 * **MCP Management:** `/mcp` (list status of all configured servers), `/mcp on <name>` (connect server and inject tools), `/mcp off <name>` (disconnect server).
+* **Skills Management:** `/skills` (list all host skill packs and active session skills), `/skills on <pack|skill|all>` (copy skill pack or skill into the session and update the Brain's system prompt), `/skills off <pack|skill|all>` (unload skill pack or skill from the session), `/skills save <skill> <pack>` (save a session skill permanently to `./skills/<pack>/<skill>` on the host).
 
 **Advanced Usage Examples:**
 * **Rich Interactive Mode with Specific Models:**
-  `pixi run python overseer.py -f markdown -v standard -s "Test_2" --brain 2 --coder 3`
+  `pixi run python smrtk.py -f markdown -v standard -s "Test_2" --brain 2 --coder 3`
 * **Connecting Host Tools on Boot (e.g. ChimeraX):**
-  `pixi run python overseer.py -f markdown -v detailed --mcp chimerax`
+  `pixi run python smrtk.py -f markdown -v detailed --mcp chimerax`
 * **Headless Background Task (Auto-Exits when done):**
-  `pixi run python overseer.py -v silent -s "Research" -x -p "Scrape the latest papers on CRISPR and save to outputs/summary.md"`
+  `pixi run python smrtk.py -v silent -s "Research" -x -p "Scrape the latest papers on CRISPR and save to outputs/summary.md"`
 * **Unix Pipeline (Pipe files directly into the AI):**
-  `cat error_log.txt | pixi run python overseer.py -f text -v minimal -x -p "Find the bug and write a python fix to outputs/fix.py"`
+  `cat error_log.txt | pixi run python smrtk.py -f text -v minimal -x -p "Find the bug and write a python fix to outputs/fix.py"`
 
 ### Session Management (Config Fallback & Idempotent Resumption)
 If you don't use the `-s` flag, the framework falls back to your `config.py`. **Always use strings for Session IDs**.
@@ -563,14 +573,14 @@ Because the framework strictly isolates state, memory, and Podman execution envi
 You can use `tmux` to launch a multi-agent swarm in a 2x2 split-pane dashboard. Paste this chained command into your terminal to boot 4 independent researchers at once:
 
     tmux new-session -d -s smrtk_swarm \; \
-      send-keys "pixi run python overseer.py -f text -s 'Swarm_Text_1'" C-m \; \
+      send-keys "pixi run python smrtk.py -f text -s 'Swarm_Text_1'" C-m \; \
       split-window -h \; \
-      send-keys "pixi run python overseer.py -f text -s 'Swarm_Text_2'" C-m \; \
+      send-keys "pixi run python smrtk.py -f text -s 'Swarm_Text_2'" C-m \; \
       split-window -v \; \
-      send-keys "pixi run python overseer.py -f markdown -s 'Swarm_MD_2'" C-m \; \
+      send-keys "pixi run python smrtk.py -f markdown -s 'Swarm_MD_2'" C-m \; \
       select-pane -t 0 \; \
       split-window -v \; \
-      send-keys "pixi run python overseer.py -f markdown -s 'Swarm_MD_1'" C-m \; \
+      send-keys "pixi run python smrtk.py -f markdown -s 'Swarm_MD_1'" C-m \; \
       select-layout tiled \; \
       attach-session -t smrtk_swarm
 

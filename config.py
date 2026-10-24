@@ -31,6 +31,7 @@ TOOL_PRUNE_MIN_CHARS = 1500           # Only prune tool outputs exceeding this c
 SESSION_ID = None
 
 HOST_INPUT_DIR = os.path.abspath("./my_host_input")   # Folder you drop files into
+HOST_SKILLS_DIR = os.path.abspath("./skills")         # Host skill packs library (copied on-demand into session)
 
 # --- UI SETTINGS ---
 # Options: "markdown" (Rich formatted UI), "text" (Classic streaming text)
@@ -509,5 +510,31 @@ def get_tool_totals(state_dir):
             return data.get("totals", {"total_calls": 0, "by_tool": {}, "by_caller": {}, "total_duration": 0.0, "errors": 0})
     except Exception:
         return {"total_calls": 0, "by_tool": {}, "by_caller": {}, "total_duration": 0.0, "errors": 0}
+
+
+def extract_skill_description(content: str, max_len: int = 200) -> str:
+    """Extracts the description from a SKILL.md YAML frontmatter block (supports inline, quoted, and multiline > or | blocks)."""
+    import re
+    fm_match = re.match(r"^---\s*\r?\n(.*?)\r?\n---", content, re.DOTALL)
+    block = fm_match.group(1) if fm_match else content
+    lines = block.splitlines()
+    for idx, line in enumerate(lines):
+        m = re.match(r"^description:\s*(.*)$", line)
+        if m:
+            first_val = m.group(1).strip()
+            if first_val in ("", ">", "|", ">-", "|-", ">+", "|+"):
+                collected = []
+                for sub_line in lines[idx + 1:]:
+                    if re.match(r"^[A-Za-z0-9_-]+\s*:", sub_line):
+                        break
+                    if sub_line.strip():
+                        collected.append(sub_line.strip())
+                desc = " ".join(collected)
+            else:
+                desc = first_val.strip("\"'")
+            desc = re.sub(r"[\r\n\x00-\x1f]+", " ", desc).strip()
+            return desc[:max_len] if desc else "No description provided."
+    return "No description provided."
+
 
 
